@@ -21,13 +21,21 @@ Shaka Packager (BSD-3-Clause)
     packager/hls/base/master_playlist.{h,cc}
     packager/mpd/base/content_protection_element.h
     packager/mpd/base/mpd_options.h
+    packager/mpd/base/mpd_utils.{h,cc}
+    packager/mpd/base/media_info.proto
     packager/mpd/base/segment_info.h
     packager/mpd/base/xml/xml_node.{h,cc}
+    packager/media/base/fourccs.h
+    packager/media/base/language_utils.{h,cc}
     include/packager/mpd_params.h
     include/packager/cea_caption.h
 
   Also includes:
     src/dash/dash-content-protection.ts
+    src/dash/dash-fourcc.ts
+    src/dash/dash-language-utils.ts
+    src/dash/dash-media-info.ts
+    src/dash/dash-mpd-utils.ts
     src/dash/dash-types.ts
     src/dash/dash-xml-node.ts
 

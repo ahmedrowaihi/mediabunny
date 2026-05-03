@@ -64,7 +64,14 @@ import {
 	HEX_STRING_REGEX,
 } from '../misc';
 import { EncodedPacket, PLACEHOLDER_DATA } from '../packet';
-import { buildIsobmffMimeType, parsePsshBoxContents, psshBoxesAreEqual, PsshBox } from './isobmff-misc';
+import {
+	buildIsobmffMimeType,
+	parsePsshBoxContents,
+	parseSidxBoxContents,
+	psshBoxesAreEqual,
+	PsshBox,
+	SidxBox,
+} from './isobmff-misc';
 import {
 	MAX_BOX_HEADER_SIZE,
 	MIN_BOX_HEADER_SIZE,
@@ -304,6 +311,7 @@ export class IsobmffDemuxer extends Demuxer {
 	isFragmented = false;
 	fragmentTrackDefaults: FragmentTrackDefaults[] = [];
 	psshBoxes: PsshBox[] = [];
+	sidxBoxes: SidxBox[] = [];
 	currentFragment: Fragment | null = null;
 	/**
 	 * Caches the last fragment that was read. Based on the assumption that there will be multiple reads to the
@@ -345,6 +353,11 @@ export class IsobmffDemuxer extends Demuxer {
 		return this.metadataTags;
 	}
 
+	override async getSegmentIndex() {
+		await this.readMetadata();
+		return this.sidxBoxes;
+	}
+
 	readMetadata() {
 		return this.metadataPromise ??= (async () => {
 			let currentPos = 0;
@@ -364,6 +377,16 @@ export class IsobmffDemuxer extends Demuxer {
 				if (boxInfo.name === 'ftyp' || boxInfo.name === 'styp') {
 					const majorBrand = readAscii(slice, 4);
 					this.isQuickTime = majorBrand === 'qt  ';
+				} else if (boxInfo.name === 'sidx') {
+					let sidxSlice = this.reader.requestSlice(slice.filePos, boxInfo.contentSize);
+					if (sidxSlice instanceof Promise) sidxSlice = await sidxSlice;
+					if (!sidxSlice) break;
+
+					this.sidxBoxes.push(parseSidxBoxContents(
+						readBytes(sidxSlice, boxInfo.contentSize),
+						startPos,
+						boxInfo.totalSize,
+					));
 				} else if (boxInfo.name === 'moov') {
 					// Found moov, load it
 
@@ -386,8 +409,16 @@ export class IsobmffDemuxer extends Demuxer {
 						&& this.reader.fileSize !== null
 						&& this.reader.fileSize > startPos + boxInfo.totalSize; // There's more after the moov box
 
-					break;
+					// Don't break here — keep iterating so a `sidx` that follows `moov`
+					// (DASH on-demand profile layout) is also captured. Iteration stops
+					// when we hit `moof`/`mdat` or EOF.
 				} else if (boxInfo.name === 'moof') {
+					if (this.movieTimescale !== -1) {
+						// `moov` was already parsed earlier in the same file; the rest is
+						// fragments which are read lazily.
+						break;
+					}
+
 					if (!this.input._initInput) {
 						throw new Error(
 							'"moof" box encountered with no "moov" box present; this file is likely a Segment as'

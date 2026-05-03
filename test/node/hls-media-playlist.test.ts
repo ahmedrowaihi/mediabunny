@@ -1,3 +1,4 @@
+/* eslint-disable @stylistic/max-len */
 /*!
  * Test cases ported from Shaka Packager (BSD-3-Clause).
  * https://github.com/shaka-project/shaka-packager/blob/main/packager/hls/base/media_playlist_unittest.cc
@@ -8,6 +9,7 @@ import type { HlsMediaInfo, HlsParams } from '../../src/hls/hls-types.js';
 
 const TIME_SCALE = 90_000;
 const MBYTES = 1_000_000;
+const SHAKA_BANNER = '## Generated with https://github.com/shaka-project/shaka-packager version test';
 
 const generatorBanner = (): { generatorUrl: string; generatorVersion: string } => ({
 	generatorUrl: 'https://github.com/shaka-project/shaka-packager',
@@ -173,6 +175,161 @@ describe('MediaPlaylist — single-segment byterange', () => {
 			+ '#EXTINF:10.000,\n'
 			+ '#EXT-X-BYTERANGE:2000000\n'
 			+ 'file.mp4\n'
+			+ '#EXT-X-ENDLIST\n',
+		);
+	});
+});
+
+describe('MediaPlaylist — encryption (DRM)', () => {
+	// shaka: TEST_F(MediaPlaylistMultiSegmentTest, WriteToFileWithEncryptionInfo)
+	test('SAMPLE-AES with IV + KEYFORMATVERSIONS + KEYFORMAT', () => {
+		const p = new MediaPlaylist(vodParams(), 'media.m3u8', 'video', 'group');
+		p.setMediaInfo({ ...videoMediaInfo(), referenceTimeScale: TIME_SCALE, segmentTemplateUrl: '$Number$.ts' });
+		p.addEncryptionInfo({
+			method: 'SAMPLE-AES',
+			url: 'http://example.com',
+			iv: '0x12345678',
+			keyFormat: 'com.widevine',
+			keyFormatVersions: '1/2/4',
+		});
+		p.addSegment('file1.ts', 0, 10 * TIME_SCALE, 0, 1_000_000);
+		p.addSegment('file2.ts', 10 * TIME_SCALE, 30 * TIME_SCALE, 0, 5_000_000);
+
+		expect(p.build({ endStream: true })).toBe(
+			'#EXTM3U\n'
+			+ '#EXT-X-VERSION:6\n'
+			+ `${SHAKA_BANNER}\n`
+			+ '#EXT-X-TARGETDURATION:30\n'
+			+ '#EXT-X-PLAYLIST-TYPE:VOD\n'
+			+ '#EXT-X-KEY:METHOD=SAMPLE-AES,URI="http://example.com",IV=0x12345678,KEYFORMATVERSIONS="1/2/4",KEYFORMAT="com.widevine"\n'
+			+ '#EXTINF:10.000,\n'
+			+ 'file1.ts\n'
+			+ '#EXTINF:30.000,\n'
+			+ 'file2.ts\n'
+			+ '#EXT-X-ENDLIST\n',
+		);
+	});
+
+	// shaka: TEST_F(MediaPlaylistMultiSegmentTest, WriteToFileWithEncryptionInfoEmptyIv)
+	test('SAMPLE-AES with KEYFORMAT only (no IV, no versions)', () => {
+		const p = new MediaPlaylist(vodParams(), 'media.m3u8', 'video', 'group');
+		p.setMediaInfo({ ...videoMediaInfo(), referenceTimeScale: TIME_SCALE, segmentTemplateUrl: '$Number$.ts' });
+		p.addEncryptionInfo({
+			method: 'SAMPLE-AES',
+			url: 'http://example.com',
+			keyFormat: 'com.widevine',
+		});
+		p.addSegment('file1.ts', 0, 10 * TIME_SCALE, 0, 1_000_000);
+		p.addSegment('file2.ts', 10 * TIME_SCALE, 30 * TIME_SCALE, 0, 5_000_000);
+
+		expect(p.build({ endStream: true })).toBe(
+			'#EXTM3U\n'
+			+ '#EXT-X-VERSION:6\n'
+			+ `${SHAKA_BANNER}\n`
+			+ '#EXT-X-TARGETDURATION:30\n'
+			+ '#EXT-X-PLAYLIST-TYPE:VOD\n'
+			+ '#EXT-X-KEY:METHOD=SAMPLE-AES,URI="http://example.com",KEYFORMAT="com.widevine"\n'
+			+ '#EXTINF:10.000,\n'
+			+ 'file1.ts\n'
+			+ '#EXTINF:30.000,\n'
+			+ 'file2.ts\n'
+			+ '#EXT-X-ENDLIST\n',
+		);
+	});
+
+	// shaka: TEST_F(MediaPlaylistMultiSegmentTest, WriteToFileWithClearLead)
+	test('inserts EXT-X-DISCONTINUITY before the first key when there is clear lead', () => {
+		const p = new MediaPlaylist(vodParams(), 'media.m3u8', 'video', 'group');
+		p.setMediaInfo({ ...videoMediaInfo(), referenceTimeScale: TIME_SCALE, segmentTemplateUrl: '$Number$.ts' });
+		p.addSegment('file1.ts', 0, 10 * TIME_SCALE, 0, 1_000_000);
+		p.addEncryptionInfo({
+			method: 'SAMPLE-AES',
+			url: 'http://example.com',
+			iv: '0x12345678',
+			keyFormat: 'com.widevine',
+			keyFormatVersions: '1/2/4',
+		});
+		p.addSegment('file2.ts', 10 * TIME_SCALE, 30 * TIME_SCALE, 0, 5_000_000);
+
+		expect(p.build({ endStream: true })).toBe(
+			'#EXTM3U\n'
+			+ '#EXT-X-VERSION:6\n'
+			+ `${SHAKA_BANNER}\n`
+			+ '#EXT-X-TARGETDURATION:30\n'
+			+ '#EXT-X-PLAYLIST-TYPE:VOD\n'
+			+ '#EXTINF:10.000,\n'
+			+ 'file1.ts\n'
+			+ '#EXT-X-DISCONTINUITY\n'
+			+ '#EXT-X-KEY:METHOD=SAMPLE-AES,URI="http://example.com",IV=0x12345678,KEYFORMATVERSIONS="1/2/4",KEYFORMAT="com.widevine"\n'
+			+ '#EXTINF:30.000,\n'
+			+ 'file2.ts\n'
+			+ '#EXT-X-ENDLIST\n',
+		);
+	});
+
+	// shaka: TEST_F(MediaPlaylistMultiSegmentTest, SampleAesCenc)
+	test('SAMPLE-AES-CTR method', () => {
+		const p = new MediaPlaylist(vodParams(), 'media.m3u8', 'video', 'group');
+		p.setMediaInfo({ ...videoMediaInfo(), referenceTimeScale: TIME_SCALE, segmentTemplateUrl: '$Number$.ts' });
+		p.addEncryptionInfo({
+			method: 'SAMPLE-AES-CTR',
+			url: 'http://example.com',
+			iv: '0x12345678',
+			keyFormat: 'com.widevine',
+			keyFormatVersions: '1/2/4',
+		});
+		p.addSegment('file1.ts', 0, 10 * TIME_SCALE, 0, 1_000_000);
+		p.addSegment('file2.ts', 10 * TIME_SCALE, 30 * TIME_SCALE, 0, 5_000_000);
+
+		expect(p.build({ endStream: true })).toBe(
+			'#EXTM3U\n'
+			+ '#EXT-X-VERSION:6\n'
+			+ `${SHAKA_BANNER}\n`
+			+ '#EXT-X-TARGETDURATION:30\n'
+			+ '#EXT-X-PLAYLIST-TYPE:VOD\n'
+			+ '#EXT-X-KEY:METHOD=SAMPLE-AES-CTR,URI="http://example.com",IV=0x12345678,KEYFORMATVERSIONS="1/2/4",KEYFORMAT="com.widevine"\n'
+			+ '#EXTINF:10.000,\n'
+			+ 'file1.ts\n'
+			+ '#EXTINF:30.000,\n'
+			+ 'file2.ts\n'
+			+ '#EXT-X-ENDLIST\n',
+		);
+	});
+
+	// shaka: TEST_F(MediaPlaylistMultiSegmentTest, MultipleEncryptionInfo)
+	test('multiple keys at the start emit consecutive #EXT-X-KEY lines (no discontinuity between them)', () => {
+		const p = new MediaPlaylist(vodParams(), 'media.m3u8', 'video', 'group');
+		p.setMediaInfo({ ...videoMediaInfo(), segmentTemplateUrl: '$Number$.ts' });
+		p.addEncryptionInfo({
+			method: 'SAMPLE-AES',
+			url: 'http://example.com',
+			iv: '0x12345678',
+			keyFormat: 'com.widevine',
+			keyFormatVersions: '1/2/4',
+		});
+		p.addEncryptionInfo({
+			method: 'SAMPLE-AES',
+			url: 'http://mydomain.com',
+			keyId: '0xfedc',
+			iv: '0x12345678',
+			keyFormat: 'com.widevine.someother',
+			keyFormatVersions: '1',
+		});
+		p.addSegment('file1.ts', 0, 10 * TIME_SCALE, 0, 1_000_000);
+		p.addSegment('file2.ts', 10 * TIME_SCALE, 30 * TIME_SCALE, 0, 5_000_000);
+
+		expect(p.build({ endStream: true })).toBe(
+			'#EXTM3U\n'
+			+ '#EXT-X-VERSION:6\n'
+			+ `${SHAKA_BANNER}\n`
+			+ '#EXT-X-TARGETDURATION:30\n'
+			+ '#EXT-X-PLAYLIST-TYPE:VOD\n'
+			+ '#EXT-X-KEY:METHOD=SAMPLE-AES,URI="http://example.com",IV=0x12345678,KEYFORMATVERSIONS="1/2/4",KEYFORMAT="com.widevine"\n'
+			+ '#EXT-X-KEY:METHOD=SAMPLE-AES,URI="http://mydomain.com",KEYID=0xfedc,IV=0x12345678,KEYFORMATVERSIONS="1",KEYFORMAT="com.widevine.someother"\n'
+			+ '#EXTINF:10.000,\n'
+			+ 'file1.ts\n'
+			+ '#EXTINF:30.000,\n'
+			+ 'file2.ts\n'
 			+ '#EXT-X-ENDLIST\n',
 		);
 	});

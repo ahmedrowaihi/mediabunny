@@ -19,6 +19,12 @@ Shaka Packager (BSD-3-Clause)
     packager/hls/base/tag.{h,cc}
     packager/hls/base/media_playlist.{h,cc}
     packager/hls/base/master_playlist.{h,cc}
+    packager/mpd/base/content_protection_element.h
+    packager/mpd/base/xml/xml_node.{h,cc}
+
+  Also includes:
+    src/dash/dash-element.ts
+    src/dash/dash-xml-node.ts
 
   Copyright 2014, Google LLC. All rights reserved.
   Full license text: see LICENSE.shaka-packager

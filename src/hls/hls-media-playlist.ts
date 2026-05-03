@@ -121,6 +121,9 @@ export class MediaPlaylist {
 	private insertedDiscontinuityTag = false;
 	private referenceTimeMs: number | null = null;
 	private readonly bandwidthEstimator = new BandwidthEstimator();
+	// I-frame mode buffer: shaka collects keyframes until the enclosing segment
+	// is added, then flushes them all at once with adjusted durations.
+	private readonly keyFrames: { timestamp: number; startByteOffset: number; size: number }[] = [];
 
 	constructor(
 		private readonly hlsParams: HlsParams,
@@ -171,8 +174,43 @@ export class MediaPlaylist {
 	 * Append one media segment line. `startTime` and `duration` are in track timescale
 	 * units. For single-file byterange playlists, supply non-zero `size` and use the
 	 * cumulative `startByteOffset` of the segment in the file.
+	 *
+	 * For I-frame-only playlists (after at least one {@link addKeyFrame} call),
+	 * this flushes the buffered keyframes as `#EXTINF` entries spanning each
+	 * keyframe's interval, mirroring shaka.
 	 */
 	addSegment(
+		fileName: string,
+		startTime: number,
+		duration: number,
+		startByteOffset: number,
+		size: number,
+	): void {
+		if (this.streamType === 'videoIFramesOnly') {
+			if (this.keyFrames.length === 0) {
+				return;
+			}
+			this.adjustLastSegmentInfoEntryDuration(this.keyFrames[0]!.timestamp);
+			for (let i = 0; i < this.keyFrames.length; i++) {
+				const kf = this.keyFrames[i]!;
+				const nextTimestamp = i + 1 < this.keyFrames.length
+					? this.keyFrames[i + 1]!.timestamp
+					: startTime + duration;
+				this.addSegmentInfoEntry(
+					fileName,
+					kf.timestamp,
+					nextTimestamp - kf.timestamp,
+					kf.startByteOffset,
+					kf.size,
+				);
+			}
+			this.keyFrames.length = 0;
+			return;
+		}
+		this.addSegmentInfoEntry(fileName, startTime, duration, startByteOffset, size);
+	}
+
+	private addSegmentInfoEntry(
 		fileName: string,
 		startTime: number,
 		duration: number,
@@ -206,6 +244,46 @@ export class MediaPlaylist {
 		});
 		this.entries.push(entry);
 		this.previousSegmentEndOffset = startByteOffset + size - 1;
+	}
+
+	/**
+	 * Buffer a keyframe for an I-frame-only playlist. The first call promotes
+	 * the playlist's stream type from `video` to `videoIFramesOnly` and turns on
+	 * byte-range emission. Buffered keyframes are flushed by the next
+	 * {@link addSegment} call, which determines the final keyframe's duration.
+	 */
+	addKeyFrame(timestamp: number, startByteOffset: number, size: number): void {
+		if (this.streamType !== 'videoIFramesOnly') {
+			if (this.streamType !== 'video') {
+				// I-frames-only applies to video renditions only — silently drop
+				// to mirror shaka's "warn and skip" behavior.
+				return;
+			}
+			this.streamType = 'videoIFramesOnly';
+			this.useByteRange = true;
+		}
+		this.keyFrames.push({ timestamp, startByteOffset, size });
+	}
+
+	private adjustLastSegmentInfoEntryDuration(nextTimestamp: number): void {
+		if (this.timeScale === 0) {
+			return;
+		}
+		const nextTimestampSeconds = nextTimestamp / this.timeScale;
+		for (let i = this.entries.length - 1; i >= 0; i--) {
+			const entry = this.entries[i]!;
+			if (entry instanceof SegmentInfoEntry) {
+				const segmentDurationSeconds = nextTimestampSeconds - entry.getStartTime() / this.timeScale;
+				if (segmentDurationSeconds > 0) {
+					entry.setDurationSeconds(segmentDurationSeconds);
+				}
+				this.longestSegmentDurationSeconds = Math.max(
+					this.longestSegmentDurationSeconds,
+					segmentDurationSeconds,
+				);
+				return;
+			}
+		}
 	}
 
 	/**
@@ -369,6 +447,40 @@ export class MediaPlaylist {
 	/** Returns the estimator's running average bandwidth. Matches shaka. */
 	getAvgBitrate(): number {
 		return this.bandwidthEstimator.estimate();
+	}
+
+	/**
+	 * Returns the HLS `VIDEO-RANGE` value (`"PQ"`, `"HLG"`, `"SDR"`) derived from
+	 * `transferCharacteristics`. Returns `""` when no signal is present, matching
+	 * shaka. See https://tools.ietf.org/html/draft-pantos-hls-rfc8216bis-02#section-4.4.4.2
+	 */
+	getVideoRange(): string {
+		// Dolby Vision (dvh1/dvhe) is always HDR/PQ.
+		if (this.codec.startsWith('dvh')) {
+			return 'PQ';
+		}
+		const tc = this.mediaInfo?.videoInfo?.transferCharacteristics;
+		switch (tc) {
+			case 1:
+			case 6:
+			case 13:
+			case 14:
+				// Dolby Vision profile 8.4 may report 14, with the actual value in
+				// the SEI's preferred_transfer_characteristic. shaka uses the
+				// compatible brand `db4g` as a workaround.
+				if (this.supplementalCodec && this.compatibleBrand === 'db4g') {
+					return 'HLG';
+				}
+				return 'SDR';
+			case 15:
+				return 'SDR';
+			case 16:
+				return 'PQ';
+			case 18:
+				return 'HLG';
+			default:
+				return '';
+		}
 	}
 
 	/** Returns the video frame rate computed from `videoInfo.timeScale / videoInfo.frameDuration`, or `0`. */

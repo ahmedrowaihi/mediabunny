@@ -164,6 +164,10 @@ const buildStreamInfTag = (
 				tag.addFloat('FRAME-RATE', fps);
 			}
 		}
+		const videoRange = p.getVideoRange();
+		if (videoRange) {
+			tag.addString('VIDEO-RANGE', videoRange);
+		}
 	}
 
 	if (!isIFrame) {

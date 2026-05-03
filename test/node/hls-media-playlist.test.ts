@@ -335,6 +335,88 @@ describe('MediaPlaylist — encryption (DRM)', () => {
 	});
 });
 
+describe('MediaPlaylist — placement opportunity & program date time', () => {
+	// shaka: TEST_F(MediaPlaylistMultiSegmentTest, WriteToFileWithSegmentsAndPlacementOpportunity)
+	test('emits #EXT-X-PLACEMENT-OPPORTUNITY between segments', () => {
+		const p = new MediaPlaylist(vodParams(), 'media.m3u8', 'video', 'group');
+		p.setMediaInfo({ ...videoMediaInfo(), referenceTimeScale: TIME_SCALE, segmentTemplateUrl: '$Number$.ts' });
+		p.addSegment('file1.ts', 0, 10 * TIME_SCALE, 0, 1_000_000);
+		p.addPlacementOpportunity();
+		p.addSegment('file2.ts', 10 * TIME_SCALE, 30 * TIME_SCALE, 0, 5_000_000);
+
+		expect(p.build({ endStream: true })).toBe(
+			'#EXTM3U\n'
+			+ '#EXT-X-VERSION:6\n'
+			+ `${SHAKA_BANNER}\n`
+			+ '#EXT-X-TARGETDURATION:30\n'
+			+ '#EXT-X-PLAYLIST-TYPE:VOD\n'
+			+ '#EXTINF:10.000,\n'
+			+ 'file1.ts\n'
+			+ '#EXT-X-PLACEMENT-OPPORTUNITY\n'
+			+ '#EXTINF:30.000,\n'
+			+ 'file2.ts\n'
+			+ '#EXT-X-ENDLIST\n',
+		);
+	});
+
+	// shaka: TEST_F(MediaPlaylistMultiSegmentTest, ProgramDateTime)
+	test('emits #EXT-X-PROGRAM-DATE-TIME before the first segment when reference time is set', () => {
+		const p = new MediaPlaylist({
+			...vodParams(),
+			addProgramDateTime: true,
+		}, 'media.m3u8', 'video', 'group');
+		p.setReferenceTime(Date.UTC(2025, 9, 12, 14, 0, 0, 0));
+		p.setMediaInfo({ ...videoMediaInfo(), referenceTimeScale: TIME_SCALE, segmentTemplateUrl: '$Number$.ts' });
+		p.addSegment('file1.ts', 0, 10 * TIME_SCALE, 0, 1_000_000);
+
+		expect(p.build({ endStream: true })).toBe(
+			'#EXTM3U\n'
+			+ '#EXT-X-VERSION:6\n'
+			+ `${SHAKA_BANNER}\n`
+			+ '#EXT-X-TARGETDURATION:10\n'
+			+ '#EXT-X-PLAYLIST-TYPE:VOD\n'
+			+ '#EXT-X-PROGRAM-DATE-TIME:2025-10-12T14:00:00.000Z\n'
+			+ '#EXTINF:10.000,\n'
+			+ 'file1.ts\n'
+			+ '#EXT-X-ENDLIST\n',
+		);
+	});
+
+	// shaka: TEST_F(MediaPlaylistMultiSegmentTest, ProgramDateTimeWithDiscontinuity)
+	test('emits PDT after every discontinuity (clear-lead → encrypted)', () => {
+		const p = new MediaPlaylist({
+			...vodParams(),
+			addProgramDateTime: true,
+		}, 'media.m3u8', 'video', 'group');
+		p.setReferenceTime(Date.UTC(2025, 9, 12, 14, 0, 0, 0));
+		p.setMediaInfo({ ...videoMediaInfo(), referenceTimeScale: TIME_SCALE, segmentTemplateUrl: '$Number$.ts' });
+		p.addSegment('file1.ts', 10 * TIME_SCALE, 10 * TIME_SCALE, 0, 1_000_000);
+		// addEncryptionInfo inserts a discontinuity since there is clear-lead.
+		p.addEncryptionInfo({ method: 'SAMPLE-AES', url: 'http://example.com' });
+		p.addSegment('file2.ts', 25 * TIME_SCALE, 10 * TIME_SCALE, 0, 1_000_000);
+		p.addSegment('file3.ts', 25 * TIME_SCALE, 10 * TIME_SCALE, 0, 1_000_000);
+
+		expect(p.build({ endStream: true })).toBe(
+			'#EXTM3U\n'
+			+ '#EXT-X-VERSION:6\n'
+			+ `${SHAKA_BANNER}\n`
+			+ '#EXT-X-TARGETDURATION:10\n'
+			+ '#EXT-X-PLAYLIST-TYPE:VOD\n'
+			+ '#EXT-X-PROGRAM-DATE-TIME:2025-10-12T14:00:10.000Z\n'
+			+ '#EXTINF:10.000,\n'
+			+ 'file1.ts\n'
+			+ '#EXT-X-DISCONTINUITY\n'
+			+ '#EXT-X-KEY:METHOD=SAMPLE-AES,URI="http://example.com"\n'
+			+ '#EXT-X-PROGRAM-DATE-TIME:2025-10-12T14:00:25.000Z\n'
+			+ '#EXTINF:10.000,\n'
+			+ 'file2.ts\n'
+			+ '#EXTINF:10.000,\n'
+			+ 'file3.ts\n'
+			+ '#EXT-X-ENDLIST\n',
+		);
+	});
+});
+
 describe('MediaPlaylist — playlist types', () => {
 	test('EVENT playlist omits #EXT-X-ENDLIST', () => {
 		const p = new MediaPlaylist(

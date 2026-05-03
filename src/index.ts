@@ -377,6 +377,12 @@ export {
 	type RepresentationCounter,
 } from './dash/dash-adaptation-set';
 export {
+	Period,
+} from './dash/dash-period';
+export {
+	addContentProtectionElements,
+} from './dash/dash-mpd-utils';
+export {
 	Representation,
 	type RepresentationStateChangeListener,
 	SuppressFlag,

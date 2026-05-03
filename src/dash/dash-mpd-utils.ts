@@ -589,3 +589,189 @@ export const DRM_UUIDS = {
 	PLAYREADY: PLAYREADY_UUID,
 	MSPR_VALUE: CONTENT_PROTECTION_VALUE_MSPR_20,
 } as const;
+
+/**
+ * Parse the inner `pssh_data` payload from a serialized PSSH box (ISO/IEC
+ * 23001-7 §8.1). Mirrors shaka-packager's
+ * `PsshBoxBuilder::ParseFromBox` (subset: only what
+ * `generateMsprProElement` needs). Returns `null` when the input is not a
+ * valid `pssh` box.
+ *
+ * Box layout consumed:
+ *   uint32 size
+ *   uint32 type ('pssh')
+ *   uint32 version+flags  (only versions 0, 1 supported)
+ *   uint8[16] systemId
+ *   v1 only: uint32 keyIdCount + uint8[16][] keyIds
+ *   uint32 dataSize
+ *   uint8[dataSize] data  ← returned
+ *
+ * @internal
+ */
+const parsePsshBoxData = (pssh: Uint8Array): Uint8Array | null => {
+	if (pssh.length < 4 + 4 + 4 + 16 + 4) {
+		return null;
+	}
+	const view = new DataView(pssh.buffer, pssh.byteOffset, pssh.byteLength);
+	let offset = 0;
+	// Box header
+	const size = view.getUint32(offset, false);
+	offset += 4;
+	const boxType = view.getUint32(offset, false);
+	offset += 4;
+	// 'pssh' = 0x70737368
+	if (boxType !== 0x70737368) {
+		return null;
+	}
+	if (size > pssh.length) {
+		return null;
+	}
+	const versionAndFlags = view.getUint32(offset, false);
+	offset += 4;
+	const version = versionAndFlags >>> 24;
+	if (version > 1) {
+		return null;
+	}
+	// SystemID (16 bytes) — skip
+	offset += 16;
+	if (version === 1) {
+		if (offset + 4 > pssh.length) {
+			return null;
+		}
+		const keyIdCount = view.getUint32(offset, false);
+		offset += 4;
+		const keyIdsBytes = keyIdCount * 16;
+		if (offset + keyIdsBytes > pssh.length) {
+			return null;
+		}
+		offset += keyIdsBytes;
+	}
+	if (offset + 4 > pssh.length) {
+		return null;
+	}
+	const dataSize = view.getUint32(offset, false);
+	offset += 4;
+	if (offset + dataSize > pssh.length) {
+		return null;
+	}
+	return pssh.slice(offset, offset + dataSize);
+};
+
+/**
+ * Generate an `<mspr:pro>` element containing the base64-encoded PlayReady
+ * Object extracted from a PSSH box. Mirrors shaka's `GenerateMsprProElement`.
+ * Returns `null` when the PSSH box cannot be parsed.
+ *
+ * @internal
+ */
+export const generateMsprProElement = (pssh: Uint8Array): Element | null => {
+	const psshData = parsePsshBoxData(pssh);
+	if (psshData === null) {
+		return null;
+	}
+	return {
+		name: MSPRO_ELEMENT_NAME,
+		attributes: new Map(),
+		content: bytesToBase64(psshData),
+		subelements: [],
+	};
+};
+
+/**
+ * Add `<ContentProtection>` elements derived from `mediaInfo` to the
+ * supplied parent (Representation or AdaptationSet — both expose
+ * `addContentProtectionElement`). Mirrors shaka's templated
+ * `AddContentProtectionElementsHelperTemplated`.
+ *
+ * Behaviour:
+ * - No-op when `mediaInfo.protectedContent` is unset.
+ * - For ISO BMFF (`containerType === 'mp4'`), emits the default Common-Encryption
+ *   descriptor (`schemeIdUri="urn:mpeg:dash:mp4protection:2011"`) with `value`
+ *   set to the protection scheme and optionally `cenc:default_KID`.
+ * - For each `ContentProtectionEntry`, emits one DRM-specific descriptor:
+ *   - FairPlay: skipped (FairPlay does not support DASH signaling per shaka).
+ *   - Marlin: scheme uses uppercase UUID; subelement is `<mas:MarlinContentIds>`.
+ *   - PlayReady: includes `<cenc:pssh>` and (when `includeMsprPro`) `<mspr:pro>`,
+ *     with `value="MSPR 2.0"`.
+ *   - Other systems (Widevine, etc.): `<cenc:pssh>` subelement.
+ *
+ * @group DASH
+ * @public
+ */
+export const addContentProtectionElements = (
+	mediaInfo: MediaInfo,
+	parent: { addContentProtectionElement: (element: ContentProtectionElement) => void },
+): void => {
+	const protectedContent = mediaInfo.protectedContent;
+	if (!protectedContent) {
+		return;
+	}
+
+	const isMp4Container = mediaInfo.containerType === 'mp4';
+	const defaultKeyId = protectedContent.defaultKeyId;
+	const hasUsableKeyId = defaultKeyId !== undefined
+		&& defaultKeyId.length > 0
+		&& !isKeyRotationDefaultKeyId(defaultKeyId);
+	const keyIdUuidFormat = hasUsableKeyId ? hexToUUID(defaultKeyId) : null;
+
+	if (isMp4Container) {
+		const mp4Cp: ContentProtectionElement = {
+			value: protectedContent.protectionScheme ?? 'cenc',
+			schemeIdUri: ENCRYPTED_MP4_SCHEME,
+			additionalAttributes: new Map(),
+			subelements: [],
+		};
+		if (keyIdUuidFormat) {
+			mp4Cp.additionalAttributes.set('cenc:default_KID', keyIdUuidFormat);
+		}
+		parent.addContentProtectionElement(mp4Cp);
+	}
+
+	const includeMsprPro = protectedContent.includeMsprPro ?? true;
+	for (const entry of protectedContent.contentProtectionEntry ?? []) {
+		if (entry.uuid === undefined || entry.uuid.length === 0) {
+			continue;
+		}
+
+		const cp: ContentProtectionElement = {
+			value: '',
+			schemeIdUri: '',
+			additionalAttributes: new Map(),
+			subelements: [],
+		};
+
+		if (entry.nameVersion !== undefined && entry.nameVersion.length > 0) {
+			cp.value = entry.nameVersion;
+		}
+
+		if (entry.uuid === DRM_UUIDS.FAIRPLAY) {
+			// shaka skips FairPlay since it does not support DASH signaling.
+			continue;
+		}
+
+		if (entry.uuid === DRM_UUIDS.MARLIN) {
+			cp.schemeIdUri = `urn:uuid:${entry.uuid.toUpperCase()}`;
+			if (defaultKeyId) {
+				cp.subelements.push(generateMarlinContentIds(defaultKeyId));
+			}
+		} else {
+			cp.schemeIdUri = `urn:uuid:${entry.uuid}`;
+			if (entry.pssh && entry.pssh.length > 0) {
+				cp.subelements.push(generateCencPsshElement(entry.pssh));
+				if (entry.uuid === DRM_UUIDS.PLAYREADY && includeMsprPro) {
+					const mspr = generateMsprProElement(entry.pssh);
+					if (mspr) {
+						cp.subelements.push(mspr);
+					}
+					cp.value = DRM_UUIDS.MSPR_VALUE;
+				}
+			}
+		}
+
+		if (keyIdUuidFormat && !isMp4Container) {
+			cp.additionalAttributes.set('cenc:default_KID', keyIdUuidFormat);
+		}
+
+		parent.addContentProtectionElement(cp);
+	}
+};

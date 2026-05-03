@@ -24,6 +24,7 @@ Shaka Packager (BSD-3-Clause)
     packager/mpd/base/mpd_options.h
     packager/mpd/base/mpd_utils.{h,cc}
     packager/mpd/base/media_info.proto
+    packager/mpd/base/period.{h,cc}
     packager/mpd/base/representation.{h,cc}
     packager/mpd/base/segment_info.h
     packager/mpd/base/xml/xml_node.{h,cc}
@@ -40,6 +41,7 @@ Shaka Packager (BSD-3-Clause)
     src/dash/dash-language-utils.ts
     src/dash/dash-media-info.ts
     src/dash/dash-mpd-utils.ts
+    src/dash/dash-period.ts
     src/dash/dash-representation.ts
     src/dash/dash-representation-xml-node.ts
     src/dash/dash-segment-name.ts

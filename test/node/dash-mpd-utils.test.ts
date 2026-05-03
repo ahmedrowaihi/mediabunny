@@ -5,8 +5,11 @@
  * the pure helpers below get coverage via these tests instead.
  */
 import { describe, expect, test } from 'vitest';
+import { AdaptationSet } from '../../src/dash/dash-adaptation-set.js';
 import type { ContentProtectionElement } from '../../src/dash/dash-content-protection.js';
+import type { MediaInfo } from '../../src/dash/dash-media-info.js';
 import {
+	addContentProtectionElements,
 	atLeastOneTrue,
 	floatToXmlString,
 	getAdaptationSetKey,
@@ -26,7 +29,9 @@ import {
 	TRANSFER_FUNCTION_PQ,
 	updateContentProtectionPsshHelper,
 } from '../../src/dash/dash-mpd-utils.js';
+import { createDefaultMpdOptions } from '../../src/dash/dash-types.js';
 import { XmlNode } from '../../src/dash/dash-xml-node.js';
+import { expectXmlEqual } from './_xml-equal.js';
 
 describe('floatToXmlString', () => {
 	test('integer renders without decimal point', () => {
@@ -368,5 +373,195 @@ describe('getDurationAttribute', () => {
 		const node = new XmlNode('S');
 		node.setStringAttribute('duration', 'not-a-number');
 		expect(getDurationAttribute(node)).toBeNull();
+	});
+});
+
+describe('addContentProtectionElements', () => {
+	const defaultKeyId = new Uint8Array([
+		0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37,
+		0x38, 0x39, 0x3a, 0x3b, 0x3c, 0x3d, 0x3e, 0x3f,
+	]);
+
+	const newAdaptationSet = (): AdaptationSet => {
+		return new AdaptationSet('', createDefaultMpdOptions(), { value: 0 });
+	};
+
+	const baseVideoMediaInfo = (): MediaInfo => ({
+		videoInfo: {
+			codec: 'avc1',
+			width: 1920,
+			height: 1080,
+			timeScale: 3000,
+			frameDuration: 100,
+		},
+		containerType: 'mp4',
+	});
+
+	// shaka: TEST_F(MpdUtilsTest, ContentProtectionGeneral)
+	test('ContentProtectionGeneral', () => {
+		const adaptationSet = newAdaptationSet();
+		const mediaInfo: MediaInfo = {
+			...baseVideoMediaInfo(),
+			protectedContent: {
+				defaultKeyId,
+				contentProtectionEntry: [
+					{ uuid: 'my_uuid', pssh: new TextEncoder().encode('my_pssh') },
+				],
+			},
+		};
+
+		addContentProtectionElements(mediaInfo, adaptationSet);
+		expect(adaptationSet.addRepresentation(mediaInfo)).not.toBeNull();
+
+		expectXmlEqual(
+			adaptationSet.getXml()!.toString(),
+			'<AdaptationSet contentType="video" width="1920"'
+			+ '    height="1080" frameRate="3000/100">'
+			+ '  <ContentProtection value="cenc"'
+			+ '      schemeIdUri="urn:mpeg:dash:mp4protection:2011"'
+			+ '      cenc:default_KID="30313233-3435-3637-3839-3a3b3c3d3e3f"/>'
+			+ '  <ContentProtection schemeIdUri="urn:uuid:my_uuid">'
+			+ '    <cenc:pssh>bXlfcHNzaA==</cenc:pssh>'
+			+ '  </ContentProtection>'
+			+ '  <Representation id="0" bandwidth="0" codecs="avc1"'
+			+ '   mimeType="video/mp4"/>'
+			+ '</AdaptationSet>',
+		);
+	});
+
+	// shaka: TEST_F(MpdUtilsTest, ContentProtectionMarlin)
+	test('ContentProtectionMarlin', () => {
+		const adaptationSet = newAdaptationSet();
+		const mediaInfo: MediaInfo = {
+			...baseVideoMediaInfo(),
+			protectedContent: {
+				defaultKeyId,
+				contentProtectionEntry: [
+					{ uuid: '5e629af5-38da-4063-8977-97ffbd9902d4' },
+				],
+			},
+		};
+
+		addContentProtectionElements(mediaInfo, adaptationSet);
+		expect(adaptationSet.addRepresentation(mediaInfo)).not.toBeNull();
+
+		expectXmlEqual(
+			adaptationSet.getXml()!.toString(),
+			'<AdaptationSet contentType="video" width="1920"'
+			+ '    height="1080" frameRate="3000/100">'
+			+ '  <ContentProtection value="cenc"'
+			+ '      schemeIdUri="urn:mpeg:dash:mp4protection:2011"'
+			+ '      cenc:default_KID="30313233-3435-3637-3839-3a3b3c3d3e3f"/>'
+			+ '  <ContentProtection'
+			+ '      schemeIdUri="urn:uuid:5E629AF5-38DA-4063-8977-97FFBD9902D4">'
+			+ '    <mas:MarlinContentIds>'
+			+ '      <mas:MarlinContentId>'
+			+ '        urn:marlin:kid:303132333435363738393a3b3c3d3e3f'
+			+ '      </mas:MarlinContentId>'
+			+ '    </mas:MarlinContentIds>'
+			+ '  </ContentProtection>'
+			+ '  <Representation id="0" bandwidth="0" codecs="avc1"'
+			+ '   mimeType="video/mp4"/>'
+			+ '</AdaptationSet>',
+		);
+	});
+
+	// Helper to build a hex-encoded byte sequence into Uint8Array.
+	const hexToBytes = (hex: string): Uint8Array => {
+		const compact = hex.replace(/\s+/g, '');
+		const bytes = new Uint8Array(compact.length / 2);
+		for (let i = 0; i < bytes.length; i++) {
+			bytes[i] = parseInt(compact.slice(i * 2, i * 2 + 2), 16);
+		}
+		return bytes;
+	};
+
+	// shaka: TEST_F(MpdUtilsTest, ContentProtectionPlayReadyCencMspr)
+	test('ContentProtectionPlayReadyCencMspr', () => {
+		const psshHex = '0000003870737368010000009A04F079'
+			+ '98404286AB92E65BE0885F9500000001'
+			+ '11223344556677889900AABBCCDDEEFF'
+			+ '0000000430313233';
+		const pssh = hexToBytes(psshHex);
+
+		const adaptationSet = newAdaptationSet();
+		const mediaInfo: MediaInfo = {
+			...baseVideoMediaInfo(),
+			protectedContent: {
+				protectionScheme: 'cenc',
+				defaultKeyId,
+				includeMsprPro: true,
+				contentProtectionEntry: [
+					{ uuid: '9a04f079-9840-4286-ab92-e65be0885f95', pssh },
+				],
+			},
+		};
+
+		addContentProtectionElements(mediaInfo, adaptationSet);
+		expect(adaptationSet.addRepresentation(mediaInfo)).not.toBeNull();
+
+		expectXmlEqual(
+			adaptationSet.getXml()!.toString(),
+			'<AdaptationSet contentType="video" width="1920"'
+			+ '    height="1080" frameRate="3000/100">'
+			+ '  <ContentProtection value="cenc"'
+			+ '      schemeIdUri="urn:mpeg:dash:mp4protection:2011"'
+			+ '      cenc:default_KID="30313233-3435-3637-3839-3a3b3c3d3e3f"/>'
+			+ '  <ContentProtection value="MSPR 2.0"'
+			+ '      schemeIdUri="urn:uuid:9a04f079-9840-4286-ab92-e65be0885f95">'
+			+ '    <cenc:pssh>'
+			+ 'AAAAOHBzc2gBAAAAmgTweZhAQoarkuZb4IhflQAAAAERIjNEVWZ3iJkAqrvM3e7/'
+			+ 'AAAABDAxMjM='
+			+ '    </cenc:pssh>'
+			+ '    <mspr:pro>MDEyMw==</mspr:pro>'
+			+ '  </ContentProtection>'
+			+ '  <Representation id="0" bandwidth="0" codecs="avc1"'
+			+ '   mimeType="video/mp4"/>'
+			+ '</AdaptationSet>',
+		);
+	});
+
+	// shaka: TEST_F(MpdUtilsTest, ContentProtectionPlayReadyCenc)
+	test('ContentProtectionPlayReadyCenc', () => {
+		const psshHex = '0000003870737368010000009A04F079'
+			+ '98404286AB92E65BE0885F9500000001'
+			+ '11223344556677889900AABBCCDDEEFF'
+			+ '0000000430313233';
+		const pssh = hexToBytes(psshHex);
+
+		const adaptationSet = newAdaptationSet();
+		const mediaInfo: MediaInfo = {
+			...baseVideoMediaInfo(),
+			protectedContent: {
+				protectionScheme: 'cenc',
+				defaultKeyId,
+				includeMsprPro: false,
+				contentProtectionEntry: [
+					{ uuid: '9a04f079-9840-4286-ab92-e65be0885f95', pssh },
+				],
+			},
+		};
+
+		addContentProtectionElements(mediaInfo, adaptationSet);
+		expect(adaptationSet.addRepresentation(mediaInfo)).not.toBeNull();
+
+		expectXmlEqual(
+			adaptationSet.getXml()!.toString(),
+			'<AdaptationSet contentType="video" width="1920"'
+			+ '    height="1080" frameRate="3000/100">'
+			+ '  <ContentProtection value="cenc"'
+			+ '      schemeIdUri="urn:mpeg:dash:mp4protection:2011"'
+			+ '      cenc:default_KID="30313233-3435-3637-3839-3a3b3c3d3e3f"/>'
+			+ '  <ContentProtection'
+			+ '      schemeIdUri="urn:uuid:9a04f079-9840-4286-ab92-e65be0885f95">'
+			+ '    <cenc:pssh>'
+			+ 'AAAAOHBzc2gBAAAAmgTweZhAQoarkuZb4IhflQAAAAERIjNEVWZ3iJkAqrvM3e7/'
+			+ 'AAAABDAxMjM='
+			+ '    </cenc:pssh>'
+			+ '  </ContentProtection>'
+			+ '  <Representation id="0" bandwidth="0" codecs="avc1"'
+			+ '   mimeType="video/mp4"/>'
+			+ '</AdaptationSet>',
+		);
 	});
 });

@@ -23,10 +23,12 @@ Shaka Packager (BSD-3-Clause)
     packager/mpd/base/mpd_options.h
     packager/mpd/base/mpd_utils.{h,cc}
     packager/mpd/base/media_info.proto
+    packager/mpd/base/representation.{h,cc}
     packager/mpd/base/segment_info.h
     packager/mpd/base/xml/xml_node.{h,cc}
     packager/media/base/fourccs.h
     packager/media/base/language_utils.{h,cc}
+    packager/media/base/muxer_util.{h,cc}
     include/packager/mpd_params.h
     include/packager/cea_caption.h
 
@@ -36,7 +38,9 @@ Shaka Packager (BSD-3-Clause)
     src/dash/dash-language-utils.ts
     src/dash/dash-media-info.ts
     src/dash/dash-mpd-utils.ts
+    src/dash/dash-representation.ts
     src/dash/dash-representation-xml-node.ts
+    src/dash/dash-segment-name.ts
     src/dash/dash-types.ts
     src/dash/dash-xml-node.ts
 

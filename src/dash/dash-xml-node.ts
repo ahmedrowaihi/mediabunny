@@ -13,29 +13,7 @@
  */
 
 import type { Element } from './dash-content-protection';
-
-/**
- * Format a floating-point number for XML output, matching shaka's `FloatToXmlString`
- * helper from `mpd_utils.cc`: print with 6 decimals, trim trailing zeros, drop the
- * trailing decimal point if no fractional digits remain.
- *
- * @internal
- */
-const floatToXmlString = (number: number): string => {
-	let formatted = number.toFixed(6);
-	const decimalPos = formatted.indexOf('.');
-	if (decimalPos !== -1) {
-		let lastNonZero = formatted.length - 1;
-		while (lastNonZero > decimalPos && formatted[lastNonZero] === '0') {
-			lastNonZero--;
-		}
-		formatted = formatted.slice(0, lastNonZero + 1);
-		if (formatted.endsWith('.')) {
-			formatted = formatted.slice(0, -1);
-		}
-	}
-	return formatted;
-};
+import { floatToXmlString } from './dash-mpd-utils';
 
 /**
  * Strict RFC 3986 percent-encoder. Equivalent to `curl_easy_escape`, which shaka

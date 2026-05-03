@@ -363,5 +363,52 @@ export {
 	createDefaultMpdParams,
 	createDefaultMpdOptions,
 } from './dash/dash-types';
+export {
+	type Range as DashRange,
+	type ContainerType as DashContainerType,
+	type TextType as DashTextType,
+	type AudioCodecSpecificData as DashAudioCodecSpecificData,
+	type VideoInfo as DashVideoInfo,
+	type AudioInfo as DashAudioInfo,
+	type TextInfo as DashTextInfo,
+	type ContentProtectionEntry as DashContentProtectionEntry,
+	type ProtectedContent as DashProtectedContent,
+	type ContentProtectionXml as DashContentProtectionXml,
+	type ContentProtectionXmlElement as DashContentProtectionXmlElement,
+	type MediaInfo as DashMediaInfo,
+	containerTypeName,
+	textTypeName,
+} from './dash/dash-media-info';
+export {
+	languageToShortestForm,
+	languageToISO6392,
+} from './dash/dash-language-utils';
+export {
+	fourCCToString,
+} from './dash/dash-fourcc';
+export {
+	ENCRYPTED_MP4_SCHEME,
+	PSSH_ELEMENT_NAME,
+	MSPRO_ELEMENT_NAME,
+	TRANSFER_FUNCTION_PQ,
+	TRANSFER_FUNCTION_HLG,
+	hasVodOnlyFields,
+	hasLiveOnlyFields,
+	removeDuplicateAttributes,
+	getLanguage,
+	getCodecs,
+	getSupplementalCodecs,
+	getSupplementalProfiles,
+	getBaseCodec,
+	getAdaptationSetKey,
+	floatToXmlString,
+	secondsToXmlDuration,
+	getDurationAttribute,
+	moreThanOneTrue,
+	atLeastOneTrue,
+	onlyOneTrue,
+	hexToUUID,
+	updateContentProtectionPsshHelper,
+} from './dash/dash-mpd-utils';
 
 // 🐡🦔

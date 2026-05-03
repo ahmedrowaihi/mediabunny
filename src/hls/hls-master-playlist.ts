@@ -1,9 +1,14 @@
 /*!
+ * Copyright (c) 2026-present, Vanilagy and contributors
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
+/*!
  * Ported from Shaka Packager, Copyright 2016 Google LLC. All rights reserved.
  * Original source: https://github.com/shaka-project/shaka-packager/blob/main/packager/hls/base/master_playlist.cc
  * Licensed under the BSD-3-Clause License. See LICENSE.shaka-packager in the repo root.
- *
- * TypeScript port: Copyright (c) 2026-present, contributors.
  * This file is dual-licensed under BSD-3-Clause (original) and MPL-2.0 (mediabunny).
  */
 
@@ -253,23 +258,38 @@ const buildVariants = (
  * @public
  */
 export class MasterPlaylist {
+	/** @internal */
 	private readonly playlists: MediaPlaylist[] = [];
 
 	constructor(
+		/** Master playlist render options. */
 		private readonly opts: {
+			/** Emit `#EXT-X-INDEPENDENT-SEGMENTS` near the top of the master playlist. */
 			independentSegments?: boolean;
+			/** Two-letter language code that flips an audio rendition to `DEFAULT=YES`. */
 			defaultAudioLanguage?: string;
+			/** Two-letter language code that flips a subtitle rendition to `DEFAULT=YES`. */
 			defaultSubtitleLanguage?: string;
+			/** Generator banner line (rendered immediately after `#EXTM3U`). */
 			generatorBanner?: string;
+			/** Collect every unique `#EXT-X-KEY` and emit `#EXT-X-SESSION-KEY` at the master level. */
 			createSessionKeys?: boolean;
 		} = {},
 	) {}
 
+	/** Register a {@link MediaPlaylist} as a video / audio / subtitle / I-frame rendition. */
 	addPlaylist(p: MediaPlaylist): void {
 		this.playlists.push(p);
 	}
 
-	build(opts: { baseUrl?: string } = {}): string {
+	/**
+	 * Render the master playlist as a single string. Pass a `baseUrl` to prefix
+	 * every segment / playlist URI with the given absolute or relative URL.
+	 */
+	build(opts: {
+		/** Optional URL prefix prepended to every variant / rendition URI. */
+		baseUrl?: string;
+	} = {}): string {
 		const baseUrl = opts.baseUrl ?? '';
 		const lines: string[] = ['#EXTM3U'];
 		if (this.opts.generatorBanner) {

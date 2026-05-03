@@ -1,9 +1,14 @@
 /*!
+ * Copyright (c) 2026-present, Vanilagy and contributors
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
+/*!
  * Ported from Shaka Packager, Copyright 2018 Google LLC. All rights reserved.
  * Original source: https://github.com/shaka-project/shaka-packager/blob/main/packager/hls/base/tag.cc
  * Licensed under the BSD-3-Clause License. See LICENSE.shaka-packager in the repo root.
- *
- * TypeScript port: Copyright (c) 2026-present, contributors.
  * This file is dual-licensed under BSD-3-Clause (original) and MPL-2.0 (mediabunny).
  */
 
@@ -19,7 +24,9 @@
  * @public
  */
 export class Tag {
+	/** @internal */
 	private result: string;
+	/** @internal */
 	private fields = 0;
 
 	constructor(name: string) {
@@ -78,6 +85,7 @@ export class Tag {
 		return this.result;
 	}
 
+	/** @internal */
 	private nextField(): void {
 		if (this.fields++ > 0) {
 			this.result += ',';

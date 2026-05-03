@@ -36,6 +36,7 @@ Shaka Packager (BSD-3-Clause)
     src/dash/dash-language-utils.ts
     src/dash/dash-media-info.ts
     src/dash/dash-mpd-utils.ts
+    src/dash/dash-representation-xml-node.ts
     src/dash/dash-types.ts
     src/dash/dash-xml-node.ts
 

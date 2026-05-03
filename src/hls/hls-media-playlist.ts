@@ -7,6 +7,7 @@
  * This file is dual-licensed under BSD-3-Clause (original) and MPL-2.0 (mediabunny).
  */
 
+import { BandwidthEstimator } from './hls-bandwidth-estimator';
 import { DiscontinuityEntry, type HlsEntry, SegmentInfoEntry } from './hls-entries';
 import { Tag } from './hls-tag';
 import {
@@ -109,6 +110,7 @@ export class MediaPlaylist {
 	private targetDurationSet = false;
 	private longestSegmentDurationSeconds = 0;
 	private previousSegmentEndOffset = 0;
+	private readonly bandwidthEstimator = new BandwidthEstimator();
 
 	constructor(
 		private readonly hlsParams: HlsParams,
@@ -172,6 +174,7 @@ export class MediaPlaylist {
 			this.longestSegmentDurationSeconds,
 			durationSeconds,
 		);
+		this.bandwidthEstimator.addBlock(size, durationSeconds);
 
 		const entry = new SegmentInfoEntry({
 			fileName,
@@ -247,14 +250,20 @@ export class MediaPlaylist {
 		return this.mediaInfo;
 	}
 
-	/** Returns the max bitrate from `MediaInfo.bandwidth` (caller-supplied). */
+	/**
+	 * Returns peak bitrate. Matches shaka: prefers caller-supplied
+	 * `MediaInfo.bandwidth` when set, falls back to the estimator's max.
+	 */
 	getMaxBitrate(): number {
-		return this.mediaInfo?.bandwidth ?? 0;
+		if (this.mediaInfo?.bandwidth !== undefined) {
+			return this.mediaInfo.bandwidth;
+		}
+		return this.bandwidthEstimator.max();
 	}
 
-	/** Returns the average bitrate. Currently same as `getMaxBitrate()` — caller-supplied. */
+	/** Returns the estimator's running average bandwidth. Matches shaka. */
 	getAvgBitrate(): number {
-		return this.mediaInfo?.bandwidth ?? 0;
+		return this.bandwidthEstimator.estimate();
 	}
 
 	/** Returns the video frame rate computed from `videoInfo.timeScale / videoInfo.frameDuration`, or `0`. */

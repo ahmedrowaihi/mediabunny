@@ -257,11 +257,6 @@ export class MasterPlaylist {
 			defaultAudioLanguage?: string;
 			defaultSubtitleLanguage?: string;
 			generatorBanner?: string;
-			/**
-			 * When `true`, every `#EXT-X-KEY` found inside the registered media
-			 * playlists is also emitted at the master level as `#EXT-X-SESSION-KEY`
-			 * (deduplicated). Mirrors shaka's `create_session_keys_`.
-			 */
 			createSessionKeys?: boolean;
 		} = {},
 	) {}
@@ -283,6 +278,8 @@ export class MasterPlaylist {
 		}
 
 		if (this.opts.createSessionKeys) {
+			// Mirror shaka: collect every EXT-X-KEY across registered playlists,
+			// deduplicate by rendered tag, and emit each as #EXT-X-SESSION-KEY.
 			const sessionKeys = new Set<string>();
 			for (const p of this.playlists) {
 				for (const entry of p.getEntries()) {

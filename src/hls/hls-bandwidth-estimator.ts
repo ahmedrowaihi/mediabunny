@@ -1,12 +1,18 @@
 /*!
+ * Copyright (c) 2026-present, Vanilagy and contributors
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
+/*!
  * Ported from Shaka Packager, Copyright 2014 Google LLC. All rights reserved.
  * Original source: https://github.com/shaka-project/shaka-packager/blob/main/packager/mpd/base/bandwidth_estimator.cc
  * Licensed under the BSD-3-Clause License. See LICENSE.shaka-packager in the repo root.
- *
- * TypeScript port: Copyright (c) 2026-present, contributors.
  * This file is dual-licensed under BSD-3-Clause (original) and MPL-2.0 (mediabunny).
  */
 
+/** @internal */
 interface Block {
 	sizeInBits: number;
 	duration: number;
@@ -18,8 +24,8 @@ const TARGET_DURATION_THRESHOLD = 10;
  * Computes peak and average bandwidth across a series of media-segment blocks.
  * Mirrors shaka-packager's `BandwidthEstimator` (used for both DASH and HLS).
  *
- * - The first {@link TARGET_DURATION_THRESHOLD} blocks (default 10) seed an
- *   adaptive target duration; subsequent blocks are evaluated against it.
+ * - The first 10 blocks (`TARGET_DURATION_THRESHOLD`) seed an adaptive target
+ *   duration; subsequent blocks are evaluated against it.
  * - Per RFC 8216 §4.1, segments shorter than 50% of target duration are
  *   excluded from peak-bandwidth computation (they're not representative of
  *   sustained throughput).
@@ -28,15 +34,22 @@ const TARGET_DURATION_THRESHOLD = 10;
  * @public
  */
 export class BandwidthEstimator {
+	/** @internal */
 	private initialBlocks: Block[] = [];
+	/** @internal */
 	private targetBlockDuration = 0;
+	/** @internal */
 	private totalSizeInBits = 0;
+	/** @internal */
 	private totalDuration = 0;
+	/** @internal */
 	private maxBitrate = 0;
 
 	/**
-	 * @param sizeInBytes block size in bytes (must be > 0)
-	 * @param duration block duration in seconds (must be > 0)
+	 * Record one media block.
+	 *
+	 * @param sizeInBytes - block size in bytes (must be greater than 0)
+	 * @param duration - block duration in seconds (must be greater than 0)
 	 */
 	addBlock(sizeInBytes: number, duration: number): void {
 		if (sizeInBytes === 0 || duration === 0) {
@@ -91,6 +104,7 @@ export class BandwidthEstimator {
 		return maxBitrate;
 	}
 
+	/** @internal */
 	private getAverageBlockDuration(): number {
 		if (this.initialBlocks.length === 0) {
 			return 0;
@@ -99,6 +113,7 @@ export class BandwidthEstimator {
 		return sum / this.initialBlocks.length;
 	}
 
+	/** @internal */
 	private getBitrate(block: Block, targetBlockDuration: number): number {
 		// Per shaka: exclude short segments (< 50% of target) from peak computation
 		// to match the RFC 8216 §4.1 definition of "peak segment bit rate".

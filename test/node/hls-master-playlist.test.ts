@@ -86,7 +86,7 @@ describe('MasterPlaylist — single video', () => {
 			'#EXTM3U\n'
 			+ `${SHAKA_BANNER}\n`
 			+ '\n'
-			+ '#EXT-X-STREAM-INF:BANDWIDTH=435889,AVERAGE-BANDWIDTH=435889,'
+			+ '#EXT-X-STREAM-INF:BANDWIDTH=435889,AVERAGE-BANDWIDTH=0,'
 			+ 'CODECS="avc1",RESOLUTION=800x600,CLOSED-CAPTIONS=NONE\n'
 			+ 'http://myplaylistdomain.com/media1.m3u8\n',
 		);
@@ -106,7 +106,7 @@ describe('MasterPlaylist — single video', () => {
 			+ `${SHAKA_BANNER}\n`
 			+ '\n#EXT-X-INDEPENDENT-SEGMENTS\n'
 			+ '\n'
-			+ '#EXT-X-STREAM-INF:BANDWIDTH=435889,AVERAGE-BANDWIDTH=435889,'
+			+ '#EXT-X-STREAM-INF:BANDWIDTH=435889,AVERAGE-BANDWIDTH=0,'
 			+ 'CODECS="avc1",RESOLUTION=800x600,CLOSED-CAPTIONS=NONE\n'
 			+ 'http://myplaylistdomain.com/media1.m3u8\n',
 		);
@@ -126,7 +126,7 @@ describe('MasterPlaylist — single video', () => {
 			'#EXTM3U\n'
 			+ `${SHAKA_BANNER}\n`
 			+ '\n'
-			+ '#EXT-X-STREAM-INF:BANDWIDTH=435889,AVERAGE-BANDWIDTH=435889,'
+			+ '#EXT-X-STREAM-INF:BANDWIDTH=435889,AVERAGE-BANDWIDTH=0,'
 			+ 'CODECS="avc1",RESOLUTION=800x600,FRAME-RATE=60.000,'
 			+ 'CLOSED-CAPTIONS=NONE\n'
 			+ 'http://myplaylistdomain.com/media1.m3u8\n',
@@ -181,11 +181,11 @@ describe('MasterPlaylist — video + audio', () => {
 			+ 'GROUP-ID="audiogroup",LANGUAGE="es",NAME="espanol",'
 			+ 'DEFAULT=NO,AUTOSELECT=YES,CHANNELS="5"\n'
 			+ '\n'
-			+ '#EXT-X-STREAM-INF:BANDWIDTH=360000,AVERAGE-BANDWIDTH=360000,'
+			+ '#EXT-X-STREAM-INF:BANDWIDTH=360000,AVERAGE-BANDWIDTH=0,'
 			+ 'CODECS="sdvideocodec,audiocodec",'
 			+ 'RESOLUTION=800x600,AUDIO="audiogroup",CLOSED-CAPTIONS=NONE\n'
 			+ 'http://playlists.org/sd.m3u8\n'
-			+ '#EXT-X-STREAM-INF:BANDWIDTH=760000,AVERAGE-BANDWIDTH=760000,'
+			+ '#EXT-X-STREAM-INF:BANDWIDTH=760000,AVERAGE-BANDWIDTH=0,'
 			+ 'CODECS="hdvideocodec,audiocodec",'
 			+ 'RESOLUTION=800x600,AUDIO="audiogroup",CLOSED-CAPTIONS=NONE\n'
 			+ 'http://playlists.org/hd.m3u8\n',
@@ -209,7 +209,7 @@ describe('MasterPlaylist — audio-only master', () => {
 
 		const out = m.build({ baseUrl: 'http://x/' });
 		expect(out).toContain('#EXT-X-MEDIA:TYPE=AUDIO');
-		expect(out).toContain('#EXT-X-STREAM-INF:BANDWIDTH=50000,AVERAGE-BANDWIDTH=50000,'
+		expect(out).toContain('#EXT-X-STREAM-INF:BANDWIDTH=50000,AVERAGE-BANDWIDTH=0,'
 			+ 'CODECS="audiocodec",AUDIO="audiogroup",CLOSED-CAPTIONS=NONE');
 		expect(out).toContain('http://x/eng.m3u8');
 	});

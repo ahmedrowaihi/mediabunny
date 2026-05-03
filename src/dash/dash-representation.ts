@@ -184,6 +184,32 @@ export class Representation {
 	}
 
 	/**
+	 * Create a fresh Representation that shares `other`'s media info,
+	 * options, and id but starts with empty segment / content-protection
+	 * state. Mirrors shaka's
+	 * `Representation::Representation(const Representation&, ...)` copy
+	 * constructor — used by {@link AdaptationSet.copyRepresentation} to
+	 * clone Representations across Periods.
+	 *
+	 * Pre-computed `mimeType` and `codecs` are propagated so the clone
+	 * doesn't require a fresh `init()` call.
+	 */
+	static cloneFrom(
+		other: Representation,
+		stateChangeListener: RepresentationStateChangeListener | null = null,
+	): Representation {
+		const clone = new Representation(
+			other.mediaInfo,
+			other.mpdOptions,
+			other.idValue,
+			stateChangeListener,
+		);
+		clone.mimeType = other.mimeType;
+		clone.codecs = other.codecs;
+		return clone;
+	}
+
+	/**
 	 * Validate the MediaInfo and pre-compute mimeType / codecs / supplemental
 	 * codec strings. Returns `false` (with no side effects on success state)
 	 * when validation fails. Mirrors shaka's `Init`.

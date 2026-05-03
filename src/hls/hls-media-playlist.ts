@@ -45,7 +45,8 @@ const buildPlaylistHeader = (
 ): string[] => {
 	const lines: string[] = ['#EXTM3U', '#EXT-X-VERSION:6'];
 	if (generatorBanner) {
-		lines.splice(1, 0, generatorBanner);
+		// Shaka places the generator banner between EXT-X-VERSION and EXT-X-TARGETDURATION.
+		lines.push(generatorBanner);
 	}
 	lines.push(`#EXT-X-TARGETDURATION:${targetDuration}`);
 
@@ -176,7 +177,7 @@ export class MediaPlaylist {
 			fileName,
 			startTime,
 			durationSeconds,
-			useByteRange: this.useByteRange && size > 0,
+			useByteRange: this.useByteRange,
 			startByteOffset,
 			segmentFileSize: size,
 			previousSegmentEndOffset: this.previousSegmentEndOffset,

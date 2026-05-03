@@ -79,8 +79,8 @@ describe('MediaPlaylist — multi-segment', () => {
 		p.setMediaInfo(videoMediaInfo());
 		expect(p.build({ endStream: true })).toBe(
 			'#EXTM3U\n'
-			+ '## Generated with https://github.com/shaka-project/shaka-packager version test\n'
 			+ '#EXT-X-VERSION:6\n'
+			+ '## Generated with https://github.com/shaka-project/shaka-packager version test\n'
 			+ '#EXT-X-TARGETDURATION:0\n'
 			+ '#EXT-X-PLAYLIST-TYPE:VOD\n'
 			+ '#EXT-X-ENDLIST\n',
@@ -99,8 +99,8 @@ describe('MediaPlaylist — multi-segment', () => {
 
 		expect(p.build({ endStream: true })).toBe(
 			'#EXTM3U\n'
-			+ '## Generated with https://github.com/shaka-project/shaka-packager version test\n'
 			+ '#EXT-X-VERSION:6\n'
+			+ '## Generated with https://github.com/shaka-project/shaka-packager version test\n'
 			+ '#EXT-X-TARGETDURATION:10\n'
 			+ '#EXT-X-PLAYLIST-TYPE:VOD\n'
 			+ '#EXTINF:10.000,\n'
@@ -122,8 +122,8 @@ describe('MediaPlaylist — single-segment byterange', () => {
 
 		expect(p.build({ endStream: true })).toBe(
 			'#EXTM3U\n'
-			+ '## Generated with https://github.com/shaka-project/shaka-packager version test\n'
 			+ '#EXT-X-VERSION:6\n'
+			+ '## Generated with https://github.com/shaka-project/shaka-packager version test\n'
 			+ '#EXT-X-TARGETDURATION:0\n'
 			+ '#EXT-X-PLAYLIST-TYPE:VOD\n'
 			+ '#EXT-X-MAP:URI="file.mp4",BYTERANGE="501@0"\n'
@@ -140,8 +140,8 @@ describe('MediaPlaylist — single-segment byterange', () => {
 
 		expect(p.build({ endStream: true })).toBe(
 			'#EXTM3U\n'
-			+ '## Generated with https://github.com/shaka-project/shaka-packager version test\n'
 			+ '#EXT-X-VERSION:6\n'
+			+ '## Generated with https://github.com/shaka-project/shaka-packager version test\n'
 			+ '#EXT-X-TARGETDURATION:0\n'
 			+ '#EXT-X-PLAYLIST-TYPE:VOD\n'
 			+ '#EXT-X-MAP:URI="file.mp4",BYTERANGE="485@16"\n'
@@ -162,8 +162,8 @@ describe('MediaPlaylist — single-segment byterange', () => {
 
 		expect(p.build({ endStream: true })).toBe(
 			'#EXTM3U\n'
-			+ '## Generated with https://github.com/shaka-project/shaka-packager version test\n'
 			+ '#EXT-X-VERSION:6\n'
+			+ '## Generated with https://github.com/shaka-project/shaka-packager version test\n'
 			+ '#EXT-X-TARGETDURATION:10\n'
 			+ '#EXT-X-PLAYLIST-TYPE:VOD\n'
 			+ '#EXT-X-MAP:URI="file.mp4",BYTERANGE="501@0"\n'

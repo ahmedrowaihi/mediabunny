@@ -19,6 +19,7 @@
     "Encoding": "Encoder configuration and encodability checks.",
 	"Decoding": "Decoder configuration and decodability checks.",
     "Custom coders": "API for adding custom encoders and decoders.",
+    "HLS": "Generators for HLS master playlists and per-rendition `.m3u8` media playlists. Ported from shaka-packager.",
     "Miscellaneous": "Whatever's left.",
 
 	"@mediabunny/server": "Adds full video/audio decoder and encoder support to Mediabunny running in server-side environments such as Node, Bun, or Deno.",

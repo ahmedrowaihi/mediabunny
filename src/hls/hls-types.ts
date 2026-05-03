@@ -131,7 +131,11 @@ export interface HlsMediaInfo {
 	initRange?: { begin: number; end: number };
 	/** Template URL used by segmented containers (presence disables byte-range mode). */
 	segmentTemplateUrl?: string;
-	/** Average bandwidth in bits per second; used by `EXT-X-STREAM-INF`. */
+	/**
+	 * Peak bandwidth in bits per second. When set, used directly as the result of
+	 * `MediaPlaylist::MaxBitrate()`. When unset, peak bandwidth is computed from
+	 * segment data via the {@link BandwidthEstimator}, matching shaka exactly.
+	 */
 	bandwidth?: number;
 	containerType?: HlsContainerType;
 	forcedSubtitle?: boolean;

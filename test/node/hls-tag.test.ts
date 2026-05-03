@@ -3,7 +3,7 @@
  * https://github.com/shaka-project/shaka-packager/blob/main/packager/hls/base/tag.cc
  */
 import { describe, expect, test } from 'vitest';
-import { Tag } from '../../src/hls/hls-tag';
+import { Tag } from '../../src/hls/hls-tag.js';
 
 describe('Tag', () => {
 	test('renders bare tag with no fields', () => {

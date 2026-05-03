@@ -8,7 +8,7 @@ import {
 	PlacementOpportunityEntry,
 	ProgramDateTimeEntry,
 	SegmentInfoEntry,
-} from '../../src/hls/hls-entries';
+} from '../../src/hls/hls-entries.js';
 
 describe('SegmentInfoEntry', () => {
 	test('renders without byte range', () => {

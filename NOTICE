@@ -19,6 +19,7 @@ Shaka Packager (BSD-3-Clause)
     packager/hls/base/tag.{h,cc}
     packager/hls/base/media_playlist.{h,cc}
     packager/hls/base/master_playlist.{h,cc}
+    packager/mpd/base/adaptation_set.{h,cc}
     packager/mpd/base/content_protection_element.h
     packager/mpd/base/mpd_options.h
     packager/mpd/base/mpd_utils.{h,cc}
@@ -33,6 +34,7 @@ Shaka Packager (BSD-3-Clause)
     include/packager/cea_caption.h
 
   Also includes:
+    src/dash/dash-adaptation-set.ts
     src/dash/dash-content-protection.ts
     src/dash/dash-fourcc.ts
     src/dash/dash-language-utils.ts

@@ -1,9 +1,14 @@
 /*!
+ * Copyright (c) 2026-present, Vanilagy and contributors
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
+/*!
  * Ported from Shaka Packager, Copyright 2016 Google LLC. All rights reserved.
  * Original source: https://github.com/shaka-project/shaka-packager/blob/main/packager/hls/base/media_playlist.cc
  * Licensed under the BSD-3-Clause License. See LICENSE.shaka-packager in the repo root.
- *
- * TypeScript port: Copyright (c) 2026-present, contributors.
  * This file is dual-licensed under BSD-3-Clause (original) and MPL-2.0 (mediabunny).
  */
 
@@ -102,33 +107,58 @@ const buildPlaylistHeader = (
  * @public
  */
 export class MediaPlaylist {
+	/** @internal */
 	private mediaInfo?: HlsMediaInfo;
+	/** @internal */
 	private streamType: HlsMediaPlaylistStreamType = 'video';
+	/** @internal */
 	private codec = '';
+	/** @internal */
 	private supplementalCodec?: string;
+	/** @internal */
 	private compatibleBrand?: string;
+	/** @internal */
 	private timeScale = 0;
+	/** @internal */
 	private language = '';
+	/** @internal */
 	private useByteRange = false;
+	/** @internal */
 	private characteristics: string[] = [];
+	/** @internal */
 	private forcedSubtitle = false;
 
+	/** @internal */
 	private readonly entries: HlsEntry[] = [];
+	/** @internal */
 	private targetDurationSeconds = 0;
+	/** @internal */
 	private targetDurationSet = false;
+	/** @internal */
 	private longestSegmentDurationSeconds = 0;
+	/** @internal */
 	private previousSegmentEndOffset = 0;
+	/** @internal */
 	private insertedDiscontinuityTag = false;
+	/** @internal */
 	private referenceTimeMs: number | null = null;
+	/** @internal */
 	private readonly bandwidthEstimator = new BandwidthEstimator();
-	// I-frame mode buffer: shaka collects keyframes until the enclosing segment
-	// is added, then flushes them all at once with adjusted durations.
+	/**
+	 * I-frame mode buffer: shaka collects keyframes until the enclosing segment
+	 * is added, then flushes them all at once with adjusted durations.
+	 * @internal
+	 */
 	private readonly keyFrames: { timestamp: number; startByteOffset: number; size: number }[] = [];
 
 	constructor(
+		/** Top-level HLS options (playlist type, sequence numbers, generator banner, etc.). */
 		private readonly hlsParams: HlsParams,
+		/** Output filename for this `.m3u8` playlist. */
 		private readonly fileName: string,
+		/** Human-readable rendition name (used as `NAME` in `#EXT-X-MEDIA`). */
 		private readonly displayName: string,
+		/** Group identifier (used as `GROUP-ID` in `#EXT-X-MEDIA`). */
 		private readonly groupId: string,
 	) {
 		// Mirror shaka: when a forced media sequence number is set, the playlist
@@ -175,7 +205,7 @@ export class MediaPlaylist {
 	 * units. For single-file byterange playlists, supply non-zero `size` and use the
 	 * cumulative `startByteOffset` of the segment in the file.
 	 *
-	 * For I-frame-only playlists (after at least one {@link addKeyFrame} call),
+	 * For I-frame-only playlists (after at least one {@link MediaPlaylist.addKeyFrame} call),
 	 * this flushes the buffered keyframes as `#EXTINF` entries spanning each
 	 * keyframe's interval, mirroring shaka.
 	 */
@@ -210,6 +240,7 @@ export class MediaPlaylist {
 		this.addSegmentInfoEntry(fileName, startTime, duration, startByteOffset, size);
 	}
 
+	/** @internal */
 	private addSegmentInfoEntry(
 		fileName: string,
 		startTime: number,
@@ -250,7 +281,7 @@ export class MediaPlaylist {
 	 * Buffer a keyframe for an I-frame-only playlist. The first call promotes
 	 * the playlist's stream type from `video` to `videoIFramesOnly` and turns on
 	 * byte-range emission. Buffered keyframes are flushed by the next
-	 * {@link addSegment} call, which determines the final keyframe's duration.
+	 * {@link MediaPlaylist.addSegment} call, which determines the final keyframe's duration.
 	 */
 	addKeyFrame(timestamp: number, startByteOffset: number, size: number): void {
 		if (this.streamType !== 'videoIFramesOnly') {
@@ -265,6 +296,7 @@ export class MediaPlaylist {
 		this.keyFrames.push({ timestamp, startByteOffset, size });
 	}
 
+	/** @internal */
 	private adjustLastSegmentInfoEntryDuration(nextTimestamp: number): void {
 		if (this.timeScale === 0) {
 			return;
@@ -291,7 +323,7 @@ export class MediaPlaylist {
 	 * with `HlsParams.addProgramDateTime`, drives auto-injected `#EXT-X-PROGRAM-DATE-TIME`
 	 * entries before the first segment and after every discontinuity.
 	 *
-	 * @param unixEpochMs absolute time in milliseconds since the Unix epoch
+	 * @param unixEpochMs - absolute time in milliseconds since the Unix epoch
 	 */
 	setReferenceTime(unixEpochMs: number): void {
 		this.referenceTimeMs = unixEpochMs;
@@ -302,6 +334,7 @@ export class MediaPlaylist {
 		this.entries.push(new PlacementOpportunityEntry());
 	}
 
+	/** @internal */
 	private maybeEmitProgramDateTime(startTime: number): void {
 		if (!this.hlsParams.addProgramDateTime || this.referenceTimeMs === null) {
 			return;
@@ -352,11 +385,17 @@ export class MediaPlaylist {
 	 * stream changes from clear to encrypted.
 	 */
 	addEncryptionInfo(opts: {
+		/** Encryption method (`SAMPLE-AES`, `AES-128`, `SAMPLE-AES-CTR`, or `NONE`). */
 		method: HlsEncryptionMethod;
+		/** URI to fetch the key. */
 		url: string;
+		/** Optional `KEYID` attribute (16-byte hex string). */
 		keyId?: string;
+		/** Optional `IV` attribute (16-byte hex string). */
 		iv?: string;
+		/** Optional `KEYFORMAT` attribute (e.g. `com.apple.streamingkeydelivery`). */
 		keyFormat?: string;
+		/** Optional `KEYFORMATVERSIONS` attribute (slash-separated list). */
 		keyFormatVersions?: string;
 	}): void {
 		if (!this.insertedDiscontinuityTag) {
@@ -380,55 +419,68 @@ export class MediaPlaylist {
 		return this.entries;
 	}
 
+	/** Override the auto-computed `#EXT-X-TARGETDURATION` (in seconds). */
 	setTargetDuration(seconds: number): void {
 		this.targetDurationSeconds = seconds;
 		this.targetDurationSet = true;
 	}
 
+	/** Returns the longest segment duration recorded so far (in seconds). */
 	getLongestSegmentDuration(): number {
 		return this.longestSegmentDurationSeconds;
 	}
 
+	/** Returns the playlist's stream type (`video`, `audio`, `subtitle`, `videoIFramesOnly`). */
 	getStreamType(): HlsMediaPlaylistStreamType {
 		return this.streamType;
 	}
 
+	/** Returns the (HLS-adjusted) RFC-6381 codec parameter string. */
 	getCodec(): string {
 		return this.codec;
 	}
 
+	/** Returns the supplemental codec for Dolby Vision dual-track signaling, if any. */
 	getSupplementalCodec(): string | undefined {
 		return this.supplementalCodec;
 	}
 
+	/** Returns the compatible brand FourCC for Dolby Vision dual-track signaling, if any. */
 	getCompatibleBrand(): string | undefined {
 		return this.compatibleBrand;
 	}
 
+	/** Returns the playlist's language tag (`audioInfo.language` || `textInfo.language` || `''`). */
 	getLanguage(): string {
 		return this.language;
 	}
 
+	/** Returns the configured `CHARACTERISTICS` attribute values. */
 	getCharacteristics(): readonly string[] {
 		return this.characteristics;
 	}
 
+	/** Returns `true` when this is a forced subtitle rendition. */
 	isForcedSubtitle(): boolean {
 		return this.forcedSubtitle;
 	}
 
+	/** Returns the output filename for this `.m3u8` playlist. */
 	getFileName(): string {
 		return this.fileName;
 	}
 
+	/** Returns the rendition's human-readable name (used as `NAME` in `#EXT-X-MEDIA`). */
 	getName(): string {
 		return this.displayName;
 	}
 
+	/** Returns the rendition's group identifier (used as `GROUP-ID` in `#EXT-X-MEDIA`). */
 	getGroupId(): string {
 		return this.groupId;
 	}
 
+	/** Returns the media-info supplied to {@link MediaPlaylist.setMediaInfo}, if any. */
 	getMediaInfo(): HlsMediaInfo | undefined {
 		return this.mediaInfo;
 	}
@@ -492,18 +544,22 @@ export class MediaPlaylist {
 		return v.timeScale / v.frameDuration;
 	}
 
+	/** Returns the audio channel count, or `0` when this is not an audio rendition. */
 	getNumChannels(): number {
 		return this.mediaInfo?.audioInfo?.numChannels ?? 0;
 	}
 
+	/** Returns the EC-3 JOC complexity (Dolby Atmos), or `0` when not applicable. */
 	getEC3JocComplexity(): number {
 		return this.mediaInfo?.audioInfo?.codecSpecificData?.ec3JocComplexity ?? 0;
 	}
 
+	/** Returns `true` when the AC-4 IMS (Immersive Stereo) flag is set. */
 	getAC4ImsFlag(): boolean {
 		return this.mediaInfo?.audioInfo?.codecSpecificData?.ac4ImsFlag ?? false;
 	}
 
+	/** Returns `true` when the AC-4 CBI (Channel-Based Immersive) flag is set. */
 	getAC4CbiFlag(): boolean {
 		return this.mediaInfo?.audioInfo?.codecSpecificData?.ac4CbiFlag ?? false;
 	}
@@ -512,7 +568,12 @@ export class MediaPlaylist {
 	 * Returns the display resolution accounting for the sample aspect ratio,
 	 * if a video track is present.
 	 */
-	getDisplayResolution(): { width: number; height: number } | null {
+	getDisplayResolution(): {
+		/** Display width (coded width × pixel aspect ratio, floored). */
+		width: number;
+		/** Display height (coded height). */
+		height: number;
+	} | null {
 		const v = this.mediaInfo?.videoInfo;
 		if (!v) {
 			return null;
@@ -529,7 +590,12 @@ export class MediaPlaylist {
 	 * If `eventToVodOnEnd` is `true` and `endStream` is `true`, an `EVENT` playlist
 	 * is rendered as `VOD`.
 	 */
-	build(opts: { eventToVodOnEnd?: boolean; endStream?: boolean } = {}): string {
+	build(opts: {
+		/** When `true` and `endStream` is `true`, an `EVENT` playlist is rendered as `VOD`. */
+		eventToVodOnEnd?: boolean;
+		/** Marks the end of stream — appends `#EXT-X-ENDLIST` for VOD playlists. */
+		endStream?: boolean;
+	} = {}): string {
 		if (!this.mediaInfo) {
 			throw new Error('MediaPlaylist.build: setMediaInfo must be called first.');
 		}

@@ -1,9 +1,14 @@
 /*!
+ * Copyright (c) 2026-present, Vanilagy and contributors
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
+/*!
  * Ported from Shaka Packager, Copyright 2016 Google LLC. All rights reserved.
  * Original source: https://github.com/shaka-project/shaka-packager/blob/main/packager/hls/base/media_playlist.cc
  * Licensed under the BSD-3-Clause License. See LICENSE.shaka-packager in the repo root.
- *
- * TypeScript port: Copyright (c) 2026-present, contributors.
  * This file is dual-licensed under BSD-3-Clause (original) and MPL-2.0 (mediabunny).
  */
 
@@ -30,7 +35,9 @@ export type HlsEntryType =
  * @public
  */
 export interface HlsEntry {
+	/** Discriminator for the kind of entry. */
 	readonly type: HlsEntryType;
+	/** Renders the entry as one or more lines of HLS playlist text. */
 	toString(): string;
 }
 
@@ -45,23 +52,38 @@ const formatExtInfDuration = (seconds: number) => seconds.toFixed(3);
  * @public
  */
 export class SegmentInfoEntry implements HlsEntry {
+	/** Discriminator for HlsEntry: always `'extInf'`. */
 	readonly type = 'extInf' as const;
 
+	/** @internal */
 	private readonly fileName: string;
+	/** @internal */
 	private readonly startTime: number;
+	/** @internal */
 	private durationSeconds: number;
+	/** @internal */
 	private readonly useByteRange: boolean;
+	/** @internal */
 	private readonly startByteOffset: number;
+	/** @internal */
 	private readonly segmentFileSize: number;
+	/** @internal */
 	private readonly previousSegmentEndOffset: number;
 
 	constructor(opts: {
+		/** Segment URI to emit on the line following `#EXTINF`. */
 		fileName: string;
+		/** Segment start time in track timescale units. */
 		startTime: number;
+		/** Segment duration in seconds (ends up in `#EXTINF:<duration>`). */
 		durationSeconds: number;
+		/** When `true`, emit `#EXT-X-BYTERANGE` after `#EXTINF`. */
 		useByteRange: boolean;
+		/** Cumulative byte offset of this segment in the single media file. */
 		startByteOffset: number;
+		/** Segment size in bytes. */
 		segmentFileSize: number;
+		/** End-of-previous-segment offset (used to compact contiguous byteranges). */
 		previousSegmentEndOffset: number;
 	}) {
 		this.fileName = opts.fileName;
@@ -73,18 +95,22 @@ export class SegmentInfoEntry implements HlsEntry {
 		this.previousSegmentEndOffset = opts.previousSegmentEndOffset;
 	}
 
+	/** Returns the segment's start time in track timescale units. */
 	getStartTime(): number {
 		return this.startTime;
 	}
 
+	/** Returns the segment's duration in seconds. */
 	getDurationSeconds(): number {
 		return this.durationSeconds;
 	}
 
+	/** Mutates the segment's duration (used by I-frame flushing). */
 	setDurationSeconds(durationSeconds: number): void {
 		this.durationSeconds = durationSeconds;
 	}
 
+	/** Renders the `#EXTINF` line, optional `#EXT-X-BYTERANGE`, and the URI. */
 	toString(): string {
 		let result = `#EXTINF:${formatExtInfDuration(this.durationSeconds)},`;
 		if (this.useByteRange) {
@@ -110,14 +136,21 @@ export class SegmentInfoEntry implements HlsEntry {
  * @public
  */
 export class EncryptionInfoEntry implements HlsEntry {
+	/** Discriminator for HlsEntry: always `'extKey'`. */
 	readonly type = 'extKey' as const;
 
 	constructor(
+		/** Encryption method (`SAMPLE-AES`, `AES-128`, `SAMPLE-AES-CTR`, or `NONE`). */
 		readonly method: HlsEncryptionMethod,
+		/** URI to fetch the key. */
 		readonly url: string,
+		/** Optional `KEYID` attribute (16-byte hex string). */
 		readonly keyId: string,
+		/** Optional `IV` attribute (16-byte hex string). */
 		readonly iv: string,
+		/** Optional `KEYFORMAT` attribute (e.g. `com.apple.streamingkeydelivery`). */
 		readonly keyFormat: string,
+		/** Optional `KEYFORMATVERSIONS` attribute (slash-separated list). */
 		readonly keyFormatVersions: string,
 	) {}
 
@@ -152,7 +185,9 @@ export class EncryptionInfoEntry implements HlsEntry {
  * @public
  */
 export class DiscontinuityEntry implements HlsEntry {
+	/** Discriminator for HlsEntry: always `'extDiscontinuity'`. */
 	readonly type = 'extDiscontinuity' as const;
+	/** Renders the literal `#EXT-X-DISCONTINUITY` line. */
 	toString(): string {
 		return '#EXT-X-DISCONTINUITY';
 	}
@@ -165,7 +200,9 @@ export class DiscontinuityEntry implements HlsEntry {
  * @public
  */
 export class PlacementOpportunityEntry implements HlsEntry {
+	/** Discriminator for HlsEntry: always `'placementOpportunity'`. */
 	readonly type = 'placementOpportunity' as const;
+	/** Renders the literal `#EXT-X-PLACEMENT-OPPORTUNITY` line. */
 	toString(): string {
 		return '#EXT-X-PLACEMENT-OPPORTUNITY';
 	}
@@ -183,10 +220,18 @@ const pad4 = (n: number) => n.toString().padStart(4, '0');
  * @public
  */
 export class ProgramDateTimeEntry implements HlsEntry {
+	/** Discriminator for HlsEntry: always `'programDateTime'`. */
 	readonly type = 'programDateTime' as const;
 
-	constructor(private readonly programTimeMs: number) {}
+	constructor(
+		/**
+		 * Wall-clock time in milliseconds since the Unix epoch.
+		 * @internal
+		 */
+		private readonly programTimeMs: number,
+	) {}
 
+	/** Renders the `#EXT-X-PROGRAM-DATE-TIME:<ISO-8601>` line. */
 	toString(): string {
 		const date = new Date(this.programTimeMs);
 		const yyyy = pad4(date.getUTCFullYear());

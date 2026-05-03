@@ -330,4 +330,12 @@ export {
 	MasterPlaylist,
 } from './hls/hls-master-playlist';
 
+// DASH MPD generators (ported from shaka-packager).
+export {
+	type Element,
+} from './dash/dash-element';
+export {
+	XmlNode,
+} from './dash/dash-xml-node';
+
 // 🐡🦔

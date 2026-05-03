@@ -12,6 +12,8 @@ import {
 	DiscontinuityEntry,
 	EncryptionInfoEntry,
 	type HlsEntry,
+	PlacementOpportunityEntry,
+	ProgramDateTimeEntry,
 	SegmentInfoEntry,
 } from './hls-entries';
 import { Tag } from './hls-tag';
@@ -117,6 +119,7 @@ export class MediaPlaylist {
 	private longestSegmentDurationSeconds = 0;
 	private previousSegmentEndOffset = 0;
 	private insertedDiscontinuityTag = false;
+	private referenceTimeMs: number | null = null;
 	private readonly bandwidthEstimator = new BandwidthEstimator();
 
 	constructor(
@@ -183,6 +186,15 @@ export class MediaPlaylist {
 		);
 		this.bandwidthEstimator.addBlock(size, durationSeconds);
 
+		// Out-of-order detection (matches shaka): if the most recent EXTINF has a
+		// later start_time than this segment, insert an EXT-X-DISCONTINUITY.
+		const last = this.entries[this.entries.length - 1];
+		if (last instanceof SegmentInfoEntry && last.getStartTime() > startTime) {
+			this.entries.push(new DiscontinuityEntry());
+		}
+
+		this.maybeEmitProgramDateTime(startTime);
+
 		const entry = new SegmentInfoEntry({
 			fileName,
 			startTime,
@@ -194,6 +206,57 @@ export class MediaPlaylist {
 		});
 		this.entries.push(entry);
 		this.previousSegmentEndOffset = startByteOffset + size - 1;
+	}
+
+	/**
+	 * Set the reference (absolute) wall-clock time the first sample maps to. Combined
+	 * with `HlsParams.addProgramDateTime`, drives auto-injected `#EXT-X-PROGRAM-DATE-TIME`
+	 * entries before the first segment and after every discontinuity.
+	 *
+	 * @param unixEpochMs absolute time in milliseconds since the Unix epoch
+	 */
+	setReferenceTime(unixEpochMs: number): void {
+		this.referenceTimeMs = unixEpochMs;
+	}
+
+	/** Append `#EXT-X-PLACEMENT-OPPORTUNITY` (Shaka's SCTE ad-marker convention). */
+	addPlacementOpportunity(): void {
+		this.entries.push(new PlacementOpportunityEntry());
+	}
+
+	private maybeEmitProgramDateTime(startTime: number): void {
+		if (!this.hlsParams.addProgramDateTime || this.referenceTimeMs === null) {
+			return;
+		}
+
+		// PDT goes before the first segment AND after every discontinuity.
+		// shaka detects discontinuity by checking last entry, OR last-key-after-discontinuity.
+		let isFirstSegment = true;
+		let isDiscontinuity = false;
+		if (this.entries.length > 0) {
+			for (let i = this.entries.length - 1; i >= 0; i--) {
+				if (this.entries[i] instanceof SegmentInfoEntry) {
+					isFirstSegment = false;
+					break;
+				}
+			}
+
+			const last = this.entries[this.entries.length - 1]!;
+			if (last instanceof DiscontinuityEntry) {
+				isDiscontinuity = true;
+			} else if (this.entries.length >= 2) {
+				const secondLast = this.entries[this.entries.length - 2]!;
+				if (last instanceof EncryptionInfoEntry && secondLast instanceof DiscontinuityEntry) {
+					isDiscontinuity = true;
+				}
+			}
+		}
+
+		if (isFirstSegment || isDiscontinuity) {
+			const programTimeMs = this.referenceTimeMs
+				+ (this.timeScale > 0 ? (startTime / this.timeScale) * 1000 : 0);
+			this.entries.push(new ProgramDateTimeEntry(programTimeMs));
+		}
 	}
 
 	/**

@@ -154,9 +154,8 @@ export interface HlsParams {
 	mediaSequenceNumber?: number;
 	discontinuitySequenceNumber?: number;
 	startTimeOffset?: number;
-	/** Project URL written into the playlist generator banner. */
+	addProgramDateTime?: boolean;
 	generatorUrl?: string;
-	/** Generator version string. */
 	generatorVersion?: string;
 }
 

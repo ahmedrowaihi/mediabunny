@@ -377,6 +377,29 @@ export class AdaptationSet {
 	}
 
 	/**
+	 * Clone an existing Representation into this AdaptationSet, preserving
+	 * its id and pre-computed mimeType/codecs. Mirrors shaka's
+	 * `AdaptationSet::CopyRepresentation` — used to duplicate a
+	 * Representation across Periods. The clone gets a fresh
+	 * state-change listener bound to this AdaptationSet.
+	 */
+	copyRepresentation(other: Representation): Representation {
+		const representationId = other.id();
+		const listener: RepresentationStateChangeListener = {
+			onNewSegmentForRepresentation: (startTime) => {
+				this.onNewSegmentForRepresentation(representationId, startTime);
+			},
+			onSetFrameRateForRepresentation: (frameDuration, timeScale) => {
+				this.onSetFrameRateForRepresentation(representationId, frameDuration, timeScale);
+			},
+		};
+		const clone = Representation.cloneFrom(other, listener);
+		this.updateFromMediaInfo(clone.getMediaInfo());
+		this.representationMap.set(clone.id(), clone);
+		return clone;
+	}
+
+	/**
 	 * Append a ContentProtection descriptor at AdaptationSet level. Mirrors
 	 * shaka's `AddContentProtectionElement`. Duplicates between the
 	 * top-level and `additionalAttributes` are stripped on insertion.

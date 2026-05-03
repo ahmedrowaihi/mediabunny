@@ -1,0 +1,25 @@
+mediabunny — TypeScript media toolkit
+Copyright (c) Vanilagy and contributors.
+
+This product is primarily licensed under the Mozilla Public License 2.0
+(see LICENSE).
+
+It includes the following third-party material:
+
+------------------------------------------------------------------------
+Shaka Packager (BSD-3-Clause)
+  src/hls/hls-tag.ts
+  src/hls/hls-entries.ts
+  src/hls/hls-types.ts
+  src/hls/hls-bandwidth-estimator.ts
+  src/hls/hls-media-playlist.ts
+  src/hls/hls-master-playlist.ts
+
+  Ported from https://github.com/shaka-project/shaka-packager
+    packager/hls/base/tag.{h,cc}
+    packager/hls/base/media_playlist.{h,cc}
+    packager/hls/base/master_playlist.{h,cc}
+
+  Copyright 2014, Google LLC. All rights reserved.
+  Full license text: see LICENSE.shaka-packager
+------------------------------------------------------------------------

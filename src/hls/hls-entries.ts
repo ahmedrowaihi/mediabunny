@@ -7,6 +7,9 @@
  * This file is dual-licensed under BSD-3-Clause (original) and MPL-2.0 (mediabunny).
  */
 
+import type { HlsEncryptionMethod } from './hls-types';
+import { Tag } from './hls-tag';
+
 /**
  * Discriminator for the kinds of lines that appear in an HLS media playlist.
  *
@@ -92,6 +95,53 @@ export class SegmentInfoEntry implements HlsEntry {
 		}
 		result += `\n${this.fileName}`;
 		return result;
+	}
+}
+
+/**
+ * One Common Encryption / SAMPLE-AES key declaration. Renders as `#EXT-X-KEY`
+ * inside a media playlist or `#EXT-X-SESSION-KEY` when consumed at the master
+ * playlist level. Mirrors shaka-packager's `EncryptionInfoEntry`.
+ *
+ * Field order in the rendered tag matches shaka exactly (METHOD, URI, KEYID,
+ * IV, KEYFORMATVERSIONS, KEYFORMAT) — RFC 8216 §4.3.2.4.
+ *
+ * @group HLS
+ * @public
+ */
+export class EncryptionInfoEntry implements HlsEntry {
+	readonly type = 'extKey' as const;
+
+	constructor(
+		readonly method: HlsEncryptionMethod,
+		readonly url: string,
+		readonly keyId: string,
+		readonly iv: string,
+		readonly keyFormat: string,
+		readonly keyFormatVersions: string,
+	) {}
+
+	/**
+	 * Renders this entry. Defaults to `#EXT-X-KEY`; pass `'#EXT-X-SESSION-KEY'`
+	 * (or any other tag name) to render the same fields under a different tag.
+	 */
+	toString(tagName = '#EXT-X-KEY'): string {
+		const tag = new Tag(tagName);
+		tag.addString('METHOD', this.method);
+		tag.addQuotedString('URI', this.url);
+		if (this.keyId) {
+			tag.addString('KEYID', this.keyId);
+		}
+		if (this.iv) {
+			tag.addString('IV', this.iv);
+		}
+		if (this.keyFormatVersions) {
+			tag.addQuotedString('KEYFORMATVERSIONS', this.keyFormatVersions);
+		}
+		if (this.keyFormat) {
+			tag.addQuotedString('KEYFORMAT', this.keyFormat);
+		}
+		return tag.toString();
 	}
 }
 

@@ -29,6 +29,8 @@
     "README.md",
     "package.json",
     "LICENSE",
+    "LICENSE.shaka-packager",
+    "NOTICE",
     "dist",
     "src"
   ],

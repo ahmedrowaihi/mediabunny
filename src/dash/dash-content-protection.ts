@@ -18,7 +18,7 @@
  * Mirrors shaka-packager's `Element` struct from `content_protection_element.h`.
  *
  * Used as input to {@link XmlNode.addElements} and as nested content inside
- * `ContentProtectionElement.subelements`.
+ * {@link ContentProtectionElement.subelements}.
  *
  * @group DASH
  * @public
@@ -31,5 +31,24 @@ export type Element = {
 	/** Text content of this element. Mutually exclusive with `subelements` per typical usage. */
 	content: string;
 	/** Nested child elements. Recursive. */
+	subelements: Element[];
+};
+
+/**
+ * `<ContentProtection>` element in the DASH MPD spec (ISO 23009-1:2012 MPD and
+ * Segment Formats). One per DRM system (Widevine / PlayReady / FairPlay /
+ * ClearKey, etc.). Mirrors shaka-packager's `ContentProtectionElement`.
+ *
+ * @group DASH
+ * @public
+ */
+export type ContentProtectionElement = {
+	/** `value` attribute. Optional — DRM-specific (e.g. Widevine version string). */
+	value: string;
+	/** `schemeIdUri` attribute. Required — typically `urn:uuid:<system-id>`. */
+	schemeIdUri: string;
+	/** Other attributes for this element (beyond `value` and `schemeIdUri`). */
+	additionalAttributes: Map<string, string>;
+	/** Nested child elements (e.g. `<cenc:pssh>`, `<mspr:pro>`). */
 	subelements: Element[];
 };

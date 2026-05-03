@@ -4,7 +4,7 @@
  */
 import { describe, expect, test } from 'vitest';
 import { XmlNode } from '../../src/dash/dash-xml-node.js';
-import type { Element } from '../../src/dash/dash-element.js';
+import type { Element } from '../../src/dash/dash-content-protection.js';
 
 describe('XmlNode — namespace extraction', () => {
 	// shaka: TEST(XmlNodeTest, ExtractReferencedNamespaces)

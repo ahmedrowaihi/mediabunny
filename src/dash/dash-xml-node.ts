@@ -12,7 +12,7 @@
  * This file is dual-licensed under BSD-3-Clause (original) and MPL-2.0 (mediabunny).
  */
 
-import type { Element } from './dash-element';
+import type { Element } from './dash-content-protection';
 
 /**
  * Format a floating-point number for XML output, matching shaka's `FloatToXmlString`

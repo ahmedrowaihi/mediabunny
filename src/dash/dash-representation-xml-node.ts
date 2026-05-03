@@ -8,7 +8,7 @@
 /*!
  * Ported from Shaka Packager, Copyright 2014 Google LLC. All rights reserved.
  * Original source: shaka-packager packager/mpd/base/xml/xml_node.cc
- *   (RepresentationBaseXmlNode + RepresentationXmlNode)
+ *   (RepresentationBaseXmlNode + AdaptationSetXmlNode + RepresentationXmlNode)
  * Licensed under the BSD-3-Clause License. See LICENSE.shaka-packager in the repo root.
  * This file is dual-licensed under BSD-3-Clause (original) and MPL-2.0 (mediabunny).
  */
@@ -202,6 +202,46 @@ export class RepresentationBaseXmlNode extends XmlNode {
 				return false;
 			}
 		}
+		return this.addChild(descriptor);
+	}
+}
+
+/**
+ * `<AdaptationSet>` element in the DASH MPD schema. Mirrors shaka's
+ * `AdaptationSetXmlNode`. Adds Accessibility / Role / Label child-element
+ * helpers on top of {@link RepresentationBaseXmlNode}.
+ *
+ * @group DASH
+ * @public
+ */
+export class AdaptationSetXmlNode extends RepresentationBaseXmlNode {
+	constructor() {
+		super('AdaptationSet');
+	}
+
+	/**
+	 * Append an `<Accessibility schemeIdUri="..." value="..."/>` child.
+	 * Mirrors shaka's `AdaptationSetXmlNode::AddAccessibilityElement`.
+	 */
+	addAccessibilityElement(schemeIdUri: string, value: string): boolean {
+		return this.addDescriptor('Accessibility', schemeIdUri, value);
+	}
+
+	/**
+	 * Append a `<Role schemeIdUri="..." value="..."/>` child.
+	 * Mirrors shaka's `AdaptationSetXmlNode::AddRoleElement`.
+	 */
+	addRoleElement(schemeIdUri: string, value: string): boolean {
+		return this.addDescriptor('Role', schemeIdUri, value);
+	}
+
+	/**
+	 * Append a `<Label>` child whose text content is `value`. Mirrors
+	 * shaka's `AdaptationSetXmlNode::AddLabelElement`.
+	 */
+	addLabelElement(value: string): boolean {
+		const descriptor = new XmlNode('Label');
+		descriptor.setContent(value);
 		return this.addChild(descriptor);
 	}
 }

@@ -69,6 +69,8 @@ export interface HlsVideoInfo {
 	supplementalCodec?: string;
 	/** Compatible brand FourCC for Dolby Vision dual-track signaling. */
 	compatibleBrand?: string;
+	/** ISO/IEC 23001-8 transfer characteristics; drives `VIDEO-RANGE` (PQ/HLG/SDR). */
+	transferCharacteristics?: number;
 }
 
 /**

@@ -343,6 +343,14 @@ export {
 	RepresentationXmlNode,
 } from './dash/dash-representation-xml-node';
 export {
+	Representation,
+	type RepresentationStateChangeListener,
+	SuppressFlag,
+} from './dash/dash-representation';
+export {
+	getSegmentName,
+} from './dash/dash-segment-name';
+export {
 	type DashProfile,
 	type MpdType,
 	type UtcTiming,

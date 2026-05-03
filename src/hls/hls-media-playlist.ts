@@ -8,8 +8,14 @@
  */
 
 import { BandwidthEstimator } from './hls-bandwidth-estimator';
-import { DiscontinuityEntry, type HlsEntry, SegmentInfoEntry } from './hls-entries';
+import {
+	DiscontinuityEntry,
+	EncryptionInfoEntry,
+	type HlsEntry,
+	SegmentInfoEntry,
+} from './hls-entries';
 import { Tag } from './hls-tag';
+import type { HlsEncryptionMethod } from './hls-types';
 import {
 	adjustHlsVideoCodec,
 	getMediaInfoLanguage,
@@ -110,6 +116,7 @@ export class MediaPlaylist {
 	private targetDurationSet = false;
 	private longestSegmentDurationSeconds = 0;
 	private previousSegmentEndOffset = 0;
+	private insertedDiscontinuityTag = false;
 	private readonly bandwidthEstimator = new BandwidthEstimator();
 
 	constructor(
@@ -195,6 +202,41 @@ export class MediaPlaylist {
 	 */
 	addEntry(entry: HlsEntry): void {
 		this.entries.push(entry);
+	}
+
+	/**
+	 * Add an `#EXT-X-KEY` entry. Shaka behavior: when the FIRST key is added and
+	 * there are pre-existing non-encrypted media segments, an `#EXT-X-DISCONTINUITY`
+	 * is inserted immediately before the key. This signals to the player that the
+	 * stream changes from clear to encrypted.
+	 */
+	addEncryptionInfo(opts: {
+		method: HlsEncryptionMethod;
+		url: string;
+		keyId?: string;
+		iv?: string;
+		keyFormat?: string;
+		keyFormatVersions?: string;
+	}): void {
+		if (!this.insertedDiscontinuityTag) {
+			if (this.entries.length > 0) {
+				this.entries.push(new DiscontinuityEntry());
+			}
+			this.insertedDiscontinuityTag = true;
+		}
+		this.entries.push(new EncryptionInfoEntry(
+			opts.method,
+			opts.url,
+			opts.keyId ?? '',
+			opts.iv ?? '',
+			opts.keyFormat ?? '',
+			opts.keyFormatVersions ?? '',
+		));
+	}
+
+	/** Returns the entries list (read-only). Used by MasterPlaylist for session-key collection. */
+	getEntries(): readonly HlsEntry[] {
+		return this.entries;
 	}
 
 	setTargetDuration(seconds: number): void {

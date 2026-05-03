@@ -353,9 +353,15 @@ export {
 	XmlNode,
 } from './dash/dash-xml-node';
 export {
+	AdaptationSetXmlNode,
 	RepresentationBaseXmlNode,
 	RepresentationXmlNode,
 } from './dash/dash-representation-xml-node';
+export {
+	AdaptationSet,
+	type AdaptationSetRole,
+	type RepresentationCounter,
+} from './dash/dash-adaptation-set';
 export {
 	Representation,
 	type RepresentationStateChangeListener,

@@ -246,6 +246,25 @@ export class MediaPlaylist {
 		return this.mediaInfo;
 	}
 
+	/** Returns the max bitrate from `MediaInfo.bandwidth` (caller-supplied). */
+	getMaxBitrate(): number {
+		return this.mediaInfo?.bandwidth ?? 0;
+	}
+
+	/** Returns the average bitrate. Currently same as `getMaxBitrate()` — caller-supplied. */
+	getAvgBitrate(): number {
+		return this.mediaInfo?.bandwidth ?? 0;
+	}
+
+	/** Returns the video frame rate computed from `videoInfo.timeScale / videoInfo.frameDuration`, or `0`. */
+	getFrameRate(): number {
+		const v = this.mediaInfo?.videoInfo;
+		if (!v || !v.frameDuration || v.frameDuration <= 0) {
+			return 0;
+		}
+		return v.timeScale / v.frameDuration;
+	}
+
 	getNumChannels(): number {
 		return this.mediaInfo?.audioInfo?.numChannels ?? 0;
 	}

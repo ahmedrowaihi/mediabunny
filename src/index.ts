@@ -170,6 +170,8 @@ export {
 } from './logging';
 export {
 	type PsshBox,
+	type SidxBox,
+	type SidxReference,
 } from './isobmff/isobmff-misc';
 export {
 	type Rational,

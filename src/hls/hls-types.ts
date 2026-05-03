@@ -1,9 +1,14 @@
 /*!
+ * Copyright (c) 2026-present, Vanilagy and contributors
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
+/*!
  * Ported from Shaka Packager, Copyright 2016 Google LLC. All rights reserved.
  * Original source: https://github.com/shaka-project/shaka-packager/blob/main/packager/hls/base/media_playlist.h
  * Licensed under the BSD-3-Clause License. See LICENSE.shaka-packager in the repo root.
- *
- * TypeScript port: Copyright (c) 2026-present, contributors.
  * This file is dual-licensed under BSD-3-Clause (original) and MPL-2.0 (mediabunny).
  */
 
@@ -95,10 +100,15 @@ export interface HlsAudioCodecSpecificData {
  * @public
  */
 export interface HlsAudioInfo {
+	/** RFC-6381 codec parameter string (e.g. `mp4a.40.2`). */
 	codec: string;
+	/** Audio track timescale (units per second). */
 	timeScale: number;
+	/** Number of audio channels (1, 2, 6, etc.). */
 	numChannels: number;
+	/** Optional BCP-47 / RFC-5646 language code (e.g. `en`, `es`). */
 	language?: string;
+	/** Optional codec-specific data (Dolby EC-3 JOC, AC-4 flags). */
 	codecSpecificData?: HlsAudioCodecSpecificData;
 }
 
@@ -109,7 +119,9 @@ export interface HlsAudioInfo {
  * @public
  */
 export interface HlsTextInfo {
+	/** Subtitle codec identifier (`wvtt`, `ttml`, etc.). */
 	codec: string;
+	/** Optional BCP-47 / RFC-5646 language code. */
 	language?: string;
 }
 
@@ -122,15 +134,23 @@ export interface HlsTextInfo {
  * @public
  */
 export interface HlsMediaInfo {
+	/** Video track metadata (mutually exclusive with audioInfo / textInfo). */
 	videoInfo?: HlsVideoInfo;
+	/** Audio track metadata. */
 	audioInfo?: HlsAudioInfo;
+	/** Subtitle track metadata. */
 	textInfo?: HlsTextInfo;
 	/** URL of an `#EXT-X-MAP` initialization segment (used when init is in a separate file). */
 	initSegmentUrl?: string;
 	/** URL of the media file when segments live within a single file. */
 	mediaFileUrl?: string;
 	/** Inclusive byte range for the init segment when it shares the file with media. */
-	initRange?: { begin: number; end: number };
+	initRange?: {
+		/** First byte of the init segment in the media file. */
+		begin: number;
+		/** Last byte of the init segment in the media file (inclusive). */
+		end: number;
+	};
 	/** Template URL used by segmented containers (presence disables byte-range mode). */
 	segmentTemplateUrl?: string;
 	/**
@@ -139,9 +159,13 @@ export interface HlsMediaInfo {
 	 * segment data via the {@link BandwidthEstimator}, matching shaka exactly.
 	 */
 	bandwidth?: number;
+	/** Container format (`mp4`, `webm`, `mpeg2ts`, `text`). */
 	containerType?: HlsContainerType;
+	/** Marks subtitle renditions as `FORCED=YES` in `#EXT-X-MEDIA`. */
 	forcedSubtitle?: boolean;
+	/** Optional `CHARACTERISTICS` attribute values (e.g. `public.accessibility.transcribes-spoken-dialog`). */
 	hlsCharacteristics?: string[];
+	/** Reference timescale used as fallback when neither video nor audio info is set. */
 	referenceTimeScale?: number;
 }
 
@@ -152,12 +176,19 @@ export interface HlsMediaInfo {
  * @public
  */
 export interface HlsParams {
+	/** Playlist type (`vod`, `event`, `live`). */
 	playlistType: HlsPlaylistType;
+	/** Initial `#EXT-X-MEDIA-SEQUENCE` value. Any value greater than zero starts the playlist with a discontinuity. */
 	mediaSequenceNumber?: number;
+	/** Initial `#EXT-X-DISCONTINUITY-SEQUENCE` value (live only). */
 	discontinuitySequenceNumber?: number;
+	/** Optional `#EXT-X-START:TIME-OFFSET` value in seconds. */
 	startTimeOffset?: number;
+	/** When `true`, auto-inject `#EXT-X-PROGRAM-DATE-TIME` before the first segment and after every discontinuity. */
 	addProgramDateTime?: boolean;
+	/** Generator URL for the optional `## Generated with ...` banner. */
 	generatorUrl?: string;
+	/** Generator version for the optional `## Generated with ...` banner. */
 	generatorVersion?: string;
 }
 

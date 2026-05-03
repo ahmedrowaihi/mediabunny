@@ -260,6 +260,86 @@ describe('MasterPlaylist — encryption / session keys', () => {
 	});
 });
 
+describe('MasterPlaylist — I-frame stream', () => {
+	// shaka: TEST_F(MasterPlaylistTest, WriteMasterPlaylistOneIframePlaylist)
+	test('emits #EXT-X-I-FRAME-STREAM-INF with URI attribute (no FRAME-RATE)', () => {
+		const m = new MasterPlaylist(masterOpts());
+		const video = createVideoPlaylist({
+			fileName: 'media1.m3u8',
+			codec: 'avc1',
+			maxBitrate: 435889,
+			avgBitrate: 235889,
+		});
+		// One AddKeyFrame promotes the playlist to videoIFramesOnly.
+		video.addKeyFrame(0, 0, 1000);
+		m.addPlaylist(video);
+
+		expect(m.build({ baseUrl: 'http://myplaylistdomain.com/' })).toBe(
+			'#EXTM3U\n'
+			+ `${SHAKA_BANNER}\n`
+			+ '\n'
+			+ '#EXT-X-I-FRAME-STREAM-INF:BANDWIDTH=435889,AVERAGE-BANDWIDTH=0,'
+			+ 'CODECS="avc1",RESOLUTION=800x600,'
+			+ 'URI="http://myplaylistdomain.com/media1.m3u8"\n',
+		);
+	});
+});
+
+describe('MasterPlaylist — VIDEO-RANGE', () => {
+	test('emits VIDEO-RANGE=PQ for HDR (PQ transfer) variant', () => {
+		const m = new MasterPlaylist(masterOpts());
+		const p = new MediaPlaylist(vodParams(), 'hdr.m3u8', '', '');
+		p.setMediaInfo({
+			videoInfo: {
+				codec: 'hvc1.2.4.L150.B0',
+				width: 3840,
+				height: 2160,
+				timeScale: TIME_SCALE,
+				transferCharacteristics: 16,
+			},
+			bandwidth: 8000000,
+			containerType: 'mp4',
+		});
+		m.addPlaylist(p);
+
+		const out = m.build({ baseUrl: '' });
+		expect(out).toContain('RESOLUTION=3840x2160,VIDEO-RANGE=PQ,CLOSED-CAPTIONS=NONE');
+	});
+
+	test('emits VIDEO-RANGE=SDR for BT.709 variant', () => {
+		const m = new MasterPlaylist(masterOpts());
+		const p = new MediaPlaylist(vodParams(), 'sdr.m3u8', '', '');
+		p.setMediaInfo({
+			videoInfo: {
+				codec: 'avc1.640028',
+				width: 1920,
+				height: 1080,
+				timeScale: TIME_SCALE,
+				transferCharacteristics: 1,
+			},
+			bandwidth: 3000000,
+			containerType: 'mp4',
+		});
+		m.addPlaylist(p);
+
+		const out = m.build({ baseUrl: '' });
+		expect(out).toContain('RESOLUTION=1920x1080,VIDEO-RANGE=SDR,CLOSED-CAPTIONS=NONE');
+	});
+
+	test('omits VIDEO-RANGE when transferCharacteristics is unset', () => {
+		const m = new MasterPlaylist(masterOpts());
+		m.addPlaylist(createVideoPlaylist({
+			fileName: 'v.m3u8',
+			codec: 'avc1',
+			maxBitrate: 1000,
+			avgBitrate: 1000,
+		}));
+
+		const out = m.build({ baseUrl: '' });
+		expect(out).not.toContain('VIDEO-RANGE');
+	});
+});
+
 describe('MasterPlaylist — audio-only master', () => {
 	test('emits stream-inf entries pointing at audio playlists when no video', () => {
 		const m = new MasterPlaylist(masterOpts());

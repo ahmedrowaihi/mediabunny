@@ -464,3 +464,186 @@ describe('MediaPlaylist — playlist types', () => {
 		expect(out).toContain('#EXT-X-DISCONTINUITY\n#EXTINF:6.000,\nseg-12.m4s\n');
 	});
 });
+
+describe('MediaPlaylist — I-frame-only', () => {
+	// shaka: TEST_F(IFrameMediaPlaylistTest, MediaPlaylistType)
+	test('AddKeyFrame promotes stream type to videoIFramesOnly', () => {
+		const p = new MediaPlaylist(vodParams(), 'media.m3u8', 'video', 'group');
+		p.setMediaInfo(videoMediaInfo());
+		expect(p.getStreamType()).toBe('video');
+		p.addKeyFrame(0, 1000, 2345);
+		// Stream type flips to I-frame only after the first AddKeyFrame.
+		expect(p.getStreamType()).toBe('videoIFramesOnly');
+	});
+
+	// shaka: TEST_F(IFrameMediaPlaylistTest, SingleSegment)
+	test('SingleSegment — keyframes flushed by enclosing AddSegment with byterange', () => {
+		const p = new MediaPlaylist(vodParams(), 'media.m3u8', 'video', 'group');
+		p.setMediaInfo(videoMediaInfo({
+			mediaFileUrl: 'file.mp4',
+			initRange: { begin: 0, end: 500 },
+		}));
+		p.addKeyFrame(0, 1000, 2345);
+		p.addKeyFrame(2 * TIME_SCALE, 5000, 6345);
+		p.addSegment('file.mp4', 0, 10 * TIME_SCALE, 0, MBYTES);
+		p.addKeyFrame(11 * TIME_SCALE, MBYTES + 1000, 2345);
+		p.addKeyFrame(15 * TIME_SCALE, MBYTES + 3345, 12345);
+		p.addSegment('file.mp4', 10 * TIME_SCALE, 10 * TIME_SCALE, 1001000, 2 * MBYTES);
+
+		expect(p.build({ endStream: true })).toBe(
+			'#EXTM3U\n'
+			+ '#EXT-X-VERSION:6\n'
+			+ `${SHAKA_BANNER}\n`
+			+ '#EXT-X-TARGETDURATION:9\n'
+			+ '#EXT-X-PLAYLIST-TYPE:VOD\n'
+			+ '#EXT-X-I-FRAMES-ONLY\n'
+			+ '#EXT-X-MAP:URI="file.mp4",BYTERANGE="501@0"\n'
+			+ '#EXTINF:2.000,\n'
+			+ '#EXT-X-BYTERANGE:2345@1000\n'
+			+ 'file.mp4\n'
+			+ '#EXTINF:9.000,\n'
+			+ '#EXT-X-BYTERANGE:6345@5000\n'
+			+ 'file.mp4\n'
+			+ '#EXTINF:4.000,\n'
+			+ '#EXT-X-BYTERANGE:2345@1001000\n'
+			+ 'file.mp4\n'
+			+ '#EXTINF:5.000,\n'
+			+ '#EXT-X-BYTERANGE:12345\n'
+			+ 'file.mp4\n'
+			+ '#EXT-X-ENDLIST\n',
+		);
+	});
+
+	// shaka: TEST_F(IFrameMediaPlaylistTest, MultiSegment)
+	test('MultiSegment — keyframes flushed across two media files', () => {
+		const p = new MediaPlaylist(vodParams(), 'media.m3u8', 'video', 'group');
+		p.setMediaInfo(videoMediaInfo({
+			referenceTimeScale: TIME_SCALE,
+			segmentTemplateUrl: 'file$Number$.ts',
+		}));
+		p.addKeyFrame(0, 1000, 2345);
+		p.addKeyFrame(2 * TIME_SCALE, 5000, 6345);
+		p.addSegment('file1.ts', 0, 10 * TIME_SCALE, 0, MBYTES);
+		p.addKeyFrame(11 * TIME_SCALE, 1000, 2345);
+		p.addKeyFrame(15 * TIME_SCALE, 3345, 12345);
+		p.addSegment('file2.ts', 10 * TIME_SCALE, 30 * TIME_SCALE, 0, 5 * MBYTES);
+
+		expect(p.build({ endStream: true })).toBe(
+			'#EXTM3U\n'
+			+ '#EXT-X-VERSION:6\n'
+			+ `${SHAKA_BANNER}\n`
+			+ '#EXT-X-TARGETDURATION:25\n'
+			+ '#EXT-X-PLAYLIST-TYPE:VOD\n'
+			+ '#EXT-X-I-FRAMES-ONLY\n'
+			+ '#EXTINF:2.000,\n'
+			+ '#EXT-X-BYTERANGE:2345@1000\n'
+			+ 'file1.ts\n'
+			+ '#EXTINF:9.000,\n'
+			+ '#EXT-X-BYTERANGE:6345@5000\n'
+			+ 'file1.ts\n'
+			+ '#EXTINF:4.000,\n'
+			+ '#EXT-X-BYTERANGE:2345@1000\n'
+			+ 'file2.ts\n'
+			+ '#EXTINF:25.000,\n'
+			+ '#EXT-X-BYTERANGE:12345\n'
+			+ 'file2.ts\n'
+			+ '#EXT-X-ENDLIST\n',
+		);
+	});
+
+	// shaka: TEST_F(IFrameMediaPlaylistTest, MultiSegmentWithPlacementOpportunity)
+	test('MultiSegment with placement opportunity between segments', () => {
+		const p = new MediaPlaylist(vodParams(), 'media.m3u8', 'video', 'group');
+		p.setMediaInfo(videoMediaInfo({
+			referenceTimeScale: TIME_SCALE,
+			segmentTemplateUrl: 'file$Number$.ts',
+		}));
+		p.addKeyFrame(0, 1000, 2345);
+		p.addKeyFrame(2 * TIME_SCALE, 5000, 6345);
+		p.addSegment('file1.ts', 0, 10 * TIME_SCALE, 0, MBYTES);
+		p.addPlacementOpportunity();
+		p.addKeyFrame(11 * TIME_SCALE, 1000, 2345);
+		p.addKeyFrame(15 * TIME_SCALE, 3345, 12345);
+		p.addSegment('file2.ts', 10 * TIME_SCALE, 30 * TIME_SCALE, 0, 5 * MBYTES);
+
+		expect(p.build({ endStream: true })).toBe(
+			'#EXTM3U\n'
+			+ '#EXT-X-VERSION:6\n'
+			+ `${SHAKA_BANNER}\n`
+			+ '#EXT-X-TARGETDURATION:25\n'
+			+ '#EXT-X-PLAYLIST-TYPE:VOD\n'
+			+ '#EXT-X-I-FRAMES-ONLY\n'
+			+ '#EXTINF:2.000,\n'
+			+ '#EXT-X-BYTERANGE:2345@1000\n'
+			+ 'file1.ts\n'
+			+ '#EXTINF:9.000,\n'
+			+ '#EXT-X-BYTERANGE:6345@5000\n'
+			+ 'file1.ts\n'
+			+ '#EXT-X-PLACEMENT-OPPORTUNITY\n'
+			+ '#EXTINF:4.000,\n'
+			+ '#EXT-X-BYTERANGE:2345@1000\n'
+			+ 'file2.ts\n'
+			+ '#EXTINF:25.000,\n'
+			+ '#EXT-X-BYTERANGE:12345\n'
+			+ 'file2.ts\n'
+			+ '#EXT-X-ENDLIST\n',
+		);
+	});
+});
+
+describe('MediaPlaylist — VIDEO-RANGE', () => {
+	// shaka: covered by GetVideoRange tests in media_playlist_unittest.cc transfer_characteristics ranges.
+	test('returns "" when transferCharacteristics is unset', () => {
+		const p = new MediaPlaylist(vodParams(), 'media.m3u8', 'video', 'group');
+		p.setMediaInfo(videoMediaInfo());
+		expect(p.getVideoRange()).toBe('');
+	});
+
+	test('TC=1 (BT.709) → SDR', () => {
+		const p = new MediaPlaylist(vodParams(), 'media.m3u8', 'video', 'group');
+		p.setMediaInfo(videoMediaInfo({
+			videoInfo: { codec: 'avc1.640028', width: 1920, height: 1080, timeScale: TIME_SCALE, transferCharacteristics: 1 },
+		}));
+		expect(p.getVideoRange()).toBe('SDR');
+	});
+
+	test('TC=16 (PQ) → PQ', () => {
+		const p = new MediaPlaylist(vodParams(), 'media.m3u8', 'video', 'group');
+		p.setMediaInfo(videoMediaInfo({
+			videoInfo: { codec: 'hvc1.2.4.L150.B0', width: 3840, height: 2160, timeScale: TIME_SCALE, transferCharacteristics: 16 },
+		}));
+		expect(p.getVideoRange()).toBe('PQ');
+	});
+
+	test('TC=18 (HLG) → HLG', () => {
+		const p = new MediaPlaylist(vodParams(), 'media.m3u8', 'video', 'group');
+		p.setMediaInfo(videoMediaInfo({
+			videoInfo: { codec: 'hvc1.2.4.L150.B0', width: 3840, height: 2160, timeScale: TIME_SCALE, transferCharacteristics: 18 },
+		}));
+		expect(p.getVideoRange()).toBe('HLG');
+	});
+
+	test('Dolby Vision (dvh1) → PQ regardless of transfer characteristics', () => {
+		const p = new MediaPlaylist(vodParams(), 'media.m3u8', 'video', 'group');
+		p.setMediaInfo(videoMediaInfo({
+			videoInfo: { codec: 'dvh1.05.06', width: 3840, height: 2160, timeScale: TIME_SCALE },
+		}));
+		expect(p.getVideoRange()).toBe('PQ');
+	});
+
+	test('TC=14 with db4g compatible brand and supplemental codec → HLG (Dolby Vision profile 8.4)', () => {
+		const p = new MediaPlaylist(vodParams(), 'media.m3u8', 'video', 'group');
+		p.setMediaInfo(videoMediaInfo({
+			videoInfo: {
+				codec: 'hvc1.2.4.L150.B0',
+				width: 3840,
+				height: 2160,
+				timeScale: TIME_SCALE,
+				transferCharacteristics: 14,
+				supplementalCodec: 'dvh1.08.07',
+				compatibleBrand: 'db4g',
+			},
+		}));
+		expect(p.getVideoRange()).toBe('HLG');
+	});
+});

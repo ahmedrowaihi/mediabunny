@@ -347,9 +347,21 @@ export {
 // DASH MPD generators (ported from shaka-packager).
 export {
 	type Element,
-} from './dash/dash-element';
+	type ContentProtectionElement,
+} from './dash/dash-content-protection';
 export {
 	XmlNode,
 } from './dash/dash-xml-node';
+export {
+	type DashProfile,
+	type MpdType,
+	type UtcTiming,
+	type CeaCaption,
+	type MpdParams,
+	type MpdOptions,
+	type SegmentInfo,
+	createDefaultMpdParams,
+	createDefaultMpdOptions,
+} from './dash/dash-types';
 
 // 🐡🦔

@@ -294,4 +294,40 @@ export {
 	type TrackDisposition,
 } from './metadata';
 
+// HLS playlist generators (ported from shaka-packager).
+export {
+	Tag,
+} from './hls/hls-tag';
+export {
+	type HlsEntry,
+	type HlsEntryType,
+	SegmentInfoEntry,
+	EncryptionInfoEntry,
+	DiscontinuityEntry,
+	PlacementOpportunityEntry,
+	ProgramDateTimeEntry,
+} from './hls/hls-entries';
+export {
+	type HlsPlaylistType,
+	type HlsMediaPlaylistStreamType,
+	type HlsEncryptionMethod,
+	type HlsContainerType,
+	type HlsVideoInfo,
+	type HlsAudioInfo,
+	type HlsAudioCodecSpecificData,
+	type HlsTextInfo,
+	type HlsMediaInfo,
+	type HlsParams,
+	adjustHlsVideoCodec,
+} from './hls/hls-types';
+export {
+	BandwidthEstimator,
+} from './hls/hls-bandwidth-estimator';
+export {
+	MediaPlaylist,
+} from './hls/hls-media-playlist';
+export {
+	MasterPlaylist,
+} from './hls/hls-master-playlist';
+
 // 🐡🦔

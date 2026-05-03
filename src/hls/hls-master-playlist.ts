@@ -7,6 +7,7 @@
  * This file is dual-licensed under BSD-3-Clause (original) and MPL-2.0 (mediabunny).
  */
 
+import { EncryptionInfoEntry } from './hls-entries';
 import type { MediaPlaylist } from './hls-media-playlist';
 import { Tag } from './hls-tag';
 
@@ -256,6 +257,12 @@ export class MasterPlaylist {
 			defaultAudioLanguage?: string;
 			defaultSubtitleLanguage?: string;
 			generatorBanner?: string;
+			/**
+			 * When `true`, every `#EXT-X-KEY` found inside the registered media
+			 * playlists is also emitted at the master level as `#EXT-X-SESSION-KEY`
+			 * (deduplicated). Mirrors shaka's `create_session_keys_`.
+			 */
+			createSessionKeys?: boolean;
 		} = {},
 	) {}
 
@@ -273,6 +280,20 @@ export class MasterPlaylist {
 		if (this.opts.independentSegments) {
 			lines.push('');
 			lines.push('#EXT-X-INDEPENDENT-SEGMENTS');
+		}
+
+		if (this.opts.createSessionKeys) {
+			const sessionKeys = new Set<string>();
+			for (const p of this.playlists) {
+				for (const entry of p.getEntries()) {
+					if (entry instanceof EncryptionInfoEntry) {
+						sessionKeys.add(entry.toString('#EXT-X-SESSION-KEY'));
+					}
+				}
+			}
+			for (const sessionKey of sessionKeys) {
+				lines.push(sessionKey);
+			}
 		}
 
 		const audioGroups = new Map<string, MediaPlaylist[]>();

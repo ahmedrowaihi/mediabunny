@@ -353,6 +353,10 @@ export {
 	XmlNode,
 } from './dash/dash-xml-node';
 export {
+	RepresentationBaseXmlNode,
+	RepresentationXmlNode,
+} from './dash/dash-representation-xml-node';
+export {
 	type DashProfile,
 	type MpdType,
 	type UtcTiming,

@@ -12,18 +12,8 @@
  * This file is dual-licensed under BSD-3-Clause (original) and MPL-2.0 (mediabunny).
  */
 
-/**
- * Inclusive byte range. Mirrors shaka's `Range` proto message.
- *
- * @group DASH
- * @public
- */
-export type Range = {
-	/** First byte of the range (inclusive). */
-	begin: number;
-	/** Last byte of the range (inclusive). */
-	end: number;
-};
+import { type ByteRange as Range } from '../isobmff/isobmff-misc';
+export { type ByteRange as Range } from '../isobmff/isobmff-misc';
 
 /**
  * Container format. Mirrors shaka's `MediaInfo.ContainerType` enum.

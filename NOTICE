@@ -40,6 +40,7 @@ Shaka Packager (BSD-3-Clause)
     src/dash/dash-fourcc.ts
     src/dash/dash-language-utils.ts
     src/dash/dash-media-info.ts
+    src/dash/dash-mpd-builder.ts
     src/dash/dash-mpd-utils.ts
     src/dash/dash-period.ts
     src/dash/dash-representation.ts

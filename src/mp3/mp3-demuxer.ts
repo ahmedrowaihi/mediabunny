@@ -330,6 +330,10 @@ class Mp3AudioTrackBacking implements InputAudioTrackBacking {
 		return null;
 	}
 
+	getEncryptionInfo() {
+		return null;
+	}
+
 	getNumberOfChannels() {
 		assert(this.demuxer.firstFrameHeader);
 		return this.demuxer.firstFrameHeader.channel === 3 ? 1 : 2;

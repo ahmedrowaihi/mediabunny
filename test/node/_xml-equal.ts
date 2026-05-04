@@ -168,27 +168,44 @@ const parseRootElement = (s: string): ParsedXmlNode => {
 	throw new Error('no root element found');
 };
 
+const isNamespaceDecl = (key: string): boolean => key === 'xmlns' || key.startsWith('xmlns:');
+
+const filterNamespaceAttrs = (attrs: Map<string, string>): Map<string, string> => {
+	const out = new Map<string, string>();
+	for (const [k, v] of attrs) {
+		if (!isNamespaceDecl(k)) {
+			out.set(k, v);
+		}
+	}
+	return out;
+};
+
 const nodesEqual = (a: ParsedXmlNode, b: ParsedXmlNode): { equal: true } | { equal: false; reason: string } => {
 	if (a.name !== b.name) {
 		return { equal: false, reason: `element name mismatch: <${a.name}> vs <${b.name}>` };
 	}
-	if (a.attributes.size !== b.attributes.size) {
-		const actualKeys = [...a.attributes.keys()].join(',');
-		const expectedKeys = [...b.attributes.keys()].join(',');
+	// Ignore xmlns / xmlns:* attributes, mirroring shaka's libxml2-based
+	// XmlNodeEqual which compares `node->properties` (excludes namespace
+	// declarations stored in `node->nsDef`).
+	const aAttrs = filterNamespaceAttrs(a.attributes);
+	const bAttrs = filterNamespaceAttrs(b.attributes);
+	if (aAttrs.size !== bAttrs.size) {
+		const actualKeys = [...aAttrs.keys()].join(',');
+		const expectedKeys = [...bAttrs.keys()].join(',');
 		return {
 			equal: false,
-			reason: `<${a.name}> attribute count mismatch: ${a.attributes.size} vs ${b.attributes.size} `
+			reason: `<${a.name}> attribute count mismatch: ${aAttrs.size} vs ${bAttrs.size} `
 				+ `(actual: [${actualKeys}]; expected: [${expectedKeys}])`,
 		};
 	}
-	for (const [key, value] of a.attributes) {
-		if (!b.attributes.has(key)) {
+	for (const [key, value] of aAttrs) {
+		if (!bAttrs.has(key)) {
 			return { equal: false, reason: `<${a.name}> has attribute "${key}" not in expected` };
 		}
-		if (b.attributes.get(key) !== value) {
+		if (bAttrs.get(key) !== value) {
 			return {
 				equal: false,
-				reason: `<${a.name}> @${key} mismatch: "${value}" vs "${b.attributes.get(key)}"`,
+				reason: `<${a.name}> @${key} mismatch: "${value}" vs "${bAttrs.get(key)}"`,
 			};
 		}
 	}

@@ -169,6 +169,13 @@ export {
 	type LoggingEvents,
 } from './logging';
 export {
+	type ByteRange,
+	getSidxDurationSeconds,
+	getSidxIndexRange,
+	getSidxInitRange,
+	getSidxMaxSegmentDuration,
+	getSidxPeakBitrate,
+	getSidxSegmentOffsets,
 	type PsshBox,
 	type SidxBox,
 	type SidxReference,

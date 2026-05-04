@@ -439,13 +439,17 @@ describe('RepresentationXmlNode — addVODOnlyInfo', () => {
 		);
 	});
 
-	test('mediaFileUrl is URL-encoded inside BaseURL', () => {
+	test('mediaFileUrl is path-encoded inside BaseURL (preserves "/" as path separator)', () => {
+		// Deviates from shaka-packager's whole-string URL encoding: BaseURL is
+		// an RFC 3986 URI reference (DASH §5.6), so "/" must survive as a
+		// path-segment delimiter for cross-directory layouts to resolve.
+		// See NOTICE for the full rationale.
 		const repr = new RepresentationXmlNode();
 		repr.addVODOnlyInfo({ mediaFileUrl: 'a b/c.mp4' }, false, 0);
 		expectXmlEqual(
 			repr.toString(),
 			'<Representation>'
-			+ '  <BaseURL>a%20b%2Fc.mp4</BaseURL>'
+			+ '  <BaseURL>a%20b/c.mp4</BaseURL>'
 			+ '</Representation>',
 		);
 	});

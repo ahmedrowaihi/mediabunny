@@ -122,6 +122,32 @@ describe('XmlNode — basic API', () => {
 		expect(root.toString()).toContain('<BaseURL>https://example.com/a%20b</BaseURL>');
 	});
 
+	test('setPathContent encodes per RFC 3986 path component, preserving "/"', () => {
+		const root = new XmlNode('BaseURL');
+		root.setPathContent('../cmaf/seg with space.mp4');
+		// "/" survives, space → %20, ASCII alphanumerics + "." + "-" + "_" + "~" left alone.
+		expect(root.toString()).toContain(
+			'<BaseURL>../cmaf/seg%20with%20space.mp4</BaseURL>',
+		);
+	});
+
+	test('setPathContent escapes "?" and "#" (URI delimiters)', () => {
+		const root = new XmlNode('BaseURL');
+		root.setPathContent('foo?q.mp4');
+		expect(root.toString()).toContain('<BaseURL>foo%3Fq.mp4</BaseURL>');
+		const root2 = new XmlNode('BaseURL');
+		root2.setPathContent('foo#frag.mp4');
+		expect(root2.toString()).toContain('<BaseURL>foo%23frag.mp4</BaseURL>');
+	});
+
+	test('setPathContent matches setUrlEncodedContent for unreserved-only inputs', () => {
+		const a = new XmlNode('BaseURL');
+		a.setPathContent('test_output_file_name1.mp4');
+		const b = new XmlNode('BaseURL');
+		b.setUrlEncodedContent('test_output_file_name1.mp4');
+		expect(a.toString()).toBe(b.toString());
+	});
+
 	test('children render with 2-space indentation, attributes on the open tag', () => {
 		const root = new XmlNode('MPD');
 		root.setStringAttribute('xmlns', 'urn:mpeg:dash:schema:mpd:2011');

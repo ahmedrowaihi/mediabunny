@@ -346,7 +346,7 @@ export class RepresentationXmlNode extends RepresentationBaseXmlNode {
 
 		if (mediaInfo.mediaFileUrl !== undefined && !useSingleSegmentUrlWithMedia) {
 			const baseUrl = new XmlNode('BaseURL');
-			baseUrl.setUrlEncodedContent(mediaInfo.mediaFileUrl);
+			baseUrl.setPathContent(mediaInfo.mediaFileUrl);
 			if (!this.addChild(baseUrl)) {
 				return false;
 			}

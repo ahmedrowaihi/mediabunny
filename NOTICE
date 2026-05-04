@@ -51,4 +51,16 @@ Shaka Packager (BSD-3-Clause)
 
   Copyright 2014, Google LLC. All rights reserved.
   Full license text: see LICENSE.shaka-packager
+
+  Deliberate deviation from upstream:
+    `<BaseURL>` element content is encoded per RFC 3986 path component
+    (preserving `/` as a path-segment delimiter) rather than via shaka's
+    whole-string `SetUrlEncodedContent` which percent-encodes `/` to
+    `%2F`. The shaka behavior produces non-resolving manifests for
+    cross-directory layouts (e.g. `<BaseURL>../cmaf/foo.mp4</BaseURL>`)
+    because per RFC 3986 §3.3, `%2F` is a literal slash inside a single
+    path segment, not a separator. Output is byte-identical to shaka's
+    for inputs containing only `unreserved` characters (the shape
+    shaka's own test corpus exercises). See dash-xml-node.ts
+    `setPathContent` and `urlEncodePathPreservingSlashes`.
 ------------------------------------------------------------------------

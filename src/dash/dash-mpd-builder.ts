@@ -382,7 +382,7 @@ export class MpdBuilder {
 
 		for (const baseUrl of this.baseUrls) {
 			const node = new XmlNode('BaseURL');
-			node.setUrlEncodedContent(baseUrl);
+			node.setPathContent(baseUrl);
 			if (!mpd.addChild(node)) {
 				return null;
 			}

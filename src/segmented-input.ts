@@ -307,6 +307,10 @@ class SegmentedInputInputTrackBacking implements InputTrackBacking {
 		return this.delegate(() => this.firstInputTrack!._backing.getInternalCodecId());
 	}
 
+	getEncryptionInfo() {
+		return this.delegate(() => this.firstInputTrack!._backing.getEncryptionInfo());
+	}
+
 	getDisposition() {
 		return this.delegate(() => this.firstInputTrack!._backing.getDisposition());
 	}

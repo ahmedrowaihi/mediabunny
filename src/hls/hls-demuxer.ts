@@ -725,6 +725,10 @@ abstract class HlsInputTrackBacking implements InputTrackBacking {
 		return null;
 	}
 
+	getEncryptionInfo() {
+		return null;
+	}
+
 	getLanguageCode(): string {
 		return this.internalTrack.languageCode;
 	}

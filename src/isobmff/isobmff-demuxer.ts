@@ -36,6 +36,7 @@ import {
 import { Demuxer } from '../demuxer';
 import { Input } from '../input';
 import {
+	FrameRateMode,
 	InputAudioTrackBacking,
 	InputTrackBacking,
 	InputVideoTrackBacking,
@@ -52,8 +53,10 @@ import {
 	last,
 	MATRIX_COEFFICIENTS_MAP_INVERSE,
 	normalizeRotation,
+	Rational,
 	roundToMultiple,
 	Rotation,
+	simplifyRational,
 	textDecoder,
 	TransformationMatrix,
 	TRANSFER_CHARACTERISTICS_MAP_INVERSE,
@@ -3345,6 +3348,63 @@ class IsobmffVideoTrackBacking extends IsobmffTrackBacking implements InputVideo
 
 	getSquarePixelHeight() {
 		return this.internalTrack.info.squarePixelHeight;
+	}
+
+	private async resolveFrameTiming(sampleCount: number): Promise<{
+		mode: FrameRateMode;
+		delta: number;
+	}> {
+		const timescale = this.internalTrack.timescale;
+		if (timescale <= 0) {
+			return { mode: 'unknown', delta: 0 };
+		}
+
+		const sampleTable = this.internalTrack.demuxer.getSampleTableForTrack(this.internalTrack);
+		const entries = sampleTable.sampleTimingEntries;
+		if (entries.length > 0) {
+			const firstDelta = entries[0]!.delta;
+			if (firstDelta === 0) {
+				return { mode: 'unknown', delta: 0 };
+			}
+			for (let i = 1; i < entries.length; i++) {
+				if (entries[i]!.delta !== firstDelta) {
+					return { mode: 'variable', delta: 0 };
+				}
+			}
+			return { mode: 'constant', delta: firstDelta };
+		}
+
+		let firstDelta: number | null = null;
+		let packet: EncodedPacket | null = await this.getFirstPacket({ metadataOnly: true });
+		for (let i = 0; i < sampleCount && packet; i++) {
+			const delta = Math.round(packet.duration * timescale);
+			if (delta === 0) {
+				return { mode: 'unknown', delta: 0 };
+			}
+			if (firstDelta === null) {
+				firstDelta = delta;
+			} else if (delta !== firstDelta) {
+				return { mode: 'variable', delta: 0 };
+			}
+			packet = await this.getNextPacket(packet, { metadataOnly: true });
+		}
+		if (firstDelta === null) {
+			return { mode: 'unknown', delta: 0 };
+		}
+		return { mode: 'constant', delta: firstDelta };
+	}
+
+	async getFrameRate(sampleCount = 60): Promise<Rational | null> {
+		const { mode, delta } = await this.resolveFrameTiming(sampleCount);
+		if (mode !== 'constant') {
+			return null;
+		}
+		return simplifyRational({ num: this.internalTrack.timescale, den: delta });
+	}
+
+	async getFrameRateMode(sampleCount = 60): Promise<FrameRateMode> {
+		const { mode } = await this.resolveFrameTiming(sampleCount);
+		return mode;
 	}
 
 	getRotation() {

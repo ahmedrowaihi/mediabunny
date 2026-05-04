@@ -369,6 +369,10 @@ class WaveAudioTrackBacking implements InputAudioTrackBacking {
 		return this.demuxer.audioInfo.format;
 	}
 
+	getEncryptionInfo() {
+		return null;
+	}
+
 	async getDecoderConfig(): Promise<AudioDecoderConfig | null> {
 		const codec = this.demuxer.getCodec();
 		if (!codec) {

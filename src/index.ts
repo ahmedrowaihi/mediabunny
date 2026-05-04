@@ -166,9 +166,13 @@ export {
 	getSidxMaxSegmentDuration,
 	getSidxPeakBitrate,
 	getSidxSegmentOffsets,
+	parsePsshBoxContents,
+	psshBoxesAreEqual,
 	type PsshBox,
+	type PsshBoxContents,
 	type SidxBox,
 	type SidxReference,
+	type TrackEncryptionInfo,
 } from './isobmff/isobmff-misc';
 export {
 	getFrameDurationFromRate,

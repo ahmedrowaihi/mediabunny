@@ -1960,6 +1960,10 @@ abstract class MatroskaTrackBacking implements InputTrackBacking {
 		return this.internalTrack.codecId;
 	}
 
+	getEncryptionInfo() {
+		return null;
+	}
+
 	getName() {
 		return this.internalTrack.name;
 	}

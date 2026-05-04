@@ -1089,6 +1089,10 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 		return this.elementaryStream.streamType;
 	}
 
+	getEncryptionInfo() {
+		return null;
+	}
+
 	getName() {
 		return null;
 	}

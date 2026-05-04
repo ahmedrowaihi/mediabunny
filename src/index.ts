@@ -181,6 +181,7 @@ export {
 	type SidxReference,
 } from './isobmff/isobmff-misc';
 export {
+	getFrameDurationFromRate,
 	type Rational,
 	type Rectangle,
 	type Rotation,
@@ -257,6 +258,7 @@ export {
 	type DurationMetadataRequestOptions,
 } from './demuxer';
 export {
+	type FrameRateMode,
 	InputTrack,
 	InputVideoTrack,
 	InputAudioTrack,

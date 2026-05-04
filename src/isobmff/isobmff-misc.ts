@@ -210,3 +210,142 @@ export const parseSidxBoxContents = (
 		boxSize,
 	};
 };
+
+/**
+ * Inclusive byte range — `[begin, end]`, both endpoints included.
+ * Used throughout mediabunny for byte-range descriptors (sidx-derived
+ * ranges, DASH `MediaInfo.initRange` / `indexRange` /
+ * `subsegmentRanges`, and HTTP `Range` requests).
+ *
+ * @group Miscellaneous
+ * @public
+ */
+export type ByteRange = {
+	/** First byte of the range (inclusive). */
+	begin: number;
+	/** Last byte of the range (inclusive). */
+	end: number;
+};
+
+/**
+ * Returns the inclusive byte range of the initialization segment — every
+ * byte in the file before the `sidx` box (typically `ftyp` + `moov`,
+ * possibly with extra boxes like `free` / `pdin`).
+ *
+ * @group Miscellaneous
+ * @public
+ */
+export const getSidxInitRange = (sidx: SidxBox): ByteRange => ({
+	begin: 0,
+	end: sidx.boxStart - 1,
+});
+
+/**
+ * Returns the inclusive byte range of the `sidx` box itself, suitable
+ * for DASH `<SegmentBase @indexRange>` emission.
+ *
+ * @group Miscellaneous
+ * @public
+ */
+export const getSidxIndexRange = (sidx: SidxBox): ByteRange => ({
+	begin: sidx.boxStart,
+	end: sidx.boxStart + sidx.boxSize - 1,
+});
+
+/**
+ * Returns one byte offset per referenced subsegment, in order. Each
+ * offset is the absolute byte position in the file where that
+ * subsegment begins. Mirrors shaka-packager's
+ * `SingleSegmentSegmenter::GetSegmentRanges` algorithm but operates on
+ * a parsed (read-side) `SidxBox`.
+ *
+ * @group Miscellaneous
+ * @public
+ */
+export const getSidxSegmentOffsets = (sidx: SidxBox): number[] => {
+	const offsets: number[] = [];
+	let cursor = sidx.boxStart + sidx.boxSize + sidx.firstOffset;
+	for (const ref of sidx.references) {
+		offsets.push(cursor);
+		cursor += ref.referencedSize;
+	}
+	return offsets;
+};
+
+/**
+ * Returns the peak per-subsegment bitrate in bits per second, rounded
+ * to the nearest integer. Returns `0` for sidx boxes with no
+ * references or zero timescale.
+ *
+ * Matches the per-segment-peak heuristic used by every mainstream
+ * packager (shaka-packager, ffmpeg, Bento4) for DASH
+ * `<Representation @bandwidth>` and HLS `BANDWIDTH`. Note that the
+ * DASH spec (ISO/IEC 23009-1 §5.3.5.2) technically defines
+ * `@bandwidth` as the max bitrate over any sliding window of size
+ * `minBufferTime`; computing that requires bitstream inspection, not
+ * sidx data. The per-segment approximation is the *de facto*
+ * implementation across the industry.
+ *
+ * @group Miscellaneous
+ * @public
+ */
+export const getSidxPeakBitrate = (sidx: SidxBox): number => {
+	if (sidx.references.length === 0 || sidx.timescale === 0) {
+		return 0;
+	}
+	let max = 0;
+	for (const ref of sidx.references) {
+		const seconds = ref.subsegmentDuration / sidx.timescale;
+		if (seconds > 0) {
+			const bps = (ref.referencedSize * 8) / seconds;
+			if (bps > max) {
+				max = bps;
+			}
+		}
+	}
+	return Math.round(max);
+};
+
+/**
+ * Returns the total span covered by the sidx's referenced subsegments
+ * in seconds. Equals media duration when the sidx covers the entire
+ * file (the standard CMAF VOD layout). Returns `0` for sidx boxes
+ * with no references or zero timescale.
+ *
+ * @group Miscellaneous
+ * @public
+ */
+export const getSidxDurationSeconds = (sidx: SidxBox): number => {
+	if (sidx.references.length === 0 || sidx.timescale === 0) {
+		return 0;
+	}
+	let total = 0;
+	for (const ref of sidx.references) {
+		total += ref.subsegmentDuration;
+	}
+	return total / sidx.timescale;
+};
+
+/**
+ * Returns the duration of the longest single subsegment in seconds.
+ * Useful for setting DASH `MPD@minBufferTime` (which must be ≥ the
+ * largest segment duration so a player can fully buffer any one
+ * segment before playback starts). Returns `0` for sidx boxes with no
+ * references or zero timescale.
+ *
+ * @group Miscellaneous
+ * @public
+ */
+export const getSidxMaxSegmentDuration = (sidx: SidxBox): number => {
+	if (sidx.references.length === 0 || sidx.timescale === 0) {
+		return 0;
+	}
+	let max = 0;
+	for (const ref of sidx.references) {
+		const seconds = ref.subsegmentDuration / sidx.timescale;
+		if (seconds > max) {
+			max = seconds;
+		}
+	}
+	return max;
+};

@@ -366,6 +366,10 @@ export {
 	Period,
 } from './dash/dash-period';
 export {
+	type Clock as DashClock,
+	MpdBuilder,
+} from './dash/dash-mpd-builder';
+export {
 	addContentProtectionElements,
 } from './dash/dash-mpd-utils';
 export {

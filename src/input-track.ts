@@ -493,6 +493,16 @@ const toValidatedPredicate = <T extends InputTrack>(
 		: undefined;
 };
 
+/**
+ * Frame-rate timing mode of a video track. `'constant'` means every sample has the same
+ * duration (CFR). `'variable'` means at least two samples have different durations (VFR).
+ * `'unknown'` means the timing couldn't be determined (zero timescale, no packets, etc.).
+ *
+ * @group Input files & tracks
+ * @public
+ */
+export type FrameRateMode = 'constant' | 'variable' | 'unknown';
+
 export interface InputVideoTrackBacking extends InputTrackBacking {
 	getType(): 'video';
 	getCodec(): MaybePromise<VideoCodec | null>;
@@ -506,6 +516,8 @@ export interface InputVideoTrackBacking extends InputTrackBacking {
 	getColorSpace(): Promise<VideoColorSpaceInit>;
 	canBeTransparent(): Promise<boolean>;
 	getDecoderConfig(): Promise<VideoDecoderConfig | null>;
+	getFrameRate?(sampleCount?: number): Promise<Rational | null>;
+	getFrameRateMode?(sampleCount?: number): Promise<FrameRateMode>;
 }
 
 /**
@@ -615,6 +627,29 @@ export class InputVideoTrack extends InputTrack {
 	 */
 	get squarePixelHeight() {
 		return requireSync(this._backing.getSquarePixelHeight(), 'squarePixelHeight', 'getSquarePixelHeight');
+	}
+
+	/**
+	 * Returns the nominal frame rate as a rational number in its reduced form. Returns `null` when the track is
+	 * variable-frame-rate or the rate can't be determined. `sampleCount` bounds how many packets are checked when
+	 * the container can't expose frame timing exactly (e.g. fragmented MP4); pass `Infinity` for full-file scan.
+	 */
+	async getFrameRate(sampleCount?: number): Promise<Rational | null> {
+		if (!this._backing.getFrameRate) {
+			return null;
+		}
+		return this._backing.getFrameRate(sampleCount);
+	}
+
+	/**
+	 * Returns whether the track is constant- or variable-frame-rate, or `'unknown'` when the timing
+	 * mode can't be determined. Useful when the caller needs to distinguish VFR from indeterminate.
+	 */
+	async getFrameRateMode(sampleCount?: number): Promise<FrameRateMode> {
+		if (!this._backing.getFrameRateMode) {
+			return 'unknown';
+		}
+		return this._backing.getFrameRateMode(sampleCount);
 	}
 
 	/**

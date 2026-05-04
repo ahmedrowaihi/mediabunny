@@ -151,6 +151,13 @@ export {
 	type MaybePromise,
 } from './misc';
 export {
+	type ByteRange,
+	getSidxDurationSeconds,
+	getSidxIndexRange,
+	getSidxInitRange,
+	getSidxMaxSegmentDuration,
+	getSidxPeakBitrate,
+	getSidxSegmentOffsets,
 	type PsshBox,
 	type SidxBox,
 	type SidxReference,

@@ -41,6 +41,50 @@ const urlEncode = (input: string): string => {
 };
 
 /**
+ * RFC 3986 path-component encoder that preserves the path-segment
+ * delimiter `/`. Encodes everything not in the `pchar` set (`unreserved
+ * / sub-delims / ":" / "@"`) plus `?` and `#` (which terminate the path
+ * in a URI). Unlike {@link urlEncode}, this is suitable for DASH
+ * `<BaseURL>` elements that carry RFC 3986 URI references with literal
+ * path separators (e.g. `../cmaf/foo.mp4`).
+ *
+ * Output is byte-identical to {@link urlEncode} for inputs containing
+ * only `unreserved` characters — meaning shaka's test corpus emits the
+ * same XML through either encoder. The two diverge only when the input
+ * carries `/`, sub-delims, `:`, or `@`.
+ *
+ * @internal
+ */
+const urlEncodePathPreservingSlashes = (input: string): string => {
+	const bytes = new TextEncoder().encode(input);
+	let out = '';
+	for (let i = 0; i < bytes.length; i++) {
+		const b = bytes[i]!;
+		const isUnreserved = (b >= 0x41 && b <= 0x5a) // A-Z
+			|| (b >= 0x61 && b <= 0x7a) // a-z
+			|| (b >= 0x30 && b <= 0x39) // 0-9
+			|| b === 0x2d || b === 0x5f || b === 0x2e || b === 0x7e; // - _ . ~
+		// pchar = unreserved / pct-encoded / sub-delims / ":" / "@"
+		// sub-delims = "!" / "$" / "&" / "'" / "(" / ")" / "*" / "+" / "," / ";" / "="
+		// Plus "/" as path-segment delimiter (preserved). "?" and "#" are NOT
+		// included — they terminate the path in a URI.
+		const isSubDelim = b === 0x21 || b === 0x24 || b === 0x26 || b === 0x27
+			|| b === 0x28 || b === 0x29 || b === 0x2a || b === 0x2b
+			|| b === 0x2c || b === 0x3b || b === 0x3d;
+		const isPathSafe = isUnreserved || isSubDelim
+			|| b === 0x3a // ":"
+			|| b === 0x40 // "@"
+			|| b === 0x2f; // "/" — preserved as path-segment delimiter
+		if (isPathSafe) {
+			out += String.fromCharCode(b);
+		} else {
+			out += '%' + b.toString(16).toUpperCase().padStart(2, '0');
+		}
+	}
+	return out;
+};
+
+/**
  * Escape a string for use in XML attribute values: ` & " < > ` become entities.
  *
  * @internal
@@ -217,6 +261,24 @@ export class XmlNode {
 	/** Replace this element's text content with a URL-encoded version of `content`. */
 	setUrlEncodedContent(content: string): void {
 		this.setContent(urlEncode(content));
+	}
+
+	/**
+	 * Replace this element's text content with an RFC 3986 path-component
+	 * encoded version of `content`, preserving `/` as a path separator.
+	 *
+	 * Used for `<BaseURL>` elements where the value is an RFC 3986 URI
+	 * reference (DASH §5.6) — literal path separators must survive into
+	 * the output so player URI resolution works correctly. Output matches
+	 * {@link XmlNode.setUrlEncodedContent} byte-for-byte for inputs with
+	 * only `unreserved` characters (the shape shaka's tests cover).
+	 *
+	 * Deviates from shaka-packager's `xml::XmlNode::SetUrlEncodedContent`
+	 * (which uses curl-style whole-string encoding and percent-encodes
+	 * `/` to `%2F` — incorrect for path-component values).
+	 */
+	setPathContent(content: string): void {
+		this.setContent(urlEncodePathPreservingSlashes(content));
 	}
 
 	/**

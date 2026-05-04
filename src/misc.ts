@@ -970,6 +970,21 @@ export const simplifyRational = (rational: Rational): Rational => {
 };
 
 /**
+ * Returns the integer number of timescale-units per frame given a frame rate. Useful for
+ * populating `frameDuration` fields in DASH/HLS-style metadata: e.g. for a 30000/1001 fps
+ * stream in a 90000-tick timescale, returns `3003`. Rounds to the nearest integer.
+ *
+ * @group Miscellaneous
+ * @public
+ */
+export const getFrameDurationFromRate = (rate: Rational, timescale: number): number => {
+	if (rate.num <= 0 || timescale <= 0) {
+		return 0;
+	}
+	return Math.round((timescale * rate.den) / rate.num);
+};
+
+/**
  * Specifies a rectangular region where all quantities must be non-negative integers.
  * @group Miscellaneous
  * @public

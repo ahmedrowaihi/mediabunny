@@ -16,6 +16,7 @@ import { TrackType } from './output';
 import { EncodedPacket, PacketType } from './packet';
 import { TrackDisposition } from './metadata';
 import { DurationMetadataRequestOptions } from './demuxer';
+import { TrackEncryptionInfo } from './isobmff/isobmff-misc';
 
 /**
  * Contains aggregate statistics about the encoded packets of a track.
@@ -51,6 +52,7 @@ export interface InputTrackBacking {
 	getHasOnlyKeyPackets?(): MaybePromise<boolean | null>;
 	getDecoderConfig(): Promise<VideoDecoderConfig | AudioDecoderConfig | null>;
 	getMetadataCodecParameterString?(): MaybePromise<string | null>;
+	getEncryptionInfo(): MaybePromise<TrackEncryptionInfo | null>;
 
 	getFirstPacket(options: PacketRetrievalOptions): Promise<EncodedPacket | null>;
 	getPacket(timestamp: number, options: PacketRetrievalOptions): Promise<EncodedPacket | null>;
@@ -99,6 +101,16 @@ export abstract class InputTrack {
 	 * differ.
 	 */
 	abstract hasOnlyKeyPackets(): Promise<boolean>;
+
+	/**
+	 * Returns the Common Encryption descriptor parsed from the track's `tenc` box, or `null` if the track is
+	 * unencrypted (or the container has no equivalent metadata). When non-null, `defaultKid` and `scheme` describe
+	 * how subsequent samples are protected; pair with {@link Input.getPsshBoxes} to obtain DRM-system-specific
+	 * licensing data.
+	 */
+	async getEncryptionInfo(): Promise<TrackEncryptionInfo | null> {
+		return this._backing.getEncryptionInfo();
+	}
 
 	/** Returns true if and only if this track is a video track. */
 	isVideoTrack(): this is InputVideoTrack {

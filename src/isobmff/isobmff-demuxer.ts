@@ -74,6 +74,7 @@ import {
 	psshBoxesAreEqual,
 	PsshBox,
 	SidxBox,
+	TrackEncryptionInfo,
 } from './isobmff-misc';
 import {
 	MAX_BOX_HEADER_SIZE,
@@ -267,16 +268,6 @@ type Fragment = {
 	psshBoxes: PsshBox[];
 };
 
-type TrackEncryptionInfo = {
-	scheme: 'cenc' | 'cens' | 'cbcs';
-	defaultKid: string | null;
-	defaultIsProtected: boolean | null;
-	defaultPerSampleIvSize: number | null;
-	defaultConstantIv: Uint8Array | null;
-	defaultCryptByteBlock: number | null;
-	defaultSkipByteBlock: number | null;
-};
-
 type SampleEncryptionInfo = {
 	iv: Uint8Array;
 	subsamples: {
@@ -358,6 +349,11 @@ export class IsobmffDemuxer extends Demuxer {
 	override async getSegmentIndex() {
 		await this.readMetadata();
 		return this.sidxBoxes;
+	}
+
+	override async getPsshBoxes() {
+		await this.readMetadata();
+		return this.psshBoxes;
 	}
 
 	readMetadata() {
@@ -2154,7 +2150,11 @@ export class IsobmffDemuxer extends Demuxer {
 					break;
 				}
 
-				const psshBox = parsePsshBoxContents(readBytes(slice, boxInfo.contentSize));
+				const bytes = readBytes(slice.slice(startPos, boxInfo.totalSize), boxInfo.totalSize);
+				const psshBox: PsshBox = {
+					...parsePsshBoxContents(readBytes(slice, boxInfo.contentSize)),
+					bytes,
+				};
 
 				if (this.currentFragment) {
 					this.currentFragment.psshBoxes.push(psshBox);
@@ -2821,6 +2821,10 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 
 	getInternalCodecId() {
 		return this.internalTrack.internalCodecId;
+	}
+
+	getEncryptionInfo(): TrackEncryptionInfo | null {
+		return this.internalTrack.encryptionInfo;
 	}
 
 	getName() {

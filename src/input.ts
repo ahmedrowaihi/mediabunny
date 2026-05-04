@@ -530,6 +530,16 @@ export class Input<S extends Source = Source> extends EventEmitter<InputEvents> 
 	}
 
 	/**
+	 * Returns top-level Protection System Specific Header (`pssh`) boxes from the file, one per DRM system
+	 * (Widevine, PlayReady, FairPlay, etc.). Use {@link parsePsshBoxContents} on the raw bytes to get
+	 * structured fields. Returns an empty array for clear files and for formats without a `pssh` equivalent.
+	 */
+	async getPsshBoxes() {
+		const demuxer = await this._getDemuxer();
+		return demuxer.getPsshBoxes();
+	}
+
+	/**
 	 * Disposes this input and frees connected resources. When an input is disposed, ongoing read operations will be
 	 * canceled, all future read operations will fail, any open decoders will be closed, and all ongoing media sink
 	 * operations will be canceled. Disallowed and canceled operations will throw an {@link InputDisposedError}.

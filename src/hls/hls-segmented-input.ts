@@ -406,7 +406,10 @@ export class HlsSegmentedInput extends SegmentedInput {
 							&& bytes[7] === 0x68
 						) {
 							const size = toDataView(bytes).getUint32(0);
-							psshBox = parsePsshBoxContents(bytes.subarray(8, Math.min(size, bytes.length)));
+							psshBox = {
+								...parsePsshBoxContents(bytes.subarray(8, Math.min(size, bytes.length))),
+								bytes,
+							};
 						}
 					}
 

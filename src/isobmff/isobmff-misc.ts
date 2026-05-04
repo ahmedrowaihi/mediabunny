@@ -46,9 +46,37 @@ export type PsshBox = {
 	keyIds: string[] | null;
 	/** The content protection system-specific data. */
 	data: Uint8Array;
+	/**
+	 * The original `pssh` box bytes — full ISO/IEC 23001-7 layout (size + `'pssh'` + version+flags +
+	 * systemId + optional keyIds + dataSize + data). Use this when re-emitting the box into a manifest
+	 * (`<cenc:pssh>`, HLS `data:` URI, etc.) — it skips a re-serialization round-trip and preserves any
+	 * vendor-specific layout details verbatim.
+	 */
+	bytes: Uint8Array;
 };
 
-export const parsePsshBoxContents = (contents: Uint8Array): PsshBox => {
+/**
+ * Parsed view of a `pssh` box's contents (everything after the 8-byte box header). Returned by
+ * {@link parsePsshBoxContents}; lacks the original `bytes` field carried by a full {@link PsshBox}.
+ *
+ * @group Miscellaneous
+ * @public
+ */
+export type PsshBoxContents = Omit<PsshBox, 'bytes'>;
+
+/**
+ * Parse the contents of a `pssh` box (everything after the box header) into structured fields.
+ * Supports v0 (no key IDs) and v1 (with key IDs) layouts. The result lacks the original `bytes`
+ * field — callers that have the full box should attach it manually:
+ *
+ * ```ts
+ * const box: PsshBox = { ...parsePsshBoxContents(contents), bytes: fullBoxBytes };
+ * ```
+ *
+ * @group Miscellaneous
+ * @public
+ */
+export const parsePsshBoxContents = (contents: Uint8Array): PsshBoxContents => {
 	const view = toDataView(contents);
 	let pos = 0;
 
@@ -84,10 +112,42 @@ export const parsePsshBoxContents = (contents: Uint8Array): PsshBox => {
 	};
 };
 
+/**
+ * Returns `true` when two {@link PsshBox} values describe the same DRM system and carry
+ * byte-identical system-specific data. Key ID lists are not compared (they are derived from
+ * the same data and may legitimately be omitted in v0 boxes).
+ *
+ * @group Miscellaneous
+ * @public
+ */
 export const psshBoxesAreEqual = (a: PsshBox, b: PsshBox) => (
 	a.systemId === b.systemId
 	&& uint8ArraysAreEqual(a.data, b.data)
 );
+
+/**
+ * Common Encryption track-level descriptor parsed from `tenc` (under
+ * `sinf.schi`). One per encrypted track.
+ *
+ * @group Miscellaneous
+ * @public
+ */
+export type TrackEncryptionInfo = {
+	/** Protection scheme — `cenc` (CTR mode), `cens` (CTR pattern), or `cbcs` (CBC subsample). */
+	scheme: 'cenc' | 'cens' | 'cbcs';
+	/** Default Key ID as a 32-character lowercase hex string, or `null` when the track is unprotected. */
+	defaultKid: string | null;
+	/** Whether samples in this track are protected by default. */
+	defaultIsProtected: boolean | null;
+	/** Default `IV` size in bytes (8 or 16). `null` when constant IV is used instead. */
+	defaultPerSampleIvSize: number | null;
+	/** Default constant `IV` bytes (16 bytes, used by `cbcs`). `null` when per-sample IVs are used instead. */
+	defaultConstantIv: Uint8Array | null;
+	/** Pattern: number of encrypted blocks per cycle. `null` when the scheme doesn't use patterns. */
+	defaultCryptByteBlock: number | null;
+	/** Pattern: number of skipped blocks per cycle. `null` when the scheme doesn't use patterns. */
+	defaultSkipByteBlock: number | null;
+};
 
 /**
  * One subsegment reference within a {@link SidxBox}.

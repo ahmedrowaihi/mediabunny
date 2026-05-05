@@ -15,7 +15,6 @@ import {
 	AsyncMutex,
 	findLastIndex,
 	joinPaths,
-	textEncoder,
 	toArray,
 	UNDETERMINED_LANGUAGE,
 } from '../misc';
@@ -35,10 +34,11 @@ import {
 	HlsOutputSegmentInfo,
 	OutputFormat,
 } from '../output-format';
-import { Writer } from '../writer';
+import { ManifestEmitter } from '../manifest-emitter';
 import { EncodedPacket } from '../packet';
 import { SubtitleCue, SubtitleMetadata } from '../subtitles';
 import { NullTarget, PathedTarget, Target, TargetRequest } from '../target';
+import { HlsManifestEmitter } from './hls-manifest-emitter';
 import { HLS_MIME_TYPE } from './hls-misc';
 
 type HlsTrackData = {
@@ -90,6 +90,14 @@ type Playlist = {
 		info: HlsOutputSegmentInfo;
 	} | null;
 
+	bitrateCache: {
+		processedCount: number;
+		cachedGtd: number;
+		totalBytes: number;
+		totalDuration: number;
+		peakBitrate: number;
+	} | null;
+
 	// For HLS, having a single mutex is too coarse. Every playlist is basically independent and therefore we can have
 	// a per-playlist mutex instead of a per-muxer one. This means two packets from different playlists coming in don't
 	// block each other.
@@ -121,7 +129,23 @@ export class HlsMuxer extends Muxer {
 	playlists: Playlist[] = [];
 	playlistDeclarations: PlaylistDeclaration[] = [];
 
-	constructor(output: Output, format: HlsOutputFormat) {
+	/**
+	 * Manifest emitters fed by the segment-cutting pipeline. The default
+	 * configuration always includes one {@link HlsManifestEmitter} so HLS
+	 * output stays byte-identical to the pre-extraction implementation.
+	 *
+	 * `AdaptiveOutputFormat` constructs the muxer with a different list
+	 * (HLS + DASH, optionally + I-frame trick-play, etc.) — same segment
+	 * pipeline, multiple manifest formats fed off the same lifecycle.
+	 */
+	private manifestEmitters: ManifestEmitter[];
+
+	constructor(
+		output: Output,
+		format: HlsOutputFormat,
+		emitterFactory: (muxer: HlsMuxer) => ManifestEmitter[]
+		= muxer => [new HlsManifestEmitter(muxer)],
+	) {
 		if (!(output._target instanceof PathedTarget)) {
 			throw new TypeError('HLS outputs require `OutputOptions.target` to be a PathedTarget.');
 		}
@@ -143,6 +167,37 @@ export class HlsMuxer extends Muxer {
 				: `segment-${info.playlist.n}-${info.n}${info.format.fileExtension}`);
 		this.getInitPath = format._options.getInitPath
 			?? (playlist => `init-${playlist.n}${playlist.segmentFormat.fileExtension}`);
+
+		this.manifestEmitters = emitterFactory(this);
+	}
+
+	/**
+	 * Fan an event out to every registered manifest emitter, awaiting each
+	 * in turn so that emitters that read shared state see prior emitters'
+	 * mutations (e.g. `peakBitrate` populated by HLS before DASH reads it).
+	 */
+	private async broadcast<E extends keyof ManifestEmitter>(
+		event: E,
+		...args: Parameters<NonNullable<ManifestEmitter[E]>>
+	): Promise<void> {
+		for (const emitter of this.manifestEmitters) {
+			const handler = emitter[event] as undefined | ((...a: unknown[]) => unknown);
+			if (handler) {
+				await handler.apply(emitter, args);
+			}
+		}
+	}
+
+	/** @internal Routed through the muxer so it stays the single owner of the
+	 * master-playlist write counter. */
+	noteMasterPlaylistWritten() {
+		this.numWrittenMasterPlaylists++;
+	}
+
+	/** @internal Exposes the muxer's master-playlist mutex to the manifest
+	 * emitter without leaking the underlying {@link AsyncMutex}. */
+	acquireMutex() {
+		return this.mutex.acquire();
 	}
 
 	async start(): Promise<void> {
@@ -467,6 +522,7 @@ export class HlsMuxer extends Muxer {
 				done: false,
 				singleFile: null,
 				mutex: new AsyncMutex(),
+				bitrateCache: null,
 			};
 			this.playlists.push(playlist);
 
@@ -509,6 +565,8 @@ export class HlsMuxer extends Muxer {
 					: [],
 			});
 		}
+
+		await this.broadcast('onStart');
 
 		release();
 	}
@@ -1091,8 +1149,7 @@ export class HlsMuxer extends Muxer {
 					}
 				}
 
-				await this.writePlaylist(playlist);
-				await this.tryWriteMasterPlaylist();
+				await this.broadcast('onSegmentAppended', playlist);
 			}
 		}
 	}
@@ -1108,365 +1165,7 @@ export class HlsMuxer extends Muxer {
 			this.format._options.onSegment?.(playlist.singleFile.target, playlist.singleFile.info);
 		}
 
-		await this.writePlaylist(playlist);
-
-		if (this.isLive && playlist.writtenSegments.length === 0) {
-			await this.tryWriteMasterPlaylist();
-		}
-	}
-
-	private updatePlaylistBitrates(playlist: Playlist) {
-		const segments = playlist.writtenSegments;
-
-		let peakBitrate = 0;
-		let totalBits = 0;
-		let totalDuration = 0;
-
-		// Per spec, peak bitrate is the largest bit rate of any contiguous set of segments whose total duration is
-		// between 0.5 and 1.5 times the target duration
-		for (let i = 0; i < segments.length; i++) {
-			totalDuration += segments[i]!.duration;
-
-			let windowBytes = 0;
-			let windowDuration = 0;
-
-			for (let j = i; j < segments.length; j++) {
-				windowBytes += segments[j]!.byteSize;
-				windowDuration += segments[j]!.duration;
-
-				if (
-					windowDuration >= 0.5 * this.globalTargetDuration
-					&& windowDuration <= 1.5 * this.globalTargetDuration
-				) {
-					peakBitrate = Math.max(peakBitrate, 8 * windowBytes / windowDuration);
-				}
-
-				if (windowDuration > 1.5 * this.globalTargetDuration) {
-					break;
-				}
-			}
-		}
-
-		// Fallback: if no contiguous set falls within the range, use per-segment max
-		if (peakBitrate === 0) {
-			for (const segment of segments) {
-				const segmentDuration = segment.duration || 1; // To catch 0-duration segments which can happen
-				peakBitrate = Math.max(peakBitrate, 8 * segment.byteSize / segmentDuration);
-			}
-		}
-
-		for (const segment of segments) {
-			totalBits += 8 * segment.byteSize;
-		}
-
-		playlist.peakBitrate = peakBitrate;
-		playlist.averageBitrate = totalBits / (totalDuration || 1);
-	}
-
-	private async writePlaylist(playlist: Playlist) {
-		assert(this.output._target instanceof PathedTarget);
-		const pathedTarget = this.output._target;
-
-		this.updatePlaylistBitrates(playlist);
-
-		let hasByteOffsets = false;
-		for (const segment of playlist.writtenSegments) {
-			hasByteOffsets ||= segment.byteOffset !== null;
-		}
-
-		const isKeyPacketsOnly = playlist.tracks[0]!.isVideoTrack()
-			&& playlist.tracks[0].metadata.hasOnlyKeyPackets;
-
-		let version = 3;
-		if (isKeyPacketsOnly || hasByteOffsets) {
-			version = 4;
-		}
-		if (playlist.initSegment) {
-			version = 5;
-		}
-		if (playlist.initSegment && !isKeyPacketsOnly) {
-			// "if it contains the EXT-X-MAP tag in a Media Playlist that does not contain EXT-X-I-FRAMES-ONLY"
-			version = 6;
-		}
-
-		// In live mode, target duration is not allowed to change, so we use the nominal value
-		const targetDuration = this.isLive ? this.targetSegmentDuration : this.globalTargetDuration;
-
-		const playlistPath = joinPaths(pathedTarget.rootPath, playlist.path);
-		const playlistText = '#EXTM3U\n'
-			+ `#EXT-X-VERSION:${version}\n`
-			+ (!this.isLive ? '#EXT-X-PLAYLIST-TYPE:VOD\n' : '')
-			+ `#EXT-X-TARGETDURATION:${Math.ceil(targetDuration)}\n` // Must be a "decimal-integer"
-			+ (Number.isFinite(this.maxLiveSegmentCount) ? `#EXT-X-MEDIA-SEQUENCE:${playlist.mediaSequence}\n` : '')
-			+ '#EXT-X-INDEPENDENT-SEGMENTS\n'
-			+ (isKeyPacketsOnly ? '#EXT-X-I-FRAMES-ONLY\n' : '')
-			+ (playlist.initSegment
-				? (`#EXT-X-MAP:URI="${playlist.initSegment.path}"`
-					+ (playlist.initSegment.byteOffset !== null
-						? `,BYTERANGE="${playlist.initSegment.byteSize}@${playlist.initSegment.byteOffset}"`
-						: '')
-					+ '\n')
-				: '')
-			+ '\n'
-			+ (playlist.writtenSegments
-				.map(segment => (
-					`#EXTINF:${+segment.duration.toFixed(12)},\n` // Trailing comma mandated by spec
-					+ (this.isRelativeToUnixEpoch
-						? `#EXT-X-PROGRAM-DATE-TIME:${new Date(1000 * segment.timestamp).toISOString()}\n`
-						: '')
-					+ (segment.byteOffset !== null
-						? `#EXT-X-BYTERANGE:${segment.byteSize}@${segment.byteOffset}\n`
-						: '')
-					+ `${segment.path}\n`
-				))
-				.join(''))
-			+ (playlist.done
-				? (playlist.writtenSegments.length > 0 ? '\n' : '') + '#EXT-X-ENDLIST\n'
-				: '');
-
-		this.format._options.onPlaylist?.(playlistText, toPlaylistInfo(playlist));
-
-		const target = await this.output._getTarget({
-			path: playlistPath,
-			isRoot: false,
-			mimeType: HLS_MIME_TYPE,
-		});
-		const writer = new Writer(target, true);
-		writer.start();
-		writer.write(textEncoder.encode(playlistText));
-
-		await writer.flush();
-		await writer.finalize();
-	}
-
-	private async writeMasterPlaylist() {
-		assert(this.output._target instanceof PathedTarget);
-		const pathedTarget = this.output._target;
-
-		let masterPlaylistText = '#EXTM3U\n';
-		let firstVariantWritten = false;
-
-		let lastGroupId: string | null = null;
-		let groupIdTrackCount = 0;
-		let hasHadDefaultTrackInGroup = false;
-
-		for (const decl of this.playlistDeclarations) {
-			if (decl.groupId === null) {
-				const isKeyPacketsOnly = decl.playlist.tracks[0]!.isVideoTrack()
-					&& decl.playlist.tracks[0].metadata.hasOnlyKeyPackets;
-
-				const codecs: string[] = [];
-				for (const track of decl.playlist.tracks) {
-					const trackData = this.trackDatas.find(x => x.track === track);
-					const codecString = trackData?.info.decoderConfig.codec ?? track.source._codec;
-					codecs.push(codecString);
-				}
-
-				let peakDeclBitrate = 0;
-				let maxRefAverageBitrate = 0;
-
-				if (decl.references.length > 0) {
-					const firstRef = decl.references[0]!;
-					const firstTrack = firstRef.playlist.tracks[0]!;
-					const trackData = this.trackDatas.find(x => x.track === firstTrack);
-					const codecString = trackData?.info.decoderConfig.codec ?? firstTrack.source._codec;
-					codecs.push(codecString);
-
-					for (const ref of decl.references) {
-						assert(ref.playlist.peakBitrate !== null);
-						peakDeclBitrate = Math.max(peakDeclBitrate, ref.playlist.peakBitrate);
-						maxRefAverageBitrate = Math.max(maxRefAverageBitrate, ref.playlist.averageBitrate ?? 0);
-					}
-				}
-
-				assert(decl.playlist.peakBitrate !== null);
-				const totalPeakBitrate = decl.playlist.peakBitrate + peakDeclBitrate;
-				const totalAverageBitrate = (decl.playlist.averageBitrate ?? 0) + maxRefAverageBitrate;
-
-				if (!firstVariantWritten) {
-					masterPlaylistText += '\n';
-					firstVariantWritten = true;
-				}
-
-				if (isKeyPacketsOnly) {
-					masterPlaylistText += `#EXT-X-I-FRAME-STREAM-INF:`;
-				} else {
-					masterPlaylistText += `#EXT-X-STREAM-INF:`;
-				}
-
-				masterPlaylistText += `BANDWIDTH=${Math.ceil(totalPeakBitrate)}`;
-
-				if (totalAverageBitrate > 0) {
-					masterPlaylistText += `,AVERAGE-BANDWIDTH=${Math.ceil(totalAverageBitrate)}`;
-				}
-
-				masterPlaylistText += `,CODECS="${codecs.join(',')}"`;
-
-				const videoTrack = decl.playlist.tracks.find(x => x.isVideoTrack());
-				if (videoTrack?.isVideoTrack()) {
-					const trackData = this.trackDatas.find(x => x.track === videoTrack) as
-						HlsVideoTrackData | undefined;
-					const decoderConfig = trackData?.info.decoderConfig;
-					if (decoderConfig) {
-						let width = decoderConfig.displayAspectWidth ?? decoderConfig.codedWidth;
-						let height = decoderConfig.displayAspectHeight ?? decoderConfig.codedHeight;
-
-						if (width !== undefined && height !== undefined) {
-							if (
-								videoTrack.metadata.rotation !== undefined
-								&& videoTrack.metadata.rotation % 180 === 90
-							) {
-								[width, height] = [height, width];
-							}
-
-							masterPlaylistText += `,RESOLUTION=${width}x${height}`;
-						}
-					}
-
-					// FRAME-RATE is not defined for EXT-X-I-FRAME-STREAM-INF
-					if (!isKeyPacketsOnly && videoTrack.metadata.frameRate !== undefined) {
-						// Spec requires that frame rate be rounded to 3 decimal places
-						masterPlaylistText += `,FRAME-RATE=${+videoTrack.metadata.frameRate.toFixed(3)}`;
-					}
-				}
-
-				if (!isKeyPacketsOnly) {
-					const groupIdForType = new Map<string, string>();
-					for (const ref of decl.references) {
-						assert(ref.groupId !== null);
-						const type = ref.playlist.tracks[0]!.type;
-						groupIdForType.set(type, ref.groupId);
-					}
-
-					for (const [type, id] of groupIdForType) {
-						masterPlaylistText += `,${type.toUpperCase()}="${id}"`;
-					}
-				}
-
-				if (isKeyPacketsOnly) {
-					// EXT-X-I-FRAME-STREAM-INF is standalone with a URI attribute
-					masterPlaylistText += `,URI="${decl.playlist.path}"`;
-					masterPlaylistText += '\n';
-				} else {
-					masterPlaylistText += '\n';
-					masterPlaylistText += `${decl.playlist.path}\n`;
-				}
-			} else {
-				assert(decl.playlist.tracks.length === 1);
-
-				const track = decl.playlist.tracks[0]!;
-				const type = track.type;
-				let name = track.metadata.name ?? null;
-				const languageCode = track.metadata.languageCode;
-				const disposition = track.metadata.disposition;
-
-				if (lastGroupId === null || decl.groupId !== lastGroupId) {
-					groupIdTrackCount = 0;
-					masterPlaylistText += '\n';
-					hasHadDefaultTrackInGroup = false;
-				}
-				lastGroupId = decl.groupId;
-				groupIdTrackCount++;
-
-				masterPlaylistText += `#EXT-X-MEDIA:TYPE=${type.toUpperCase()},GROUP-ID="${decl.groupId}"`;
-
-				if (name !== null && /[\n\r"]/.test(name)) {
-					Logging._warn(
-						'Dropping track name since it includes a line feed, carriage return, or double quote'
-						+ ' character, which are not allowed in HLS playlist attributes.',
-					);
-					name = null;
-				}
-
-				// Name is required, so we have to set it to SOMETHING
-				name ??= `${languageCode ?? decl.groupId}-${groupIdTrackCount}`;
-
-				masterPlaylistText += `,NAME="${name}"`;
-
-				if (languageCode !== undefined) {
-					masterPlaylistText += `,LANGUAGE="${languageCode}"`;
-				}
-
-				const dispositionPrimary = disposition?.primary ?? false;
-				const dispositionDefault = disposition?.default ?? true;
-				const dispositionForced = disposition?.forced ?? false;
-
-				if (dispositionPrimary && !hasHadDefaultTrackInGroup) {
-					// HLS's "DEFAULT" behaves like our "primary"
-					masterPlaylistText += ',DEFAULT=YES';
-					hasHadDefaultTrackInGroup = true; // Only one DEFAULT label per group allowed
-				}
-
-				if (dispositionPrimary || dispositionDefault) {
-					masterPlaylistText += ',AUTOSELECT=YES';
-				}
-
-				if (dispositionForced) {
-					masterPlaylistText += ',FORCED=YES';
-				}
-
-				if (type === 'audio') {
-					const trackData = this.trackDatas.find(x => x.track === track) as
-						HlsAudioTrackData | undefined;
-					const decoderConfig = trackData?.info.decoderConfig;
-
-					if (decoderConfig) {
-						masterPlaylistText += `,CHANNELS="${decoderConfig.numberOfChannels}"`;
-					}
-				}
-
-				if (!decl.noUri) {
-					masterPlaylistText += `,URI="${decl.playlist.path}"`;
-				}
-
-				masterPlaylistText += '\n';
-			}
-		}
-
-		this.format._options.onMaster?.(masterPlaylistText);
-
-		const release = await this.mutex.acquire();
-
-		try {
-			let writer: Writer;
-			if (this.numWrittenMasterPlaylists === 0) {
-				// For the first master playlist write, we use the normal root writer getter, so that the target
-				// returned by Output.target emits valid write events.
-				writer = await this.output._getRootWriter(true);
-			} else {
-				// For subsequent master playlist writes, we *must* obtain a different target in order to overwrite
-				// the file.
-				const target = await this.output._getTarget({
-					path: pathedTarget.rootPath,
-					isRoot: true,
-					mimeType: HLS_MIME_TYPE,
-				});
-				writer = new Writer(target, true);
-				writer.start();
-			}
-
-			writer.write(textEncoder.encode(masterPlaylistText));
-
-			await writer.flush();
-			await writer.finalize();
-
-			this.numWrittenMasterPlaylists++;
-		} finally {
-			release();
-		}
-	}
-
-	private async tryWriteMasterPlaylist() {
-		assert(this.isLive);
-
-		// The master playlist is written once all playlists have either produced at least one segment or are done
-		for (const playlist of this.playlists) {
-			if (playlist.writtenSegments.length === 0 && !playlist.done) {
-				return;
-			}
-		}
-
-		await this.writeMasterPlaylist();
+		await this.broadcast('onPlaylistDone', playlist);
 	}
 
 	async finalize() {
@@ -1481,9 +1180,7 @@ export class HlsMuxer extends Muxer {
 			playlist.done ? Promise.resolve() : this.advancePlaylist(playlist)
 		)));
 
-		if (!this.isLive) {
-			await this.writeMasterPlaylist();
-		}
+		await this.broadcast('onFinalize');
 	}
 }
 

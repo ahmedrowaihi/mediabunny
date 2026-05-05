@@ -28,6 +28,10 @@ import { OggMuxer } from './ogg/ogg-muxer';
 import { Output, OutputTrack, TrackType } from './output';
 import { MpegTsMuxer } from './mpeg-ts/mpeg-ts-muxer';
 import { WaveMuxer } from './wave/wave-muxer';
+import { DashManifestEmitter } from './dash/dash-manifest-emitter';
+import type { DashProfile, MpdParams, MpdType } from './dash/dash-types';
+import { HlsManifestEmitter, type HlsManifestEmitterHost } from './hls/hls-manifest-emitter';
+import type { MediaPipelineHost } from './manifest-emitter';
 import { HlsMuxer } from './hls/hls-muxer';
 import { HLS_MIME_TYPE } from './hls/hls-misc';
 import { MaybePromise, FilePath, toArray } from './misc';
@@ -1421,5 +1425,246 @@ export class HlsOutputFormat extends OutputFormat {
 	// eslint-disable-next-line @typescript-eslint/no-unused-vars
 	override _codecUnsupportedHint(codec: MediaCodec): string {
 		return ` Using different segment formats may grant support for this codec.`;
+	}
+}
+
+/**
+ * Options for {@link DashOutputFormat}. Same segment-pipeline surface as
+ * {@link HlsOutputFormatOptions} (minus HLS-only `onMaster` / `onPlaylist`)
+ * plus DASH-specific manifest fields.
+ *
+ * @group Output formats
+ * @public
+ */
+export type DashOutputFormatOptions = Omit<HlsOutputFormatOptions, 'onMaster' | 'onPlaylist'> & {
+	/** Path of the rendered MPD relative to the {@link PathedTarget}'s root. */
+	mpdPath: string;
+	/** `<SegmentTemplate@media>` value with `$Number$` placeholder, relative to the playlist directory. */
+	segmentTemplate?: string;
+	/** `<SegmentTemplate@initialization>` filename, relative to the playlist directory. */
+	initSegmentName?: string;
+	/** DASH profile. Defaults to `'live'` (segments addressed by `SegmentTemplate`). */
+	dashProfile?: DashProfile;
+	/** MPD presentation type. `'static'` for VOD (default), `'dynamic'` for live. */
+	mpdType?: MpdType;
+	/** Override individual {@link MpdParams} fields; merged onto shaka defaults. */
+	mpdParams?: Partial<MpdParams>;
+	/** Called once with the MPD text after every track has been finalised. */
+	onMpd?: (content: string) => unknown;
+};
+
+const SHARED_PIPELINE_KEYS = [
+	'segmentFormat', 'targetDuration', 'singleFilePerPlaylist', 'live',
+	'maxLiveSegmentCount', 'getPlaylistPath', 'getSegmentPath', 'getInitPath',
+	'onSegment', 'onInit', 'onSegmentPopped',
+] as const satisfies readonly (keyof HlsOutputFormatOptions)[];
+
+const extractSharedPipelineOptions = (options: DashOutputFormatOptions): HlsOutputFormatOptions => {
+	const out = { segmentFormat: options.segmentFormat } as HlsOutputFormatOptions;
+	for (const key of SHARED_PIPELINE_KEYS) {
+		if (options[key] !== undefined) {
+			(out as Record<string, unknown>)[key] = options[key];
+		}
+	}
+	return out;
+};
+
+/**
+ * MPEG-DASH output format.
+ *
+ * @group Output formats
+ * @public
+ */
+export class DashOutputFormat extends OutputFormat {
+	/** @internal */
+	_options: DashOutputFormatOptions;
+
+	/** Creates a new {@link DashOutputFormat} configured with the specified `options`. */
+	constructor(options: DashOutputFormatOptions) {
+		if (!options || typeof options !== 'object') {
+			throw new TypeError('options must be an object.');
+		}
+		if (typeof options.mpdPath !== 'string' || options.mpdPath.length === 0) {
+			throw new TypeError('options.mpdPath must be a non-empty string.');
+		}
+		if (options.onMpd !== undefined && typeof options.onMpd !== 'function') {
+			throw new TypeError('options.onMpd, when provided, must be a function.');
+		}
+
+		super();
+
+		this._options = options;
+	}
+
+	/** @internal */
+	_createMuxer(output: Output): Muxer {
+		const sharedFormat = new HlsOutputFormat(extractSharedPipelineOptions(this._options));
+		return new HlsMuxer(output, sharedFormat, muxer => [
+			new DashManifestEmitter(muxer as unknown as MediaPipelineHost, this._options),
+		]);
+	}
+
+	/** @internal */
+	get _name() {
+		return 'MPEG-DASH';
+	}
+
+	get fileExtension() {
+		return '.mpd';
+	}
+
+	get mimeType() {
+		return 'application/dash+xml';
+	}
+
+	getSupportedCodecs(): MediaCodec[] {
+		const uniqueCodecs = new Set(toArray(this._options.segmentFormat).flatMap(x => x.getSupportedCodecs()));
+		return [...uniqueCodecs];
+	}
+
+	getSupportedTrackCounts(): TrackCountLimits {
+		let supportsVideo = false;
+		let supportsAudio = false;
+		for (const format of toArray(this._options.segmentFormat)) {
+			const trackCounts = format.getSupportedTrackCounts();
+			supportsVideo ||= trackCounts.video.max > 0;
+			supportsAudio ||= trackCounts.audio.max > 0;
+		}
+		return {
+			video: { min: 0, max: supportsVideo ? Infinity : 0 },
+			audio: { min: 0, max: supportsAudio ? Infinity : 0 },
+			subtitle: { min: 0, max: 0 },
+			total: { min: 1, max: Infinity },
+		};
+	}
+
+	get supportsVideoRotationMetadata(): boolean {
+		return toArray(this._options.segmentFormat).some(format => format.supportsVideoRotationMetadata);
+	}
+
+	get supportsTimestampedMediaData(): boolean {
+		return toArray(this._options.segmentFormat).some(format => format.supportsTimestampedMediaData);
+	}
+}
+
+/**
+ * Options for {@link AdaptiveOutputFormat}.
+ *
+ * @group Output formats
+ * @public
+ */
+export type AdaptiveOutputFormatOptions = {
+	/** One {@link HlsOutputFormat} plus zero or more {@link DashOutputFormat}s, sharing the same segment pipeline. */
+	formats: (HlsOutputFormat | DashOutputFormat)[];
+};
+
+/**
+ * Adaptive output format — one encoder pass, multiple manifests pointing at
+ * the same CMAF segments.
+ *
+ * @group Output formats
+ * @public
+ */
+export class AdaptiveOutputFormat extends OutputFormat {
+	/** @internal */
+	_options: AdaptiveOutputFormatOptions;
+	/** @internal */
+	_hlsFormat: HlsOutputFormat;
+	/** @internal */
+	_dashFormats: DashOutputFormat[];
+
+	/** Creates a new {@link AdaptiveOutputFormat} configured with the specified `options`. */
+	constructor(options: AdaptiveOutputFormatOptions) {
+		if (!options || typeof options !== 'object') {
+			throw new TypeError('options must be an object.');
+		}
+		if (!Array.isArray(options.formats) || options.formats.length === 0) {
+			throw new TypeError('options.formats must be a non-empty array.');
+		}
+
+		const hlsFormats = options.formats.filter(
+			(f): f is HlsOutputFormat => f instanceof HlsOutputFormat,
+		);
+		const dashFormats = options.formats.filter(
+			(f): f is DashOutputFormat => f instanceof DashOutputFormat,
+		);
+		if (hlsFormats.length !== 1) {
+			throw new TypeError(
+				'options.formats must contain exactly one HlsOutputFormat instance '
+				+ '(the underlying muxer uses the HLS master playlist as its root file).',
+			);
+		}
+		if (hlsFormats.length + dashFormats.length !== options.formats.length) {
+			throw new TypeError(
+				'options.formats may currently only contain HlsOutputFormat or DashOutputFormat instances.',
+			);
+		}
+
+		const hlsFormat = hlsFormats[0]!;
+		const sharedFields: (keyof DashOutputFormatOptions & keyof HlsOutputFormatOptions)[] = [
+			'segmentFormat', 'targetDuration', 'singleFilePerPlaylist', 'live',
+			'maxLiveSegmentCount', 'getPlaylistPath', 'getSegmentPath', 'getInitPath',
+		];
+		for (const dash of dashFormats) {
+			for (const field of sharedFields) {
+				if (hlsFormat._options[field] !== dash._options[field]) {
+					throw new TypeError(
+						`options.formats: composed formats must agree on '${field}' — `
+						+ 'pass the same value (or instance) to every format.',
+					);
+				}
+			}
+		}
+
+		super();
+
+		this._options = options;
+		this._hlsFormat = hlsFormat;
+		this._dashFormats = dashFormats;
+	}
+
+	/** @internal */
+	_createMuxer(output: Output): Muxer {
+		return new HlsMuxer(output, this._hlsFormat, muxer => [
+			new HlsManifestEmitter(muxer as unknown as HlsManifestEmitterHost),
+			...this._dashFormats.map(dash => new DashManifestEmitter(
+				muxer as unknown as MediaPipelineHost,
+				dash._options,
+			)),
+		]);
+	}
+
+	/** @internal */
+	get _name() {
+		return 'Adaptive Streaming (HLS + DASH)';
+	}
+
+	get fileExtension() {
+		return '.m3u8';
+	}
+
+	get mimeType() {
+		return this._hlsFormat.mimeType;
+	}
+
+	getSupportedCodecs(): MediaCodec[] {
+		return this._hlsFormat.getSupportedCodecs();
+	}
+
+	getSupportedTrackCounts(): TrackCountLimits {
+		return this._hlsFormat.getSupportedTrackCounts();
+	}
+
+	get supportsVideoRotationMetadata(): boolean {
+		return this._hlsFormat.supportsVideoRotationMetadata;
+	}
+
+	get supportsTimestampedMediaData(): boolean {
+		return this._hlsFormat.supportsTimestampedMediaData;
+	}
+
+	/** @internal */
+	override _codecUnsupportedHint(codec: MediaCodec): string {
+		return this._hlsFormat._codecUnsupportedHint(codec);
 	}
 }

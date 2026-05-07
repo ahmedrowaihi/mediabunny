@@ -2,6 +2,7 @@
 /*!
  * Test cases ported from Shaka Packager (BSD-3-Clause).
  * https://github.com/shaka-project/shaka-packager/blob/main/packager/hls/base/master_playlist_unittest.cc
+ * Last synced with shaka commit: b1580dd (2026-05-06).
  */
 import { describe, expect, test } from 'vitest';
 import { MasterPlaylist } from '../../src/hls/hls-master-playlist.js';
@@ -361,3 +362,243 @@ describe('MasterPlaylist — audio-only master', () => {
 		expect(out).toContain('http://x/eng.m3u8');
 	});
 });
+
+const createTextPlaylist = (opts: {
+	fileName: string;
+	name: string;
+	groupId: string;
+	codec: string;
+	language: string;
+	characteristics?: string[];
+	forcedSubtitle?: boolean;
+}): MediaPlaylist => {
+	const p = new MediaPlaylist(vodParams(), opts.fileName, opts.name, opts.groupId);
+	p.setMediaInfo({
+		textInfo: { codec: opts.codec, language: opts.language },
+		containerType: 'text',
+		referenceTimeScale: TIME_SCALE,
+		hlsCharacteristics: opts.characteristics,
+		forcedSubtitle: opts.forcedSubtitle,
+	});
+	return p;
+};
+
+describe('MasterPlaylist — multiple audio groups', () => {
+	test('emits one variant per audio group', () => {
+		const m = new MasterPlaylist(masterOpts());
+		m.addPlaylist(createVideoPlaylist({
+			fileName: 'video-1.m3u8',
+			codec: 'sdvideocodec',
+			maxBitrate: 300000,
+			avgBitrate: 100000,
+		}));
+		m.addPlaylist(createAudioPlaylist({
+			fileName: 'eng.m3u8',
+			name: 'english',
+			groupId: 'audio-en',
+			codec: 'audiocodec',
+			language: 'en',
+			channels: 2,
+			maxBitrate: 50000,
+			avgBitrate: 30000,
+		}));
+		m.addPlaylist(createAudioPlaylist({
+			fileName: 'fra.m3u8',
+			name: 'french',
+			groupId: 'audio-fr',
+			codec: 'audiocodec',
+			language: 'fr',
+			channels: 2,
+			maxBitrate: 50000,
+			avgBitrate: 30000,
+		}));
+
+		const out = m.build({ baseUrl: '' });
+		expect(out.match(/AUDIO="audio-en"/g)?.length).toBe(1);
+		expect(out.match(/AUDIO="audio-fr"/g)?.length).toBe(1);
+		expect(out.match(/#EXT-X-STREAM-INF:/g)?.length).toBe(2);
+	});
+});
+
+describe('MasterPlaylist — videos + texts', () => {
+	test('emits SUBTITLES group reference on each variant', () => {
+		const m = new MasterPlaylist(masterOpts());
+		m.addPlaylist(createVideoPlaylist({
+			fileName: 'sd.m3u8',
+			codec: 'sdvideocodec',
+			maxBitrate: 300000,
+			avgBitrate: 100000,
+		}));
+		m.addPlaylist(createTextPlaylist({
+			fileName: 'eng.m3u8',
+			name: 'english subs',
+			groupId: 'text-group',
+			codec: 'wvtt',
+			language: 'en',
+		}));
+
+		const out = m.build({ baseUrl: '' });
+		expect(out).toContain('#EXT-X-MEDIA:TYPE=SUBTITLES');
+		expect(out).toMatch(/SUBTITLES="text-group"/);
+	});
+});
+
+describe('MasterPlaylist — video + audio + text', () => {
+	test('cartesian variant matrix over audio × subtitle groups', () => {
+		const m = new MasterPlaylist(masterOpts());
+		m.addPlaylist(createVideoPlaylist({
+			fileName: 'video.m3u8',
+			codec: 'sdvideocodec',
+			maxBitrate: 300000,
+			avgBitrate: 100000,
+		}));
+		m.addPlaylist(createAudioPlaylist({
+			fileName: 'audio-en.m3u8',
+			name: 'english',
+			groupId: 'audio-en',
+			codec: 'audiocodec',
+			language: 'en',
+			channels: 2,
+			maxBitrate: 50000,
+			avgBitrate: 30000,
+		}));
+		m.addPlaylist(createAudioPlaylist({
+			fileName: 'audio-fr.m3u8',
+			name: 'french',
+			groupId: 'audio-fr',
+			codec: 'audiocodec',
+			language: 'fr',
+			channels: 2,
+			maxBitrate: 50000,
+			avgBitrate: 30000,
+		}));
+		m.addPlaylist(createTextPlaylist({
+			fileName: 'sub-en.m3u8',
+			name: 'sub-en',
+			groupId: 'text-en',
+			codec: 'wvtt',
+			language: 'en',
+		}));
+		m.addPlaylist(createTextPlaylist({
+			fileName: 'sub-fr.m3u8',
+			name: 'sub-fr',
+			groupId: 'text-fr',
+			codec: 'wvtt',
+			language: 'fr',
+		}));
+
+		const out = m.build({ baseUrl: '' });
+		// 2 audio groups × 2 subtitle groups = 4 variant rows.
+		expect(out.match(/#EXT-X-STREAM-INF:/g)?.length).toBe(4);
+		expect(out).toMatch(/AUDIO="audio-en".*SUBTITLES="text-en"/);
+		expect(out).toMatch(/AUDIO="audio-en".*SUBTITLES="text-fr"/);
+		expect(out).toMatch(/AUDIO="audio-fr".*SUBTITLES="text-en"/);
+		expect(out).toMatch(/AUDIO="audio-fr".*SUBTITLES="text-fr"/);
+	});
+});
+
+describe('MasterPlaylist — input order', () => {
+	// shaka commit b1580dd: emit #EXT-X-MEDIA tags in the order playlists were
+	// added, not grouped by GROUP-ID. This test interleaves two audio groups
+	// and asserts the output preserves input order.
+	test('interleaved audio groups are emitted in input order', () => {
+		const m = new MasterPlaylist(masterOpts());
+		m.addPlaylist(createVideoPlaylist({
+			fileName: 'video.m3u8',
+			codec: 'sdvideocodec',
+			maxBitrate: 300000,
+			avgBitrate: 100000,
+		}));
+		m.addPlaylist(createAudioPlaylist({
+			fileName: 'a-en.m3u8',
+			name: 'a-en',
+			groupId: 'audio-a',
+			codec: 'audiocodec',
+			language: 'en',
+			channels: 2,
+			maxBitrate: 50000,
+			avgBitrate: 30000,
+		}));
+		m.addPlaylist(createAudioPlaylist({
+			fileName: 'b-en.m3u8',
+			name: 'b-en',
+			groupId: 'audio-b',
+			codec: 'audiocodec',
+			language: 'en',
+			channels: 2,
+			maxBitrate: 50000,
+			avgBitrate: 30000,
+		}));
+		m.addPlaylist(createAudioPlaylist({
+			fileName: 'a-fr.m3u8',
+			name: 'a-fr',
+			groupId: 'audio-a',
+			codec: 'audiocodec',
+			language: 'fr',
+			channels: 2,
+			maxBitrate: 50000,
+			avgBitrate: 30000,
+		}));
+
+		const out = m.build({ baseUrl: '' });
+		const aEn = out.indexOf('a-en.m3u8');
+		const bEn = out.indexOf('b-en.m3u8');
+		const aFr = out.indexOf('a-fr.m3u8');
+		expect(aEn).toBeGreaterThan(-1);
+		expect(bEn).toBeGreaterThan(-1);
+		expect(aFr).toBeGreaterThan(-1);
+		expect(aEn).toBeLessThan(bEn);
+		expect(bEn).toBeLessThan(aFr);
+	});
+});
+
+describe('MasterPlaylist — characteristics + forced subtitle', () => {
+	test('CHARACTERISTICS attribute rendered on subtitle media tag', () => {
+		const m = new MasterPlaylist(masterOpts());
+		m.addPlaylist(createVideoPlaylist({
+			fileName: 'v.m3u8',
+			codec: 'sdvideocodec',
+			maxBitrate: 300000,
+			avgBitrate: 100000,
+		}));
+		m.addPlaylist(createTextPlaylist({
+			fileName: 't.m3u8',
+			name: 't',
+			groupId: 'text-group',
+			codec: 'wvtt',
+			language: 'en',
+			characteristics: ['public.accessibility.transcribes-spoken-dialog'],
+		}));
+
+		expect(m.build({ baseUrl: '' })).toMatch(
+			/CHARACTERISTICS="public\.accessibility\.transcribes-spoken-dialog"/,
+		);
+	});
+
+	test('forced subtitle gets FORCED=YES', () => {
+		const m = new MasterPlaylist(masterOpts());
+		m.addPlaylist(createVideoPlaylist({
+			fileName: 'v.m3u8',
+			codec: 'sdvideocodec',
+			maxBitrate: 300000,
+			avgBitrate: 100000,
+		}));
+		m.addPlaylist(createTextPlaylist({
+			fileName: 'forced.m3u8',
+			name: 'forced',
+			groupId: 'text-group',
+			codec: 'wvtt',
+			language: 'en',
+			forcedSubtitle: true,
+		}));
+
+		expect(m.build({ baseUrl: '' })).toMatch(/FORCED=YES/);
+	});
+});
+
+// Not yet ported (low priority — codec quirks our writer doesn't surface):
+//   - WriteMasterPlaylistAudioOnlyJOC (Dolby EC-3 JOC complexity)
+//   - WriteMasterPlaylistAudioOnlyAC4IMS (Dolby AC-4 IMS flag)
+//   - WriteMasterPlaylistAudioOnlyAC4CBI (Dolby AC-4 CBI flag)
+//   - WriteMasterPlaylistVideoAndDvsAudio (DVS = Descriptive Video Service)
+//   - WriteMasterPlaylistWithClosedCaptions (closed captions feature)

@@ -8,6 +8,7 @@
 /*!
  * Ported from Shaka Packager, Copyright 2016 Google LLC. All rights reserved.
  * Original source: https://github.com/shaka-project/shaka-packager/blob/main/packager/hls/base/master_playlist.cc
+ * Last synced with shaka commit: b1580dd (2026-05-06, fix(hls): emit EXT-X-MEDIA tags in command-line order).
  * Licensed under the BSD-3-Clause License. See LICENSE.shaka-packager in the repo root.
  * This file is dual-licensed under BSD-3-Clause (original) and MPL-2.0 (mediabunny).
  */
@@ -317,25 +318,46 @@ export class MasterPlaylist {
 			}
 		}
 
-		const audioGroups = new Map<string, MediaPlaylist[]>();
-		const subtitleGroups = new Map<string, MediaPlaylist[]>();
+		// Emit #EXT-X-MEDIA in input order (shaka b1580dd); rebuild group map
+		// after for buildVariants.
+		type MediaTagInfo = {
+			playlist: MediaPlaylist;
+			groupId: string;
+			isDefault: boolean;
+		};
+		const audioTags: MediaTagInfo[] = [];
+		const subtitleTags: MediaTagInfo[] = [];
 		const videoPlaylists: MediaPlaylist[] = [];
 		const iframePlaylists: MediaPlaylist[] = [];
+		const audioGroupCounts = new Map<string, number>();
+		const subtitleGroupCounts = new Map<string, number>();
 
 		for (const p of this.playlists) {
 			switch (p.getStreamType()) {
 				case 'audio': {
 					const id = groupId(p);
-					const list = audioGroups.get(id) ?? [];
-					list.push(p);
-					audioGroups.set(id, list);
+					const idx = audioGroupCounts.get(id) ?? 0;
+					audioGroupCounts.set(id, idx + 1);
+					const isLanguageDefault = !!this.opts.defaultAudioLanguage
+						&& p.getLanguage() === this.opts.defaultAudioLanguage;
+					const isFirstInGroup = idx === 0;
+					const isDefault = this.opts.defaultAudioLanguage
+						? isLanguageDefault
+						: isFirstInGroup;
+					audioTags.push({ playlist: p, groupId: id, isDefault });
 					break;
 				}
 				case 'subtitle': {
 					const id = groupId(p);
-					const list = subtitleGroups.get(id) ?? [];
-					list.push(p);
-					subtitleGroups.set(id, list);
+					const idx = subtitleGroupCounts.get(id) ?? 0;
+					subtitleGroupCounts.set(id, idx + 1);
+					const isLanguageDefault = !!this.opts.defaultSubtitleLanguage
+						&& p.getLanguage() === this.opts.defaultSubtitleLanguage;
+					const isFirstInGroup = idx === 0;
+					const isDefault = this.opts.defaultSubtitleLanguage
+						? isLanguageDefault
+						: isFirstInGroup;
+					subtitleTags.push({ playlist: p, groupId: id, isDefault });
 					break;
 				}
 				case 'video':
@@ -347,38 +369,31 @@ export class MasterPlaylist {
 			}
 		}
 
-		// Audio media tags
-		if (audioGroups.size > 0) {
+		if (audioTags.length > 0) {
 			lines.push('');
-			for (const [id, group] of audioGroups) {
-				for (let i = 0; i < group.length; i++) {
-					const p = group[i]!;
-					const isLanguageDefault = !!this.opts.defaultAudioLanguage
-						&& p.getLanguage() === this.opts.defaultAudioLanguage;
-					const isFirst = i === 0;
-					const isDefault = this.opts.defaultAudioLanguage
-						? isLanguageDefault
-						: isFirst;
-					lines.push(buildMediaTag(p, id, isDefault, true, baseUrl));
-				}
+			for (const t of audioTags) {
+				lines.push(buildMediaTag(t.playlist, t.groupId, t.isDefault, true, baseUrl));
 			}
 		}
 
-		// Subtitle media tags
-		if (subtitleGroups.size > 0) {
+		if (subtitleTags.length > 0) {
 			lines.push('');
-			for (const [id, group] of subtitleGroups) {
-				for (let i = 0; i < group.length; i++) {
-					const p = group[i]!;
-					const isLanguageDefault = !!this.opts.defaultSubtitleLanguage
-						&& p.getLanguage() === this.opts.defaultSubtitleLanguage;
-					const isFirst = i === 0;
-					const isDefault = this.opts.defaultSubtitleLanguage
-						? isLanguageDefault
-						: isFirst;
-					lines.push(buildMediaTag(p, id, isDefault, true, baseUrl));
-				}
+			for (const t of subtitleTags) {
+				lines.push(buildMediaTag(t.playlist, t.groupId, t.isDefault, true, baseUrl));
 			}
+		}
+
+		const audioGroups = new Map<string, MediaPlaylist[]>();
+		for (const t of audioTags) {
+			const list = audioGroups.get(t.groupId) ?? [];
+			list.push(t.playlist);
+			audioGroups.set(t.groupId, list);
+		}
+		const subtitleGroups = new Map<string, MediaPlaylist[]>();
+		for (const t of subtitleTags) {
+			const list = subtitleGroups.get(t.groupId) ?? [];
+			list.push(t.playlist);
+			subtitleGroups.set(t.groupId, list);
 		}
 
 		// Variant streams

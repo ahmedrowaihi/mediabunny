@@ -148,7 +148,11 @@ class MpdParseError extends Error {
 	}
 }
 
-/** Parse an MPD XML string into a typed AST. Throws on malformed XML or missing required attributes. @group DASH @public */
+/**
+ * Parse an MPD XML string into a typed AST. Throws on malformed XML or missing
+ * required attributes.
+ * @group DASH @public
+ */
 export const parseMpd = (xml: string): Mpd => {
 	if (typeof DOMParser === 'undefined') {
 		throw new MpdParseError('DOMParser is not available in this environment');

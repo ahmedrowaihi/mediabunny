@@ -143,6 +143,21 @@ export const parseFrameRate = (value: string | null | undefined): DashRational |
 	return { numerator, denominator: 1 };
 };
 
+/** Return the byte offset at which a pssh box's CONTENTS begin within `raw`,
+ *  or 0 if `raw` looks like contents-only (no `pssh` box header). Some MPDs
+ *  put the full ISO/IEC 23001-7 pssh box bytes in `<cenc:pssh>`; others put
+ *  just the contents (everything after the 8-byte header). We sniff for the
+ *  `'pssh'` 4CC at bytes 4-8 to tell them apart. */
+export const psshContentsOffset = (raw: Uint8Array): number => {
+	if (
+		raw.length >= 8
+		&& raw[4] === 0x70 && raw[5] === 0x73 && raw[6] === 0x73 && raw[7] === 0x68
+	) {
+		return 8;
+	}
+	return 0;
+};
+
 /** Normalise a key id to 32 lowercase hex digits (no dashes). MPDs sometimes
  *  use UUID form `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`. */
 export const normaliseKeyId = (value: string | null | undefined): string | null => {

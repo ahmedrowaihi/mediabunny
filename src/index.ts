@@ -314,6 +314,27 @@ export {
 	type TrackDisposition,
 } from './metadata';
 
+// HLS playlist primitives (shared by demuxer and external consumers).
+export {
+	HLS_MIME_TYPE,
+	TAG_STREAM_INF,
+	TAG_I_FRAME_STREAM_INF,
+	TAG_MEDIA,
+	TAG_EXTINF,
+	TAG_MAP,
+	TAG_KEY,
+	TAG_MEDIA_SEQUENCE,
+	TAG_BYTERANGE,
+	TAG_PROGRAM_DATE_TIME,
+	TAG_DISCONTINUITY,
+	TAG_TARGETDURATION,
+	TAG_ENDLIST,
+	TAG_PLAYLIST_TYPE,
+	TAG_I_FRAMES_ONLY,
+	AttributeList,
+	canIgnoreLine,
+} from './hls/hls-misc';
+
 // HLS playlist generators (ported from shaka-packager).
 export {
 	Tag,
@@ -349,6 +370,34 @@ export {
 export {
 	MasterPlaylist,
 } from './hls/hls-master-playlist';
+
+// DASH MPD parser + spec primitives (shared by demuxer and external consumers).
+export {
+	DASH_MIME_TYPE,
+	parseISODuration,
+	parseISODateTime,
+	parseByteRange,
+	parseFrameRate,
+	resolveURL,
+	resolveBaseURL,
+	substituteTemplate,
+	normaliseKeyId,
+	psshContentsOffset,
+	type DashRational,
+} from './dash/dash-misc';
+export {
+	parseMpd,
+	type Mpd,
+	type MpdPeriod,
+	type MpdAdaptationSet,
+	type MpdRepresentation,
+	type SegmentTemplate,
+	type SegmentTimelineEntry,
+	type SegmentList,
+	type SegmentBase,
+	type ByteRange as DashByteRange,
+	type ContentProtection,
+} from './dash/dash-mpd-parser';
 
 // DASH MPD generators (ported from shaka-packager).
 export {

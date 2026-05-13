@@ -27,18 +27,36 @@ import {
 
 /** A `#EXT-X-STREAM-INF` entry plus its URI line. @group HLS @public */
 export type HlsVariant = {
+	/** Rendition playlist URI (next line after the `#EXT-X-STREAM-INF` tag). */
 	uri: string;
+	/** `BANDWIDTH` peak bitrate in bits/second. */
 	bandwidth: number;
+	/** `AVERAGE-BANDWIDTH` average bitrate. */
 	averageBandwidth: number | null;
+	/** `CODECS` attribute string. */
 	codecs: string | null;
-	resolution: { width: number; height: number } | null;
+	/** Parsed `RESOLUTION` (e.g. `1920x1080`). */
+	resolution: {
+		/** Width in pixels. */
+		width: number;
+		/** Height in pixels. */
+		height: number;
+	} | null;
+	/** `FRAME-RATE` in fps. */
 	frameRate: number | null;
+	/** `HDCP-LEVEL`. */
 	hdcpLevel: string | null;
+	/** `AUDIO` group ID reference. */
 	audioGroup: string | null;
+	/** `VIDEO` group ID reference. */
 	videoGroup: string | null;
+	/** `SUBTITLES` group ID reference. */
 	subtitlesGroup: string | null;
+	/** `CLOSED-CAPTIONS` group ID reference. */
 	closedCaptionsGroup: string | null;
+	/** `NAME` attribute. */
 	name: string | null;
+	/** `CHANNELS` attribute (e.g. `"2"`, `"6/JOC"`). */
 	channels: string | null;
 	/** 0-based line index in the source playlist where the `#EXT-X-STREAM-INF` tag appears. */
 	lineNumber: number;
@@ -46,11 +64,22 @@ export type HlsVariant = {
 
 /** A `#EXT-X-I-FRAME-STREAM-INF` entry. @group HLS @public */
 export type HlsIFrameStream = {
+	/** I-frame playlist URI (from the `URI` attribute). */
 	uri: string;
+	/** `BANDWIDTH` peak bitrate. */
 	bandwidth: number;
+	/** `AVERAGE-BANDWIDTH`. */
 	averageBandwidth: number | null;
+	/** `CODECS`. */
 	codecs: string | null;
-	resolution: { width: number; height: number } | null;
+	/** Parsed `RESOLUTION`. */
+	resolution: {
+		/** Width in pixels. */
+		width: number;
+		/** Height in pixels. */
+		height: number;
+	} | null;
+	/** `VIDEO` group ID reference. */
 	videoGroup: string | null;
 	/** 0-based line index in the source playlist where the tag appears. */
 	lineNumber: number;
@@ -58,69 +87,126 @@ export type HlsIFrameStream = {
 
 /** A `#EXT-X-MEDIA` entry. @group HLS @public */
 export type HlsMediaRendition = {
+	/** `TYPE` enumerated value. */
 	type: 'AUDIO' | 'VIDEO' | 'SUBTITLES' | 'CLOSED-CAPTIONS';
+	/** `GROUP-ID`. */
 	groupId: string;
+	/** `NAME`. */
 	name: string;
+	/** `LANGUAGE` BCP 47 code. */
 	language: string | null;
+	/** `ASSOC-LANGUAGE`. */
 	assocLanguage: string | null;
+	/** `URI` to the rendition playlist (absent for CLOSED-CAPTIONS). */
 	uri: string | null;
+	/** `DEFAULT` flag (YES → true). */
 	default: boolean;
+	/** `AUTOSELECT` flag. */
 	autoselect: boolean;
+	/** `FORCED` flag (subtitles only). */
 	forced: boolean;
+	/** `CHANNELS` attribute. */
 	channels: string | null;
+	/** `CHARACTERISTICS` attribute. */
 	characteristics: string | null;
-	resolution: { width: number; height: number } | null;
+	/** Parsed `RESOLUTION` (rare; spec extension). */
+	resolution: {
+		/** Width in pixels. */
+		width: number;
+		/** Height in pixels. */
+		height: number;
+	} | null;
 	/** 0-based line index in the source playlist where the tag appears. */
 	lineNumber: number;
 };
 
 /** Parsed HLS master playlist (multivariant). @group HLS @public */
 export type HlsMasterPlaylist = {
+	/** Discriminator literal for the master variant of {@link HlsPlaylist}. */
 	kind: 'master';
+	/** `#EXT-X-VERSION` value, or `null` when absent. */
 	version: number | null;
+	/** `#EXT-X-INDEPENDENT-SEGMENTS` presence flag. */
 	independentSegments: boolean;
+	/** `#EXT-X-STREAM-INF` entries in document order. */
 	variants: HlsVariant[];
+	/** `#EXT-X-I-FRAME-STREAM-INF` entries in document order. */
 	iFrameStreams: HlsIFrameStream[];
+	/** `#EXT-X-MEDIA` entries in document order. */
 	media: HlsMediaRendition[];
 };
 
 /** A `#EXT-X-MAP` entry. @group HLS @public */
 export type HlsMap = {
+	/** Init-segment URI. */
 	uri: string;
-	byteRange: { length: number; offset: number | null } | null;
+	/** Optional `BYTERANGE`. */
+	byteRange: {
+		/** Range length in bytes. */
+		length: number;
+		/** Range start offset; `null` continues from previous. */
+		offset: number | null;
+	} | null;
 };
 
 /** A `#EXT-X-KEY` entry. @group HLS @public */
 export type HlsKey = {
+	/** `METHOD` (e.g. `NONE`, `AES-128`, `SAMPLE-AES`, `SAMPLE-AES-CTR`). */
 	method: string;
+	/** Key resource `URI`. */
 	uri: string | null;
+	/** `IV` as a `0x`-prefixed hex string. */
 	iv: string | null;
+	/** `KEYFORMAT` (defaults to `identity`). */
 	keyFormat: string;
+	/** `KEYFORMATVERSIONS` parsed as integers. */
 	keyFormatVersions: number[];
 };
 
 /** A segment in a media playlist. @group HLS @public */
 export type HlsSegment = {
+	/** Segment URI. */
 	uri: string;
+	/** `#EXTINF` duration in seconds. */
 	duration: number;
+	/** Optional `#EXTINF` title. */
 	title: string | null;
-	byteRange: { length: number; offset: number | null } | null;
+	/** Optional `#EXT-X-BYTERANGE`. */
+	byteRange: {
+		/** Range length in bytes. */
+		length: number;
+		/** Range start offset; `null` continues from previous. */
+		offset: number | null;
+	} | null;
+	/** `#EXT-X-PROGRAM-DATE-TIME` as Unix milliseconds when set. */
 	programDateTime: number | null;
+	/** Currently-active `#EXT-X-MAP` (init segment). */
 	map: HlsMap | null;
+	/** Currently-active `#EXT-X-KEY` (encryption descriptor). */
 	key: HlsKey | null;
+	/** True if a `#EXT-X-DISCONTINUITY` tag precedes this segment. */
 	discontinuityBefore: boolean;
 };
 
 /** Parsed HLS media playlist. @group HLS @public */
 export type HlsMediaPlaylistAst = {
+	/** Discriminator literal for the media variant of {@link HlsPlaylist}. */
 	kind: 'media';
+	/** `#EXT-X-VERSION` value, or `null` when absent. */
 	version: number | null;
+	/** `#EXT-X-TARGETDURATION` in seconds, or `null` when absent. */
 	targetDuration: number | null;
+	/** `#EXT-X-MEDIA-SEQUENCE` start sequence number (defaults to 0). */
 	mediaSequence: number;
+	/** `#EXT-X-PLAYLIST-TYPE` enum (VOD / EVENT), or `null`. */
 	playlistType: 'VOD' | 'EVENT' | null;
+	/** `#EXT-X-I-FRAMES-ONLY` presence flag. */
 	iFramesOnly: boolean;
+	/** `#EXT-X-ENDLIST` presence flag (VOD-complete signal). */
 	endlist: boolean;
+	/** `#EXT-X-INDEPENDENT-SEGMENTS` presence flag. */
 	independentSegments: boolean;
+	/** Segments in document order. */
 	segments: HlsSegment[];
 };
 

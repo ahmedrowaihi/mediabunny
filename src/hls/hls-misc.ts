@@ -43,6 +43,7 @@ export const canIgnoreLine = (line: string) => line.length === 0 || (line.starts
 
 /** Parses an HLS attribute list (`KEY=VALUE,KEY2="quoted"`) into a case-insensitive map. @group HLS @public */
 export class AttributeList {
+	/** Lowercased attribute map. @internal */
 	_attributes: Record<string, string> = {};
 
 	constructor(str: string) {
@@ -78,10 +79,12 @@ export class AttributeList {
 		}
 	}
 
+	/** Get the attribute value (case-insensitive name), or `null` if absent. */
 	get(name: string) {
 		return this._attributes[name.toLowerCase()] ?? null;
 	}
 
+	/** Get the attribute value as a finite number, or `null` if absent or non-numeric. */
 	getAsNumber(name: string) {
 		const value = this.get(name);
 		if (value === null) {
@@ -92,6 +95,7 @@ export class AttributeList {
 		return Number.isFinite(num) ? num : null;
 	}
 
+	/** Merge another attribute list into this one, overwriting on key collision. */
 	merge(other: AttributeList) {
 		Object.assign(this._attributes, other._attributes);
 	}

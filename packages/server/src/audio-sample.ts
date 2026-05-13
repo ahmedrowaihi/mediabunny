@@ -49,6 +49,7 @@ export class AvFrameAudioSampleResource extends AudioSampleResource {
 		this._frame = frame;
 	}
 
+	/** WebCodecs sample format mapped from the underlying AvFrame. */
 	getFormat(): AudioSampleFormat {
 		const result = toAudioSampleFormat(this.frame.format as NodeAv.AVSampleFormat);
 		if (result === null) {
@@ -59,27 +60,33 @@ export class AvFrameAudioSampleResource extends AudioSampleResource {
 		return result;
 	}
 
+	/** Sample rate in Hz. */
 	getSampleRate(): number {
 		return this.frame.sampleRate;
 	}
 
+	/** Number of audio channels. */
 	getNumberOfChannels(): number {
 		return this.frame.channels;
 	}
 
+	/** Number of audio frames (samples per channel) in this resource. */
 	getNumberOfFrames(): number {
 		return this.frame.nbSamples;
 	}
 
+	/** Presentation timestamp in seconds. */
 	getTimestamp(): number {
 		return Number(this.frame.pts) / this.frame.timeBase.den;
 	}
 
+	/** Release the underlying AvFrame; after this call the resource is unusable. */
 	close(): void {
 		this.frame.free();
 		this._frame = null;
 	}
 
+	/** Return the raw bytes for the given plane (planar layouts have one plane per channel). */
 	getDataPlane(planeIndex: number): Uint8Array {
 		assert(this.frame.data && planeIndex < this.frame.data.length);
 		return toUint8Array(this.frame.data[planeIndex]!);

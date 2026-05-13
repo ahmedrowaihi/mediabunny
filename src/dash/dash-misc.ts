@@ -6,6 +6,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
+/** MIME type for DASH MPD manifests. @group DASH @public */
 export const DASH_MIME_TYPE = 'application/dash+xml';
 
 export const DASH_NS = {
@@ -20,6 +21,7 @@ export const looksLikeMpd = (firstBytes: Uint8Array): boolean => {
 	return head.includes('<MPD');
 };
 
+/** Resolve `relative` against `base` per WHATWG URL, with a string-join fallback. @group DASH @public */
 export const resolveURL = (relative: string, base: string): string => {
 	try {
 		return new URL(relative, base).toString();
@@ -36,6 +38,7 @@ export const resolveURL = (relative: string, base: string): string => {
 	}
 };
 
+/** Walk a chain of BaseURL element lists and resolve them in order against `manifestURL`. @group DASH @public */
 export const resolveBaseURL = (manifestURL: string, ...chains: (string[] | undefined)[]): string => {
 	let base = manifestURL;
 	for (const chain of chains) {
@@ -48,6 +51,7 @@ export const resolveBaseURL = (manifestURL: string, ...chains: (string[] | undef
 	return base;
 };
 
+/** Parse an ISO 8601 duration (e.g. `PT1H2M3.5S`) to seconds, or `null` if malformed. @group DASH @public */
 export const parseISODuration = (value: string | null | undefined): number | null => {
 	if (!value) {
 		return null;
@@ -70,6 +74,7 @@ export const parseISODuration = (value: string | null | undefined): number | nul
 	return sign === '-' ? -total : total;
 };
 
+/** Parse an ISO 8601 instant to Unix milliseconds, or `null` if malformed. @group DASH @public */
 export const parseISODateTime = (value: string | null | undefined): number | null => {
 	if (!value) {
 		return null;
@@ -78,6 +83,7 @@ export const parseISODateTime = (value: string | null | undefined): number | nul
 	return Number.isFinite(time) ? time : null;
 };
 
+/** Parse an RFC 7233 single-range string (`"start-end"`). @group DASH @public */
 export const parseByteRange = (value: string | null | undefined): { start: number; end: number } | null => {
 	if (!value) {
 		return null;
@@ -94,8 +100,10 @@ export const parseByteRange = (value: string | null | undefined): { start: numbe
 	return { start, end };
 };
 
+/** Numerator/denominator pair used for DASH frame rates. @group DASH @public */
 export type DashRational = { numerator: number; denominator: number };
 
+/** Parse a DASH frame-rate string (`"30"`, `"30000/1001"`, `"1/2"`). @group DASH @public */
 export const parseFrameRate = (value: string | null | undefined): DashRational | null => {
 	if (!value) {
 		return null;
@@ -117,8 +125,10 @@ export const parseFrameRate = (value: string | null | undefined): DashRational |
 	return { numerator, denominator: 1 };
 };
 
-// Some MPDs embed the full pssh box; others embed only the contents.
-// Sniff the 'pssh' 4CC at bytes 4-8 to tell them apart.
+/**
+ * Returns `8` when `raw` begins with a `pssh` box header (4-byte size + `'pssh'` 4CC),
+ * else `0` — i.e. the byte offset at which the pssh box contents begin. @group DASH @public
+ */
 export const psshContentsOffset = (raw: Uint8Array): number => {
 	if (
 		raw.length >= 8
@@ -129,6 +139,7 @@ export const psshContentsOffset = (raw: Uint8Array): number => {
 	return 0;
 };
 
+/** Normalise a key id to 32 lowercase hex digits, accepting UUID dashes. @group DASH @public */
 export const normaliseKeyId = (value: string | null | undefined): string | null => {
 	if (!value) {
 		return null;
@@ -140,6 +151,11 @@ export const normaliseKeyId = (value: string | null | undefined): string | null 
 	return stripped;
 };
 
+/**
+ * Apply SegmentTemplate `$Variable$` substitution. Supports `$Number$`, `$Time$`,
+ * `$RepresentationID$`, `$Bandwidth$`, and the printf-like `%0Nd` width modifier.
+ * @group DASH @public
+ */
 export const substituteTemplate = (
 	template: string,
 	values: { number?: number; time?: number; representationId?: string; bandwidth?: number },

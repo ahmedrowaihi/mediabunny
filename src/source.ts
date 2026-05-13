@@ -86,6 +86,14 @@ export abstract class Source extends EventEmitter<SourceEvents> {
 	 */
 	_usedForHls = false;
 
+	/**
+	 * Marked `true` by `DashInputFormat._canReadInput` when this source is
+	 * the root of a DASH manifest; sub-source disposal hygiene uses the same
+	 * mechanism as HLS.
+	 * @internal
+	 */
+	_usedForDash = false;
+
 	/** @internal */
 	private _sizePromise: Promise<number | null> | null = null;
 
@@ -280,6 +288,7 @@ export abstract class PathedSource extends Source {
 				: result;
 
 			ref.source._usedForHls ||= this._usedForHls;
+			ref.source._usedForDash ||= this._usedForDash;
 
 			return ref;
 		};

@@ -218,6 +218,67 @@ export class DashDemuxer extends Demuxer {
 		return id;
 	}
 
+	refreshMpdPromise: Promise<void> | null = null;
+
+	/**
+	 * Re-fetch the MPD (dynamic only), re-parse, and mutate each existing
+	 * DashSegmentedInput context in-place so subsequent `updateSegments()`
+	 * calls see the latest period/timeline state. If the refreshed MPD
+	 * transitions to `type='static'`, each segmented input's context flips
+	 * to `isDynamic=false`; the SegmentedInput then marks itself
+	 * `streamHasEnded`.
+	 */
+	refreshMpd(): Promise<void> {
+		if (this.refreshMpdPromise) {
+			return this.refreshMpdPromise;
+		}
+		this.refreshMpdPromise = (async () => {
+			try {
+				const slice = await this.input._reader.requestEntireFile();
+				assert(slice);
+				const decoder = new TextDecoder('utf-8');
+				const xml = decoder.decode(slice.bytes.subarray(slice.start, slice.end));
+				const mpd = parseMpd(xml);
+				const boundaries = computePeriodBoundaries(mpd.periods, mpd.mediaPresentationDuration);
+
+				for (const segInput of this.segmentedInputs) {
+					const periodId = segInput.context.period.id;
+					const asId = segInput.context.adaptationSet.id;
+					const repId = segInput.context.representation.id;
+
+					const matchBoundary = boundaries.find(b => b.period.id === periodId);
+					if (!matchBoundary) {
+						continue;
+					}
+					const matchAs = matchBoundary.period.adaptationSets.find(a => a.id === asId);
+					if (!matchAs) {
+						continue;
+					}
+					const matchRep = matchAs.representations.find(r => r.id === repId);
+					if (!matchRep) {
+						continue;
+					}
+
+					segInput.context.period = matchBoundary.period;
+					segInput.context.adaptationSet = matchAs;
+					segInput.context.representation = matchRep;
+					segInput.context.periodStart = matchBoundary.periodStart;
+					segInput.context.periodEnd = matchBoundary.periodEnd;
+					segInput.context.availabilityStartTime = mpd.availabilityStartTime;
+					segInput.context.isDynamic = mpd.type === 'dynamic';
+					segInput.context.minimumUpdatePeriod = mpd.minimumUpdatePeriod;
+					segInput.context.mediaPresentationDuration = mpd.mediaPresentationDuration;
+					segInput.refreshInterval = segInput.context.isDynamic
+						? Math.max(1, mpd.minimumUpdatePeriod ?? 5)
+						: Number.POSITIVE_INFINITY;
+				}
+			} finally {
+				this.refreshMpdPromise = null;
+			}
+		})();
+		return this.refreshMpdPromise;
+	}
+
 	async getTrackBackings(): Promise<InputTrackBacking[]> {
 		await this.readMetadata();
 		assert(this.internalTracks);

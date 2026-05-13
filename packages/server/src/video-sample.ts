@@ -80,18 +80,22 @@ export class AvFrameVideoSampleResource extends VideoSampleResource {
 		this._frame = frame;
 	}
 
+	/** WebCodecs pixel format mapped from the underlying AvFrame, or `null` if unsupported. */
 	getFormat(): VideoSamplePixelFormat | null {
 		return toPixelFormat(this.frame.format as NodeAv.AVPixelFormat);
 	}
 
+	/** Coded frame width in pixels (may differ from display width when SAR ≠ 1). */
 	getCodedWidth(): number {
 		return this.frame.width;
 	}
 
+	/** Coded frame height in pixels (may differ from display height when SAR ≠ 1). */
 	getCodedHeight(): number {
 		return this.frame.height;
 	}
 
+	/** Display width after applying the sample aspect ratio. */
 	getSquarePixelWidth(): number {
 		if (this.frame.sampleAspectRatio.num > this.frame.sampleAspectRatio.den) {
 			return Math.round(this.frame.width * this.frame.sampleAspectRatio.num / this.frame.sampleAspectRatio.den);
@@ -100,6 +104,7 @@ export class AvFrameVideoSampleResource extends VideoSampleResource {
 		}
 	}
 
+	/** Display height after applying the sample aspect ratio. */
 	getSquarePixelHeight(): number {
 		if (this.frame.sampleAspectRatio.num > this.frame.sampleAspectRatio.den) {
 			return this.frame.height;
@@ -108,6 +113,7 @@ export class AvFrameVideoSampleResource extends VideoSampleResource {
 		}
 	}
 
+	/** Color space (primaries / transfer / matrix / full-range) of the underlying frame. */
 	getColorSpace(): VideoSampleColorSpace {
 		return new VideoSampleColorSpace({
 			primaries: unmapColorPrimaries(this.frame.colorPrimaries) as VideoColorPrimaries | null,
@@ -122,11 +128,13 @@ export class AvFrameVideoSampleResource extends VideoSampleResource {
 		});
 	}
 
+	/** Release the underlying AvFrame; after this call the resource is unusable. */
 	close(): void {
 		this.frame.free();
 		this._frame = null;
 	}
 
+	/** Return one entry per plane (`data` + per-line `stride` in bytes). */
 	getDataPlanes(): MaybePromise<VideoDataPlane[]> {
 		assert(this.frame.data);
 
@@ -136,6 +144,7 @@ export class AvFrameVideoSampleResource extends VideoSampleResource {
 		}));
 	}
 
+	/** Convert the frame to a packed RGBA `VideoSample`. The `colorSpace` argument is currently unused. */
 	async toRgbSample(
 		init: SetRequired<VideoSampleInit, 'timestamp'>,
 		// Will respect it when somebody complains

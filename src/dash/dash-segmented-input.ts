@@ -196,6 +196,12 @@ export class DashSegmentedInput extends SegmentedInput {
 					await wait(remainingWaitTimeMs);
 				}
 				this.lastSegmentUpdateTime = performance.now();
+				if (this.context.isDynamic) {
+					await this.demuxer.refreshMpd();
+					if (!this.context.isDynamic) {
+						this.streamHasEnded = true;
+					}
+				}
 				this.updateSegments();
 			} finally {
 				this.currentUpdateSegmentsPromise = null;

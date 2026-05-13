@@ -287,10 +287,11 @@ test('parseFrameRate: rational + integer + decimal forms', () => {
 });
 
 test('normaliseKeyId: UUID and stripped forms produce identical output', () => {
-	expect(normaliseKeyId('12345678-1234-1234-1234-1234567890AB')).toBe('12345678123412341234567890ab');
-	expect(normaliseKeyId('12345678123412341234567890AB')).toBe('12345678123412341234567890ab');
+	expect(normaliseKeyId('12345678-1234-1234-1234-1234567890ab')).toBe('123456781234123412341234567890ab');
+	expect(normaliseKeyId('123456781234123412341234567890AB')).toBe('123456781234123412341234567890ab');
 	expect(normaliseKeyId('not-hex')).toBeNull();
 	expect(normaliseKeyId('')).toBeNull();
+	expect(normaliseKeyId('1234')).toBeNull();
 });
 
 test('parseByteRange: standard "start-end"', () => {

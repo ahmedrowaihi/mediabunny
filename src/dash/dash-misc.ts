@@ -160,9 +160,12 @@ export const substituteTemplate = (
 	template: string,
 	values: { number?: number; time?: number; representationId?: string; bandwidth?: number },
 ): string => {
-	return template.replace(/\$(\$|[A-Za-z]+(?:%0?\d+d)?)\$/g, (match, token: string) => {
-		if (token === '$') {
+	return template.replace(/\$\$|\$([A-Za-z]+(?:%0?\d+d)?)\$/g, (match, token: string | undefined) => {
+		if (match === '$$') {
 			return '$';
+		}
+		if (token === undefined) {
+			return match;
 		}
 		const pctIdx = token.indexOf('%');
 		const name = pctIdx >= 0 ? token.slice(0, pctIdx) : token;

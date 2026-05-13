@@ -660,9 +660,17 @@ export class HlsInputFormat extends InputFormat {
 export class DashInputFormat extends InputFormat {
 	/** @internal */
 	async _canReadInput(input: Input) {
-		let slice = input._reader.requestSlice(0, 2048);
+		let slice = input._reader.requestSlice(0, 16);
 		if (slice instanceof Promise) slice = await slice;
 		if (!slice) return false;
+
+		const fileSize = input._reader.fileSizeNonStrict;
+		const probeEnd = fileSize !== null ? Math.min(2048, fileSize) : 2048;
+		if (slice.end < probeEnd) {
+			let bigger = input._reader.requestSlice(0, probeEnd);
+			if (bigger instanceof Promise) bigger = await bigger;
+			if (bigger) slice = bigger;
+		}
 
 		const head = slice.bytes.subarray(slice.start, slice.end);
 		if (!looksLikeMpd(head)) {

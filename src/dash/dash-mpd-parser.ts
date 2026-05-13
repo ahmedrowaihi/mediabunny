@@ -18,80 +18,159 @@ import {
 
 /** Typed AST for a parsed DASH MPD document (ISO/IEC 23009-1). @group DASH @public */
 export type Mpd = {
+	/** `@type` — `'static'` for VOD, `'dynamic'` for live. */
 	type: 'static' | 'dynamic';
+	/** Parsed `@profiles` URN list. */
 	profiles: string[];
+	/** `@mediaPresentationDuration` in seconds, or `null` when absent (e.g. live). */
 	mediaPresentationDuration: number | null;
+	/** `@minimumUpdatePeriod` in seconds (live only). */
 	minimumUpdatePeriod: number | null;
+	/** `@availabilityStartTime` as Unix milliseconds. */
 	availabilityStartTime: number | null;
+	/** `@publishTime` as Unix milliseconds. */
 	publishTime: number | null;
+	/** `@timeShiftBufferDepth` in seconds (live DVR window). */
 	timeShiftBufferDepth: number | null;
+	/** `@suggestedPresentationDelay` in seconds. */
 	suggestedPresentationDelay: number | null;
+	/** `@maxSegmentDuration` in seconds. */
 	maxSegmentDuration: number | null;
+	/** `@minBufferTime` in seconds. */
 	minBufferTime: number | null;
+	/** `<BaseURL>` text children. */
 	baseURLs: string[];
-	utcTiming: { schemeIdUri: string; value: string }[];
+	/** `<UTCTiming>` descriptors. */
+	utcTiming: {
+		/** UTCTiming `@schemeIdUri`. */
+		schemeIdUri: string;
+		/** UTCTiming `@value`. */
+		value: string;
+	}[];
+	/** `<Period>` children in document order. */
 	periods: MpdPeriod[];
 };
 
 /** A `<Period>` from a parsed MPD. @group DASH @public */
 export type MpdPeriod = {
+	/** Period `@id`. */
 	id: string | null;
+	/** Period `@start` in seconds. */
 	start: number | null;
+	/** Period `@duration` in seconds. */
 	duration: number | null;
+	/** `<BaseURL>` text children. */
 	baseURLs: string[];
+	/** `<AdaptationSet>` children in document order. */
 	adaptationSets: MpdAdaptationSet[];
 };
 
 /** A `<AdaptationSet>` from a parsed MPD. @group DASH @public */
 export type MpdAdaptationSet = {
+	/** AdaptationSet `@id`. */
 	id: string | null;
+	/** AdaptationSet `@group` (used for cross-set pairing). */
 	group: number | null;
+	/** Resolved content type (from `@contentType` or `@mimeType` prefix). */
 	contentType: 'video' | 'audio' | 'text' | 'image' | null;
+	/** AdaptationSet-level `@mimeType`. */
 	mimeType: string | null;
+	/** AdaptationSet-level `@codecs`. */
 	codecs: string | null;
+	/** `@lang` ISO 639 code. */
 	lang: string | null;
+	/** `@maxWidth` in pixels. */
 	maxWidth: number | null;
+	/** `@maxHeight` in pixels. */
 	maxHeight: number | null;
+	/** `@frameRate` as numerator/denominator pair. */
 	frameRate: DashRational | null;
-	roles: { schemeIdUri: string; value: string }[];
-	labels: { lang: string | null; value: string }[];
+	/** `<Role>` descriptors. */
+	roles: {
+		/** Role `@schemeIdUri`. */
+		schemeIdUri: string;
+		/** Role `@value`. */
+		value: string;
+	}[];
+	/** `<Label>` children with optional `@lang`. */
+	labels: {
+		/** Label `@lang`. */
+		lang: string | null;
+		/** Label text content. */
+		value: string;
+	}[];
+	/** `<BaseURL>` text children. */
 	baseURLs: string[];
+	/** `<ContentProtection>` children. */
 	contentProtections: ContentProtection[];
+	/** AdaptationSet-level `<SegmentTemplate>` (inherited by Representations). */
 	segmentTemplate: SegmentTemplate | null;
+	/** AdaptationSet-level `<SegmentList>`. */
 	segmentList: SegmentList | null;
+	/** `<Representation>` children in document order. */
 	representations: MpdRepresentation[];
 };
 
 /** A `<Representation>` from a parsed MPD. @group DASH @public */
 export type MpdRepresentation = {
+	/** Representation `@id` (required by spec). */
 	id: string;
+	/** `@bandwidth` in bits/second (required). */
 	bandwidth: number;
+	/** `@width` in pixels. */
 	width: number | null;
+	/** `@height` in pixels. */
 	height: number | null;
+	/** `@frameRate` as numerator/denominator pair. */
 	frameRate: DashRational | null;
+	/** Representation-level `@codecs` (overrides AdaptationSet). */
 	codecs: string | null;
+	/** Representation-level `@mimeType`. */
 	mimeType: string | null;
+	/** `@sar` sample aspect ratio. */
 	sar: string | null;
+	/** `@audioSamplingRate` in Hz. */
 	audioSamplingRate: number | null;
+	/** `@startWithSAP` SAP type. */
 	startWithSAP: number | null;
-	labels: { lang: string | null; value: string }[];
+	/** `<Label>` children. */
+	labels: {
+		/** Label `@lang`. */
+		lang: string | null;
+		/** Label text content. */
+		value: string;
+	}[];
+	/** `<BaseURL>` text children. */
 	baseURLs: string[];
+	/** `<ContentProtection>` children. */
 	contentProtections: ContentProtection[];
+	/** Representation-level `<SegmentTemplate>`. */
 	segmentTemplate: SegmentTemplate | null;
+	/** Representation-level `<SegmentList>`. */
 	segmentList: SegmentList | null;
+	/** Representation-level `<SegmentBase>` (single-file mode). */
 	segmentBase: SegmentBase | null;
 };
 
 /** A `<SegmentTemplate>` form of SegmentInformation. @group DASH @public */
 export type SegmentTemplate = {
+	/** `@media` template (supports `$Number$`, `$Time$`, `$RepresentationID$`, `$Bandwidth$`). */
 	media: string | null;
+	/** `@initialization` template. */
 	initialization: string | null;
+	/** `@bitstreamSwitching` template. */
 	bitstreamSwitching: string | null;
+	/** `@startNumber` (defaults to 1). */
 	startNumber: number;
+	/** `@timescale` (defaults to 1). */
 	timescale: number;
+	/** `@duration` in timescale units. */
 	duration: number | null;
+	/** `@presentationTimeOffset` in timescale units (defaults to 0). */
 	presentationTimeOffset: number;
+	/** `@availabilityTimeOffset` in seconds (defaults to 0). */
 	availabilityTimeOffset: number;
+	/** `<SegmentTimeline>` `<S>` entries when present. */
 	timeline: SegmentTimelineEntry[] | null;
 };
 
@@ -101,43 +180,80 @@ export type SegmentTemplate = {
  * @group DASH @public
  */
 export type SegmentTimelineEntry = {
+	/** `@t` start time in timescale units (inherits from previous when null). */
 	t: number | null;
+	/** `@d` duration in timescale units. */
 	d: number;
+	/** `@r` repeat count. */
 	r: number;
 };
 
 /** A `<SegmentList>` form of SegmentInformation. @group DASH @public */
 export type SegmentList = {
+	/** `@timescale` (defaults to 1). */
 	timescale: number;
+	/** `@duration` in timescale units. */
 	duration: number | null;
+	/** `@startNumber` (defaults to 1). */
 	startNumber: number;
+	/** `@presentationTimeOffset` in timescale units (defaults to 0). */
 	presentationTimeOffset: number;
-	initialization: { sourceURL: string | null; range: ByteRange | null } | null;
+	/** `<Initialization>` child. */
+	initialization: {
+		/** Initialization `@sourceURL`. */
+		sourceURL: string | null;
+		/** Initialization `@range`. */
+		range: ByteRange | null;
+	} | null;
+	/** `<SegmentTimeline>` `<S>` entries when present. */
 	timeline: SegmentTimelineEntry[] | null;
+	/** `<SegmentURL>` children. */
 	segments: {
+		/** `@media` URI. */
 		media: string;
+		/** `@mediaRange`. */
 		mediaRange: ByteRange | null;
+		/** `@index` URI (if separate). */
 		index: string | null;
+		/** `@indexRange`. */
 		indexRange: ByteRange | null;
 	}[];
 };
 
 /** A `<SegmentBase>` form of SegmentInformation. @group DASH @public */
 export type SegmentBase = {
+	/** `@timescale` (defaults to 1). */
 	timescale: number;
+	/** `@presentationTimeOffset` in timescale units (defaults to 0). */
 	presentationTimeOffset: number;
+	/** `@indexRange` (sidx box location). */
 	indexRange: ByteRange | null;
-	initialization: { sourceURL: string | null; range: ByteRange | null } | null;
+	/** `<Initialization>` child. */
+	initialization: {
+		/** Initialization `@sourceURL`. */
+		sourceURL: string | null;
+		/** Initialization `@range`. */
+		range: ByteRange | null;
+	} | null;
 };
 
 /** Inclusive byte range parsed from a DASH `@range` attribute. @group DASH @public */
-export type ByteRange = { start: number; end: number };
+export type ByteRange = {
+	/** Inclusive start byte offset. */
+	start: number;
+	/** Inclusive end byte offset. */
+	end: number;
+};
 
 /** A `<ContentProtection>` element with normalised CENC key id and pssh boxes. @group DASH @public */
 export type ContentProtection = {
+	/** `@schemeIdUri` identifying the protection system. */
 	schemeIdUri: string;
+	/** `@value`. */
 	value: string | null;
+	/** Normalised CENC default key id (32 lowercase hex chars), or `null`. */
 	keyId: string | null;
+	/** `<cenc:pssh>` boxes (may be content-only or full wire form). */
 	psshBoxes: Uint8Array[];
 };
 

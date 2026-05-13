@@ -24,30 +24,20 @@ import {
 	type SegmentTimelineEntry,
 } from './dash-mpd-parser';
 
-/** Per-segment byte location. `length === null` means "open-ended; read until EOF". */
 export type DashSegmentLocation = {
 	path: string;
 	offset: number;
 	length: number | null;
 };
 
-/** A materialised DASH segment. Mirrors HlsSegment in shape. */
 export type DashSegment = Segment & {
-	/** SegmentTemplate `$Number$` for this segment, or null when the
-	 *  representation is SegmentList-based (no number). Used for stable
-	 *  cross-refresh dedup on live MPDs. */
 	number: number | null;
-	/** Presentation time in `timescale` units at the moment of materialisation.
-	 *  Used for dedup and identity across refreshes. */
 	timeTicks: number;
 	location: DashSegmentLocation;
 	initSegment: DashSegment | null;
 	firstSegment: DashSegment | null;
 };
 
-/** Everything needed to materialise segments for one Representation. The
- *  demuxer assembles these and passes them in at construction time so this
- *  class never needs to touch the MPD AST again. */
 export type DashSegmentedInputContext = {
 	manifestURL: string;
 	period: MpdPeriod;
@@ -198,19 +188,12 @@ export class DashSegmentedInput extends SegmentedInput {
 		return result <= 50 ? 0 : result;
 	}
 
-	/** Whether we should shift segment timestamps to Unix-epoch seconds.
-	 *  Only dynamic MPDs are wall-clock anchored. A static MPD may carry
-	 *  `availabilityStartTime` for archival/scheduling reasons but its
-	 *  segments are still presentation-time-relative; shifting them to
-	 *  the wall clock would lie to consumers who expect VOD timelines. */
+	// A static MPD may carry availabilityStartTime for archival reasons but its segments are still
+	// presentation-time-relative; only dynamic MPDs anchor to the wall clock.
 	isWallClockTimeline(): boolean {
 		return this.context.isDynamic && this.context.availabilityStartTime !== null;
 	}
 
-	/** Live segment availability window. Returns `null` for static MPDs and
-	 *  when the timeShiftBufferDepth is unbounded. Segments whose end-of-presentation
-	 *  wall-clock time is older than `now - timeShiftBufferDepth` should not
-	 *  be materialised. */
 	getAvailabilityWindow(): { earliestPresentationTime: number; latestPresentationTime: number } | null {
 		if (!this.context.isDynamic || this.context.availabilityStartTime === null) {
 			return null;
@@ -244,9 +227,6 @@ export class DashSegmentedInput extends SegmentedInput {
 		})();
 	}
 
-	/** Materialise segments from the effective SegmentTemplate or SegmentList.
-	 *  Idempotent w.r.t. already-materialised segments: new segments are
-	 *  appended; existing ones are not duplicated. */
 	updateSegments(): void {
 		const template = this.getEffectiveSegmentTemplate();
 		if (template) {
@@ -258,8 +238,6 @@ export class DashSegmentedInput extends SegmentedInput {
 			this.materialiseFromList(list);
 			return;
 		}
-		// SegmentBase: single-file representation. The whole file is the segment;
-		// the underlying ISOBMFF demuxer handles seeking via sidx.
 		const base = this.context.representation.segmentBase;
 		if (base && this.segments.length === 0) {
 			this.segments.push({
@@ -305,16 +283,10 @@ export class DashSegmentedInput extends SegmentedInput {
 			if (!template.media) {
 				return;
 			}
-			// Dedup against the in-memory list by (number, timeTicks). We compare on
-			// unit-consistent fields rather than on URLs / byte offsets to avoid the
-			// confusion class of bugs caused by mixing ticks and bytes.
 			if (lastKnownEndTicks !== null && timeTicks < lastKnownEndTicks) {
 				return;
 			}
 
-			// Live availability: clamp out segments that have aged out of the DVR
-			// window. We use the segment's end-of-presentation time against the
-			// window's earliest edge so a segment partially still in-window is kept.
 			if (availabilityWindow !== null) {
 				const presentationEnd = (timeTicks - periodStartTicks + durationTicks) / timescale;
 				if (presentationEnd < availabilityWindow.earliestPresentationTime) {
@@ -367,9 +339,7 @@ export class DashSegmentedInput extends SegmentedInput {
 				if (entry.t !== null) {
 					currentTime = entry.t;
 				}
-				// Per ISO/IEC 23009-1: @r = -1 means "repeat until the next <S>@t (if
-				// any) or the period end, whichever comes first". A positive @r is the
-				// number of additional repeats. Zero means "no repeat" → 1 segment.
+				// ISO/IEC 23009-1: @r = -1 repeats until next <S>@t or period end, whichever first.
 				const nextEntry: SegmentTimelineEntry | undefined = timeline[entryIdx + 1];
 				const repeats = entry.r < 0
 					? remainingRepeatsTo(
@@ -526,9 +496,6 @@ export class DashSegmentedInput extends SegmentedInput {
 					continue;
 				}
 				const contents = parsePsshBoxContents(raw.subarray(headerOffset));
-				// When the MPD supplied only the contents (no header), reconstruct a
-				// minimal full-box `bytes` so `psshBoxesAreEqual` and any downstream
-				// consumer that re-emits the box has the canonical wire form.
 				const fullBytes = headerOffset === 8 ? raw : buildPsshBox(raw);
 				psshBoxes.push({ ...contents, bytes: fullBytes });
 			}
@@ -609,14 +576,9 @@ export class DashSegmentedInput extends SegmentedInput {
 	}
 }
 
-/** Compute the number of additional <S> repeats when @r is negative.
- *  Per ISO/IEC 23009-1 §5.3.9.6.1: repeats stop at the next <S>@t (when
- *  present) or the period end, whichever comes first. The returned value
- *  is "additional repeats" (so a result of 0 means "just one segment").
- *
- *  Mathematically: count = floor((boundary - currentTime) / entry.d) − 1
- *    because we already emit one segment for the current @t.
- *  The `entry.d` divisor is guarded against zero by parser invariants. */
+// ISO/IEC 23009-1 §5.3.9.6.1: when @r is negative, repeats stop at the next <S>@t (when present)
+// or the period end. Returns "additional repeats" (0 → one segment, since the current @t is
+// already emitted by the caller).
 const remainingRepeatsTo = (
 	entry: SegmentTimelineEntry,
 	currentTime: number,
@@ -644,10 +606,6 @@ const remainingRepeatsTo = (
 	return Math.max(0, Math.floor(remaining / entry.d) - 1);
 };
 
-/** Estimate the count of live segments materialised so far when no
- *  SegmentTimeline is in use. Uses `availabilityStartTime` + period start
- *  as the anchor; falls back to 0 when the anchor is missing (consumer
- *  hasn't supplied wall-clock info). */
 const liveSegmentCount = (
 	context: DashSegmentedInputContext,
 	segDuration: number,
@@ -660,17 +618,16 @@ const liveSegmentCount = (
 	return Math.max(0, Math.floor((elapsedSec * timescale) / segDuration));
 };
 
-/** Reconstruct a full ISO/IEC 23001-7 `pssh` box around content-only bytes.
- *  Layout: 4-byte BE size (8 + contents.length) + 'pssh' 4CC + contents. */
+// ISO/IEC 23001-7 pssh box: 4-byte BE size + 'pssh' 4CC + contents.
 const buildPsshBox = (contents: Uint8Array): Uint8Array => {
 	const total = 8 + contents.length;
 	const out = new Uint8Array(total);
 	const dv = new DataView(out.buffer);
 	dv.setUint32(0, total, false);
-	out[4] = 0x70; // 'p'
-	out[5] = 0x73; // 's'
-	out[6] = 0x73; // 's'
-	out[7] = 0x68; // 'h'
+	out[4] = 0x70;
+	out[5] = 0x73;
+	out[6] = 0x73;
+	out[7] = 0x68;
 	out.set(contents, 8);
 	return out;
 };

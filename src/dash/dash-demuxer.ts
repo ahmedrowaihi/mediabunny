@@ -140,6 +140,7 @@ export class DashDemuxer extends Demuxer {
 							isDynamic: mpd.type === 'dynamic',
 							minimumUpdatePeriod: mpd.minimumUpdatePeriod,
 							mediaPresentationDuration: mpd.mediaPresentationDuration,
+							timeShiftBufferDepth: mpd.timeShiftBufferDepth,
 						};
 
 						const stableKey = `${period.id ?? ''}|${as.id ?? ''}|${rep.id}`;
@@ -268,6 +269,7 @@ export class DashDemuxer extends Demuxer {
 					segInput.context.isDynamic = mpd.type === 'dynamic';
 					segInput.context.minimumUpdatePeriod = mpd.minimumUpdatePeriod;
 					segInput.context.mediaPresentationDuration = mpd.mediaPresentationDuration;
+					segInput.context.timeShiftBufferDepth = mpd.timeShiftBufferDepth;
 					segInput.refreshInterval = segInput.context.isDynamic
 						? Math.max(1, mpd.minimumUpdatePeriod ?? 5)
 						: Number.POSITIVE_INFINITY;

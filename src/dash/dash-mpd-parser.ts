@@ -16,6 +16,7 @@ import {
 	parseISODuration,
 } from './dash-misc';
 
+/** Typed AST for a parsed DASH MPD document (ISO/IEC 23009-1). @group DASH @public */
 export type Mpd = {
 	type: 'static' | 'dynamic';
 	profiles: string[];
@@ -32,6 +33,7 @@ export type Mpd = {
 	periods: MpdPeriod[];
 };
 
+/** A `<Period>` from a parsed MPD. @group DASH @public */
 export type MpdPeriod = {
 	id: string | null;
 	start: number | null;
@@ -40,6 +42,7 @@ export type MpdPeriod = {
 	adaptationSets: MpdAdaptationSet[];
 };
 
+/** A `<AdaptationSet>` from a parsed MPD. @group DASH @public */
 export type MpdAdaptationSet = {
 	id: string | null;
 	group: number | null;
@@ -59,6 +62,7 @@ export type MpdAdaptationSet = {
 	representations: MpdRepresentation[];
 };
 
+/** A `<Representation>` from a parsed MPD. @group DASH @public */
 export type MpdRepresentation = {
 	id: string;
 	bandwidth: number;
@@ -78,6 +82,7 @@ export type MpdRepresentation = {
 	segmentBase: SegmentBase | null;
 };
 
+/** A `<SegmentTemplate>` form of SegmentInformation. @group DASH @public */
 export type SegmentTemplate = {
 	media: string | null;
 	initialization: string | null;
@@ -90,13 +95,18 @@ export type SegmentTemplate = {
 	timeline: SegmentTimelineEntry[] | null;
 };
 
-// t/d in timescale units; r is repeat count (0 = no repeat, negative = repeat-until-boundary).
+/**
+ * A `<S>` entry from a `<SegmentTimeline>`. `t`/`d` are in timescale units;
+ * `r` is the repeat count (0 = no repeat, negative = repeat-until-boundary).
+ * @group DASH @public
+ */
 export type SegmentTimelineEntry = {
 	t: number | null;
 	d: number;
 	r: number;
 };
 
+/** A `<SegmentList>` form of SegmentInformation. @group DASH @public */
 export type SegmentList = {
 	timescale: number;
 	duration: number | null;
@@ -112,6 +122,7 @@ export type SegmentList = {
 	}[];
 };
 
+/** A `<SegmentBase>` form of SegmentInformation. @group DASH @public */
 export type SegmentBase = {
 	timescale: number;
 	presentationTimeOffset: number;
@@ -119,8 +130,10 @@ export type SegmentBase = {
 	initialization: { sourceURL: string | null; range: ByteRange | null } | null;
 };
 
+/** Inclusive byte range parsed from a DASH `@range` attribute. @group DASH @public */
 export type ByteRange = { start: number; end: number };
 
+/** A `<ContentProtection>` element with normalised CENC key id and pssh boxes. @group DASH @public */
 export type ContentProtection = {
 	schemeIdUri: string;
 	value: string | null;
@@ -135,6 +148,7 @@ class MpdParseError extends Error {
 	}
 }
 
+/** Parse an MPD XML string into a typed AST. Throws on malformed XML or missing required attributes. @group DASH @public */
 export const parseMpd = (xml: string): Mpd => {
 	if (typeof DOMParser === 'undefined') {
 		throw new MpdParseError('DOMParser is not available in this environment');
@@ -460,7 +474,7 @@ const numericAttr = (el: Element, name: string): number | null => {
 
 const base64ToBytes = (b64: string): Uint8Array | null => {
 	try {
-		const binary = typeof atob !== 'undefined' ? atob(b64) : Buffer.from(b64, 'base64').toString('binary');
+		const binary = atob(b64);
 		const bytes = new Uint8Array(binary.length);
 		for (let i = 0; i < binary.length; i++) {
 			bytes[i] = binary.charCodeAt(i);

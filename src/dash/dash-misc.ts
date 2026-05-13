@@ -8,32 +8,18 @@
 
 export const DASH_MIME_TYPE = 'application/dash+xml';
 
-/** Namespaces commonly seen in MPD documents. We do not validate them
- *  strictly — most producers omit prefixes — but we accept them when
- *  present (e.g. `cenc:default_KID` on ContentProtection). */
 export const DASH_NS = {
 	mpd: 'urn:mpeg:dash:schema:mpd:2011',
 	cenc: 'urn:mpeg:cenc:2013',
 	mspr: 'urn:microsoft:playready',
 } as const;
 
-/** Quick prefix check used by InputFormat._canReadInput. Looks at the first
- *  bytes of the source. We accept any XML that contains `<MPD` near the top
- *  (preamble plus optional doctype). The strict spec calls for
- *  `<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" ...>` but many real-world
- *  manifests omit or vary the namespace. */
 export const looksLikeMpd = (firstBytes: Uint8Array): boolean => {
 	const decoder = new TextDecoder('utf-8', { fatal: false });
 	const head = decoder.decode(firstBytes.subarray(0, Math.min(firstBytes.length, 2048)));
-	if (!head.includes('<MPD')) {
-		return false;
-	}
-	return true;
+	return head.includes('<MPD');
 };
 
-/** Resolve a (possibly relative) URL against a base, mirroring the URL spec.
- *  Returns the absolute form. Falls back to plain concatenation when the WHATWG
- *  URL constructor rejects the base (e.g. opaque schemes used in tests). */
 export const resolveURL = (relative: string, base: string): string => {
 	try {
 		return new URL(relative, base).toString();
@@ -50,10 +36,6 @@ export const resolveURL = (relative: string, base: string): string => {
 	}
 };
 
-/** Walk a BaseURL chain (MPD → Period → AdaptationSet → Representation) and
- *  resolve the final base against the manifest URL. Each list may be empty or
- *  contain multiple BaseURL elements (we pick the first; @serviceLocation
- *  rotation is out of scope). */
 export const resolveBaseURL = (manifestURL: string, ...chains: (string[] | undefined)[]): string => {
 	let base = manifestURL;
 	for (const chain of chains) {
@@ -66,8 +48,6 @@ export const resolveBaseURL = (manifestURL: string, ...chains: (string[] | undef
 	return base;
 };
 
-/** Parse an ISO 8601 duration ("PT1H2M3.5S", "PT0.5S", "P1DT2H") into seconds.
- *  Returns null for malformed input. */
 export const parseISODuration = (value: string | null | undefined): number | null => {
 	if (!value) {
 		return null;
@@ -90,8 +70,6 @@ export const parseISODuration = (value: string | null | undefined): number | nul
 	return sign === '-' ? -total : total;
 };
 
-/** Parse an ISO 8601 instant ("2026-01-02T03:04:05Z", "...+02:00") to unix
- *  milliseconds. Returns null for malformed input. */
 export const parseISODateTime = (value: string | null | undefined): number | null => {
 	if (!value) {
 		return null;
@@ -100,8 +78,6 @@ export const parseISODateTime = (value: string | null | undefined): number | nul
 	return Number.isFinite(time) ? time : null;
 };
 
-/** Parse a ByteRange string "start-end" into a numeric pair. Mirrors
- *  RFC 7233 single-range form. */
 export const parseByteRange = (value: string | null | undefined): { start: number; end: number } | null => {
 	if (!value) {
 		return null;
@@ -118,8 +94,6 @@ export const parseByteRange = (value: string | null | undefined): { start: numbe
 	return { start, end };
 };
 
-/** Parse a Rational frame-rate string. Accepts "30", "30000/1001", "30.0",
- *  "1/2". Returns null if unparseable. */
 export type DashRational = { numerator: number; denominator: number };
 
 export const parseFrameRate = (value: string | null | undefined): DashRational | null => {
@@ -143,11 +117,8 @@ export const parseFrameRate = (value: string | null | undefined): DashRational |
 	return { numerator, denominator: 1 };
 };
 
-/** Return the byte offset at which a pssh box's CONTENTS begin within `raw`,
- *  or 0 if `raw` looks like contents-only (no `pssh` box header). Some MPDs
- *  put the full ISO/IEC 23001-7 pssh box bytes in `<cenc:pssh>`; others put
- *  just the contents (everything after the 8-byte header). We sniff for the
- *  `'pssh'` 4CC at bytes 4-8 to tell them apart. */
+// Some MPDs embed the full pssh box; others embed only the contents.
+// Sniff the 'pssh' 4CC at bytes 4-8 to tell them apart.
 export const psshContentsOffset = (raw: Uint8Array): number => {
 	if (
 		raw.length >= 8
@@ -158,8 +129,6 @@ export const psshContentsOffset = (raw: Uint8Array): number => {
 	return 0;
 };
 
-/** Normalise a key id to 32 lowercase hex digits (no dashes). MPDs sometimes
- *  use UUID form `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`. */
 export const normaliseKeyId = (value: string | null | undefined): string | null => {
 	if (!value) {
 		return null;
@@ -171,9 +140,6 @@ export const normaliseKeyId = (value: string | null | undefined): string | null 
 	return stripped;
 };
 
-/** Apply SegmentTemplate `$Variable$` substitution. Supports `$Number$`,
- *  `$Time$`, `$RepresentationID$`, `$Bandwidth$`, and the printf-like width
- *  modifier `$Number%05d$`. */
 export const substituteTemplate = (
 	template: string,
 	values: { number?: number; time?: number; representationId?: string; bandwidth?: number },

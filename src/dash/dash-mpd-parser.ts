@@ -16,9 +16,6 @@ import {
 	parseISODuration,
 } from './dash-misc';
 
-/** AST root for a parsed MPD document. Field semantics follow ISO/IEC 23009-1
- *  3rd edition. Nullable values mean "not present"; consumers decide on defaults
- *  per the spec (e.g. `mediaPresentationDuration === null` for live). */
 export type Mpd = {
 	type: 'static' | 'dynamic';
 	profiles: string[];
@@ -93,12 +90,10 @@ export type SegmentTemplate = {
 	timeline: SegmentTimelineEntry[] | null;
 };
 
+// t/d in timescale units; r is repeat count (0 = no repeat, negative = repeat-until-boundary).
 export type SegmentTimelineEntry = {
-	/** Start time in `timescale` units. */
 	t: number | null;
-	/** Duration in `timescale` units. */
 	d: number;
-	/** Repeat count (0 = no repeat; negative = repeat until next entry / period end). */
 	r: number;
 };
 
@@ -140,8 +135,6 @@ class MpdParseError extends Error {
 	}
 }
 
-/** Parse an MPD XML document into the typed AST defined above. Throws
- *  `MpdParseError` for malformed XML or missing required attributes. */
 export const parseMpd = (xml: string): Mpd => {
 	if (typeof DOMParser === 'undefined') {
 		throw new MpdParseError('DOMParser is not available in this environment');

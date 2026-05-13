@@ -98,111 +98,167 @@ export class DashDemuxer extends Demuxer {
 			);
 
 			const internalTracks: InternalTrack[] = [];
-			let pairingBit = 0;
+			const pairingMaskByGroup = new Map<string, bigint>();
+			let nextPairingBit = 0;
+			// Within a period: AdaptationSets without @group share one bit; each @group=N gets its own.
+			// Cross-period bits are disjoint, so pairing stays period-local.
+			const groupBit = (periodIdx: number, group: number | null): bigint => {
+				const key = `${periodIdx}|${group === null ? '*' : group}`;
+				const existing = pairingMaskByGroup.get(key);
+				if (existing !== undefined) {
+					return existing;
+				}
+				const bit = 1n << BigInt(nextPairingBit++);
+				pairingMaskByGroup.set(key, bit);
+				return bit;
+			};
 
-			for (const { period, periodStart, periodEnd } of periodsWithBoundaries) {
-				const videoAdaptationSets = period.adaptationSets.filter(as => as.contentType === 'video');
-				const audioAdaptationSets = period.adaptationSets.filter(as => as.contentType === 'audio');
+			// Two-pass build: first collect every (period, AS, rep) triple, then resolve codecs —
+			// the second pass may need to probe segments, which requires the SegmentedInput to exist.
+			type Pending = {
+				periodIdx: number;
+				period: MpdPeriod;
+				periodStart: number;
+				periodEnd: number | null;
+				adaptationSet: MpdAdaptationSet;
+				representation: MpdRepresentation;
+				isVideoAs: boolean;
+				codecString: string | null;
+			};
+			const pending: Pending[] = [];
 
-				const pairingMask = 1n << BigInt(pairingBit);
-				pairingBit++;
-
-				for (const as of [...videoAdaptationSets, ...audioAdaptationSets]) {
-					const adaptationSetIsVideo = as.contentType === 'video';
+			for (let periodIdx = 0; periodIdx < periodsWithBoundaries.length; periodIdx++) {
+				const { period, periodStart, periodEnd } = periodsWithBoundaries[periodIdx]!;
+				for (const as of period.adaptationSets) {
+					if (as.contentType !== 'video' && as.contentType !== 'audio') {
+						continue;
+					}
+					const isVideoAs = as.contentType === 'video';
 					for (const rep of as.representations) {
-						const codecString = pickCodec(rep, as);
-						if (!codecString) {
-							continue;
-						}
+						pending.push({
+							periodIdx,
+							period,
+							periodStart,
+							periodEnd,
+							adaptationSet: as,
+							representation: rep,
+							isVideoAs,
+							codecString: pickCodec(rep, as),
+						});
+					}
+				}
+			}
 
-						const inferredCodec = inferCodecFromCodecString(codecString);
-						if (inferredCodec === null) {
-							continue;
-						}
+			for (const item of pending) {
+				const {
+					periodIdx, period, periodStart, periodEnd, adaptationSet: as, representation: rep, isVideoAs,
+				} = item;
 
-						const isVideoCodec = VIDEO_CODECS.includes(inferredCodec as VideoCodec);
-						const isAudioCodec = AUDIO_CODECS.includes(inferredCodec as AudioCodec);
-						if (adaptationSetIsVideo && !isVideoCodec) {
-							continue;
-						}
-						if (!adaptationSetIsVideo && !isAudioCodec) {
-							continue;
-						}
+				const context: DashSegmentedInputContext = {
+					manifestURL: rootPath,
+					period,
+					adaptationSet: as,
+					representation: rep,
+					periodStart,
+					periodEnd,
+					availabilityStartTime: mpd.availabilityStartTime,
+					isDynamic: mpd.type === 'dynamic',
+					minimumUpdatePeriod: mpd.minimumUpdatePeriod,
+					mediaPresentationDuration: mpd.mediaPresentationDuration,
+					timeShiftBufferDepth: mpd.timeShiftBufferDepth,
+				};
 
-						const context: DashSegmentedInputContext = {
-							manifestURL: rootPath,
+				const stableKey = `${period.id ?? ''}|${as.id ?? ''}|${rep.id}`;
+				const id = this.stableIdFor(stableKey);
+				const segmentedInput = new DashSegmentedInput(this, context, [
+					{ id, type: isVideoAs ? 'video' : 'audio' },
+				]);
+				this.segmentedInputs.push(segmentedInput);
+
+				// Fall back to a first-segment probe when MPD omits @codecs entirely.
+				let codecString: string | null = item.codecString;
+				if (!codecString) {
+					try {
+						const backings = await segmentedInput.getTrackBackings();
+						const match = backings.find(b => b.getType() === (isVideoAs ? 'video' : 'audio'));
+						if (match) {
+							const cfg: VideoDecoderConfig | AudioDecoderConfig | null
+								= await match.getDecoderConfig();
+							codecString = cfg?.codec ?? null;
+						}
+					} catch {
+						codecString = null;
+					}
+				}
+				if (!codecString) {
+					continue;
+				}
+				const inferredCodec = inferCodecFromCodecString(codecString);
+				if (inferredCodec === null) {
+					continue;
+				}
+				const isVideoCodec = VIDEO_CODECS.includes(inferredCodec as VideoCodec);
+				const isAudioCodec = AUDIO_CODECS.includes(inferredCodec as AudioCodec);
+				if (isVideoAs && !isVideoCodec) {
+					continue;
+				}
+				if (!isVideoAs && !isAudioCodec) {
+					continue;
+				}
+
+				const primaryRole = as.roles.some(r => r.value === 'main');
+				const name = pickLabel(rep, as);
+				const pairingMask = groupBit(periodIdx, as.group);
+
+				const internal: InternalTrack = isVideoAs
+					? {
+							id,
+							demuxer: this,
+							backingTrack: null,
+							languageCode: preprocessLanguageCode(as.lang),
+							primary: primaryRole,
+							autoselect: true,
+							pairingMask,
+							stableKey,
+							name,
+							codecString,
+							peakBitrate: rep.bandwidth,
+							averageBitrate: null,
 							period,
 							adaptationSet: as,
 							representation: rep,
-							periodStart,
-							periodEnd,
-							availabilityStartTime: mpd.availabilityStartTime,
-							isDynamic: mpd.type === 'dynamic',
-							minimumUpdatePeriod: mpd.minimumUpdatePeriod,
-							mediaPresentationDuration: mpd.mediaPresentationDuration,
-							timeShiftBufferDepth: mpd.timeShiftBufferDepth,
+							segmentedInput,
+							info: {
+								type: 'video',
+								width: rep.width ?? as.maxWidth,
+								height: rep.height ?? as.maxHeight,
+							},
+						}
+					: {
+							id,
+							demuxer: this,
+							backingTrack: null,
+							languageCode: preprocessLanguageCode(as.lang),
+							primary: primaryRole,
+							autoselect: true,
+							pairingMask,
+							stableKey,
+							name,
+							codecString,
+							peakBitrate: rep.bandwidth,
+							averageBitrate: null,
+							period,
+							adaptationSet: as,
+							representation: rep,
+							segmentedInput,
+							info: {
+								type: 'audio',
+								numberOfChannels: null,
+								sampleRate: rep.audioSamplingRate ?? null,
+							},
 						};
 
-						const stableKey = `${period.id ?? ''}|${as.id ?? ''}|${rep.id}`;
-						const id = this.stableIdFor(stableKey);
-						const segmentedInput = new DashSegmentedInput(this, context, [
-							{ id, type: adaptationSetIsVideo ? 'video' : 'audio' },
-						]);
-						this.segmentedInputs.push(segmentedInput);
-
-						const primaryRole = as.roles.some(r => r.value === 'main');
-
-						const internal: InternalTrack = adaptationSetIsVideo
-							? {
-									id,
-									demuxer: this,
-									backingTrack: null,
-									languageCode: preprocessLanguageCode(as.lang),
-									primary: primaryRole,
-									autoselect: true,
-									pairingMask,
-									stableKey,
-									name: rep.id,
-									codecString,
-									peakBitrate: rep.bandwidth,
-									averageBitrate: null,
-									period,
-									adaptationSet: as,
-									representation: rep,
-									segmentedInput,
-									info: {
-										type: 'video',
-										width: rep.width ?? as.maxWidth,
-										height: rep.height ?? as.maxHeight,
-									},
-								}
-							: {
-									id,
-									demuxer: this,
-									backingTrack: null,
-									languageCode: preprocessLanguageCode(as.lang),
-									primary: primaryRole,
-									autoselect: true,
-									pairingMask,
-									stableKey,
-									name: rep.id,
-									codecString,
-									peakBitrate: rep.bandwidth,
-									averageBitrate: null,
-									period,
-									adaptationSet: as,
-									representation: rep,
-									segmentedInput,
-									info: {
-										type: 'audio',
-										numberOfChannels: null,
-										sampleRate: rep.audioSamplingRate ?? null,
-									},
-								};
-
-						internalTracks.push(internal);
-					}
-				}
+				internalTracks.push(internal);
 			}
 
 			this.internalTracks = internalTracks;
@@ -221,14 +277,6 @@ export class DashDemuxer extends Demuxer {
 
 	refreshMpdPromise: Promise<void> | null = null;
 
-	/**
-	 * Re-fetch the MPD (dynamic only), re-parse, and mutate each existing
-	 * DashSegmentedInput context in-place so subsequent `updateSegments()`
-	 * calls see the latest period/timeline state. If the refreshed MPD
-	 * transitions to `type='static'`, each segmented input's context flips
-	 * to `isDynamic=false`; the SegmentedInput then marks itself
-	 * `streamHasEnded`.
-	 */
 	refreshMpd(): Promise<void> {
 		if (this.refreshMpdPromise) {
 			return this.refreshMpdPromise;
@@ -316,6 +364,18 @@ export class DashDemuxer extends Demuxer {
 		this.segmentedInputs.length = 0;
 	}
 }
+
+const pickLabel = (rep: MpdRepresentation, as: MpdAdaptationSet): string => {
+	const repLabel = rep.labels[0]?.value;
+	if (repLabel) {
+		return repLabel;
+	}
+	const asLabel = as.labels[0]?.value;
+	if (asLabel) {
+		return asLabel;
+	}
+	return rep.id;
+};
 
 const pickCodec = (rep: MpdRepresentation, as: MpdAdaptationSet): string | null => {
 	if (rep.codecs) {

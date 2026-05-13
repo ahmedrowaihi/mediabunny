@@ -13,7 +13,7 @@ import { arrayArgmin, assert, binarySearchLessOrEqual, last, wait } from '../mis
 import { Segment, SegmentedInput, SegmentedInputTrackDeclaration, SegmentRetrievalOptions } from '../segmented-input';
 import { CustomPathedSource, SourceRequest } from '../source';
 import { type DashDemuxer } from './dash-demuxer';
-import { resolveURL, substituteTemplate } from './dash-misc';
+import { psshContentsOffset, resolveURL, substituteTemplate } from './dash-misc';
 import {
 	type ContentProtection,
 	type MpdAdaptationSet,
@@ -33,6 +33,13 @@ export type DashSegmentLocation = {
 
 /** A materialised DASH segment. Mirrors HlsSegment in shape. */
 export type DashSegment = Segment & {
+	/** SegmentTemplate `$Number$` for this segment, or null when the
+	 *  representation is SegmentList-based (no number). Used for stable
+	 *  cross-refresh dedup on live MPDs. */
+	number: number | null;
+	/** Presentation time in `timescale` units at the moment of materialisation.
+	 *  Used for dedup and identity across refreshes. */
+	timeTicks: number;
 	location: DashSegmentLocation;
 	initSegment: DashSegment | null;
 	firstSegment: DashSegment | null;
@@ -52,6 +59,7 @@ export type DashSegmentedInputContext = {
 	isDynamic: boolean;
 	minimumUpdatePeriod: number | null;
 	mediaPresentationDuration: number | null;
+	timeShiftBufferDepth: number | null;
 };
 
 const MAX_INPUT_CACHE_SIZE = 4;
@@ -173,6 +181,8 @@ export class DashSegmentedInput extends SegmentedInput {
 			duration: 0,
 			relativeToUnixEpoch: false,
 			firstSegment: null,
+			number: null,
+			timeTicks: 0,
 			location,
 			initSegment: null,
 		};
@@ -186,6 +196,31 @@ export class DashSegmentedInput extends SegmentedInput {
 		const elapsed = performance.now() - this.lastSegmentUpdateTime;
 		const result = Math.max(0, 1000 * this.refreshInterval - elapsed);
 		return result <= 50 ? 0 : result;
+	}
+
+	/** Whether we should shift segment timestamps to Unix-epoch seconds.
+	 *  Only dynamic MPDs are wall-clock anchored. A static MPD may carry
+	 *  `availabilityStartTime` for archival/scheduling reasons but its
+	 *  segments are still presentation-time-relative; shifting them to
+	 *  the wall clock would lie to consumers who expect VOD timelines. */
+	isWallClockTimeline(): boolean {
+		return this.context.isDynamic && this.context.availabilityStartTime !== null;
+	}
+
+	/** Live segment availability window. Returns `null` for static MPDs and
+	 *  when the timeShiftBufferDepth is unbounded. Segments whose end-of-presentation
+	 *  wall-clock time is older than `now - timeShiftBufferDepth` should not
+	 *  be materialised. */
+	getAvailabilityWindow(): { earliestPresentationTime: number; latestPresentationTime: number } | null {
+		if (!this.context.isDynamic || this.context.availabilityStartTime === null) {
+			return null;
+		}
+		const nowSec = (Date.now() - this.context.availabilityStartTime) / 1000;
+		const latest = nowSec;
+		const earliest = this.context.timeShiftBufferDepth !== null
+			? Math.max(0, nowSec - this.context.timeShiftBufferDepth)
+			: 0;
+		return { earliestPresentationTime: earliest, latestPresentationTime: latest };
 	}
 
 	runUpdateSegments(): Promise<void> {
@@ -230,8 +265,10 @@ export class DashSegmentedInput extends SegmentedInput {
 			this.segments.push({
 				timestamp: this.context.periodStart,
 				duration: this.context.mediaPresentationDuration ?? 0,
-				relativeToUnixEpoch: this.context.availabilityStartTime !== null,
+				relativeToUnixEpoch: this.isWallClockTimeline(),
 				firstSegment: null,
+				number: null,
+				timeTicks: 0,
 				initSegment: this.getInitSegment(),
 				location: {
 					path: this.getBaseURL(),
@@ -244,16 +281,21 @@ export class DashSegmentedInput extends SegmentedInput {
 
 	private materialiseFromTemplate(template: SegmentTemplate): void {
 		const initSegment = this.getInitSegment();
-		const firstSegment = this.segments[0] ?? null;
 		const baseURL = this.getBaseURL();
 		const repId = this.context.representation.id;
 		const bandwidth = this.context.representation.bandwidth;
 		const timescale = template.timescale;
-		const wallClock = this.context.availabilityStartTime !== null;
+		const wallClock = this.isWallClockTimeline();
 		const periodStartTicks = this.context.periodStart * timescale + template.presentationTimeOffset;
 		const wallClockShift = wallClock
 			? (this.context.availabilityStartTime ?? 0) / 1000 + this.context.periodStart
 			: 0;
+		const availabilityWindow = this.getAvailabilityWindow();
+
+		const lastKnown = last(this.segments);
+		const lastKnownEndTicks = lastKnown !== undefined
+			? lastKnown.timeTicks + Math.round(lastKnown.duration * timescale)
+			: null;
 
 		const appendSegment = (
 			number: number,
@@ -263,20 +305,24 @@ export class DashSegmentedInput extends SegmentedInput {
 			if (!template.media) {
 				return;
 			}
-			const lastSeg = last(this.segments);
-			if (lastSeg) {
-				const lastNumber = lastSeg.location.path; // unique-ish identity
-				const candidatePath = resolveURL(
-					substituteTemplate(template.media, {
-						number,
-						time: timeTicks,
-						representationId: repId,
-						bandwidth,
-					}),
-					baseURL,
-				);
-				if (lastNumber === candidatePath) {
-					return; // already materialised
+			// Dedup against the in-memory list by (number, timeTicks). We compare on
+			// unit-consistent fields rather than on URLs / byte offsets to avoid the
+			// confusion class of bugs caused by mixing ticks and bytes.
+			if (lastKnownEndTicks !== null && timeTicks < lastKnownEndTicks) {
+				return;
+			}
+
+			// Live availability: clamp out segments that have aged out of the DVR
+			// window. We use the segment's end-of-presentation time against the
+			// window's earliest edge so a segment partially still in-window is kept.
+			if (availabilityWindow !== null) {
+				const presentationEnd = (timeTicks - periodStartTicks + durationTicks) / timescale;
+				if (presentationEnd < availabilityWindow.earliestPresentationTime) {
+					return;
+				}
+				const presentationStart = (timeTicks - periodStartTicks) / timescale;
+				if (presentationStart > availabilityWindow.latestPresentationTime) {
+					return;
 				}
 			}
 
@@ -299,7 +345,9 @@ export class DashSegmentedInput extends SegmentedInput {
 				timestamp,
 				duration: durationTicks / timescale,
 				relativeToUnixEpoch: wallClock,
-				firstSegment,
+				firstSegment: this.segments[0] ?? null,
+				number,
+				timeTicks,
 				initSegment,
 				location: {
 					path: mediaPath,
@@ -311,20 +359,29 @@ export class DashSegmentedInput extends SegmentedInput {
 		};
 
 		if (template.timeline && template.timeline.length > 0) {
-			let currentTime = template.timeline[0]!.t ?? 0;
+			const timeline = template.timeline;
+			let currentTime = timeline[0]!.t ?? 0;
 			let segNumber = template.startNumber;
-			const lastKnown = last(this.segments);
-			for (const entry of template.timeline) {
+			for (let entryIdx = 0; entryIdx < timeline.length; entryIdx++) {
+				const entry = timeline[entryIdx]!;
 				if (entry.t !== null) {
 					currentTime = entry.t;
 				}
+				// Per ISO/IEC 23009-1: @r = -1 means "repeat until the next <S>@t (if
+				// any) or the period end, whichever comes first". A positive @r is the
+				// number of additional repeats. Zero means "no repeat" → 1 segment.
+				const nextEntry: SegmentTimelineEntry | undefined = timeline[entryIdx + 1];
 				const repeats = entry.r < 0
-					? estimateRemainingRepeats(entry, currentTime, this.context, timescale)
+					? remainingRepeatsTo(
+							entry,
+							currentTime,
+							nextEntry?.t ?? null,
+							this.context,
+							timescale,
+						)
 					: entry.r;
 				for (let i = 0; i <= repeats; i++) {
-					if (!lastKnown || currentTime > lastKnown.location.offset) {
-						appendSegment(segNumber, currentTime, entry.d);
-					}
+					appendSegment(segNumber, currentTime, entry.d);
 					currentTime += entry.d;
 					segNumber++;
 				}
@@ -345,10 +402,9 @@ export class DashSegmentedInput extends SegmentedInput {
 
 		const segmentCount = periodDuration !== null
 			? Math.ceil((periodDuration * timescale) / segDuration)
-			: estimateLiveSegmentCount(this.context, segDuration, timescale);
+			: liveSegmentCount(this.context, segDuration, timescale);
 
-		const startIndex = this.segments.length;
-		for (let i = startIndex; i < segmentCount; i++) {
+		for (let i = 0; i < segmentCount; i++) {
 			const segNumber = template.startNumber + i;
 			const timeTicks = periodStartTicks + i * segDuration;
 			appendSegment(segNumber, timeTicks, segDuration);
@@ -357,25 +413,28 @@ export class DashSegmentedInput extends SegmentedInput {
 
 	private materialiseFromList(list: SegmentList): void {
 		const initSegment = this.getInitSegment();
-		const firstSegment = this.segments[0] ?? null;
 		const baseURL = this.getBaseURL();
 		const timescale = list.timescale;
-		const wallClock = this.context.availabilityStartTime !== null;
+		const wallClock = this.isWallClockTimeline();
 		const wallClockShift = wallClock
 			? (this.context.availabilityStartTime ?? 0) / 1000 + this.context.periodStart
 			: 0;
 
-		let accTime = list.presentationTimeOffset / timescale;
+		let accTimeTicks = list.presentationTimeOffset;
 		const startIndex = this.segments.length;
 		for (let i = startIndex; i < list.segments.length; i++) {
 			const entry = list.segments[i]!;
-			const duration = (list.timeline?.[i]?.d ?? list.duration ?? 0) / timescale;
+			const durationTicks = list.timeline?.[i]?.d ?? list.duration ?? 0;
+			const durationSec = durationTicks / timescale;
 			const path = resolveURL(entry.media, baseURL);
+			const accTimeSec = accTimeTicks / timescale;
 			const seg: DashSegment = {
-				timestamp: wallClock ? wallClockShift + accTime : this.context.periodStart + accTime,
-				duration,
+				timestamp: wallClock ? wallClockShift + accTimeSec : this.context.periodStart + accTimeSec,
+				duration: durationSec,
 				relativeToUnixEpoch: wallClock,
-				firstSegment,
+				firstSegment: this.segments[0] ?? null,
+				number: list.startNumber + i,
+				timeTicks: accTimeTicks,
 				initSegment,
 				location: {
 					path,
@@ -384,7 +443,7 @@ export class DashSegmentedInput extends SegmentedInput {
 				},
 			};
 			this.segments.push(seg);
-			accTime += duration;
+			accTimeTicks += durationTicks;
 		}
 	}
 
@@ -462,11 +521,16 @@ export class DashSegmentedInput extends SegmentedInput {
 		const psshBoxes: PsshBox[] = [];
 		for (const cp of protections) {
 			for (const raw of cp.psshBoxes) {
-				if (raw.length < 8) {
+				const headerOffset = psshContentsOffset(raw);
+				if (raw.length <= headerOffset) {
 					continue;
 				}
-				const contents = parsePsshBoxContents(raw.subarray(8));
-				psshBoxes.push({ ...contents, bytes: raw });
+				const contents = parsePsshBoxContents(raw.subarray(headerOffset));
+				// When the MPD supplied only the contents (no header), reconstruct a
+				// minimal full-box `bytes` so `psshBoxesAreEqual` and any downstream
+				// consumer that re-emits the box has the canonical wire form.
+				const fullBytes = headerOffset === 8 ? raw : buildPsshBox(raw);
+				psshBoxes.push({ ...contents, bytes: fullBytes });
 			}
 		}
 
@@ -545,22 +609,46 @@ export class DashSegmentedInput extends SegmentedInput {
 	}
 }
 
-const estimateRemainingRepeats = (
+/** Compute the number of additional <S> repeats when @r is negative.
+ *  Per ISO/IEC 23009-1 §5.3.9.6.1: repeats stop at the next <S>@t (when
+ *  present) or the period end, whichever comes first. The returned value
+ *  is "additional repeats" (so a result of 0 means "just one segment").
+ *
+ *  Mathematically: count = floor((boundary - currentTime) / entry.d) − 1
+ *    because we already emit one segment for the current @t.
+ *  The `entry.d` divisor is guarded against zero by parser invariants. */
+const remainingRepeatsTo = (
 	entry: SegmentTimelineEntry,
 	currentTime: number,
+	nextEntryTime: number | null,
 	context: DashSegmentedInputContext,
 	timescale: number,
 ): number => {
-	const endSec = context.periodEnd ?? context.mediaPresentationDuration;
-	if (endSec === null) {
+	const periodEndTicks = context.periodEnd !== null
+		? context.periodEnd * timescale
+		: context.mediaPresentationDuration !== null
+			? context.mediaPresentationDuration * timescale
+			: null;
+	const candidates: number[] = [];
+	if (nextEntryTime !== null) {
+		candidates.push(nextEntryTime);
+	}
+	if (periodEndTicks !== null) {
+		candidates.push(periodEndTicks);
+	}
+	if (candidates.length === 0) {
 		return 0;
 	}
-	const endTicks = endSec * timescale;
-	const remaining = Math.max(0, endTicks - currentTime);
+	const boundary = Math.min(...candidates);
+	const remaining = Math.max(0, boundary - currentTime);
 	return Math.max(0, Math.floor(remaining / entry.d) - 1);
 };
 
-const estimateLiveSegmentCount = (
+/** Estimate the count of live segments materialised so far when no
+ *  SegmentTimeline is in use. Uses `availabilityStartTime` + period start
+ *  as the anchor; falls back to 0 when the anchor is missing (consumer
+ *  hasn't supplied wall-clock info). */
+const liveSegmentCount = (
 	context: DashSegmentedInputContext,
 	segDuration: number,
 	timescale: number,
@@ -570,4 +658,19 @@ const estimateLiveSegmentCount = (
 	}
 	const elapsedSec = Math.max(0, (Date.now() - context.availabilityStartTime) / 1000 - context.periodStart);
 	return Math.max(0, Math.floor((elapsedSec * timescale) / segDuration));
+};
+
+/** Reconstruct a full ISO/IEC 23001-7 `pssh` box around content-only bytes.
+ *  Layout: 4-byte BE size (8 + contents.length) + 'pssh' 4CC + contents. */
+const buildPsshBox = (contents: Uint8Array): Uint8Array => {
+	const total = 8 + contents.length;
+	const out = new Uint8Array(total);
+	const dv = new DataView(out.buffer);
+	dv.setUint32(0, total, false);
+	out[4] = 0x70; // 'p'
+	out[5] = 0x73; // 's'
+	out[6] = 0x73; // 's'
+	out[7] = 0x68; // 'h'
+	out.set(contents, 8);
+	return out;
 };

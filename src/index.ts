@@ -335,6 +335,28 @@ export {
 	canIgnoreLine,
 } from './hls/hls-misc';
 
+// HLS playlist parser (master + media).
+export {
+	parseHlsPlaylist,
+	type HlsPlaylist,
+	type HlsMasterPlaylist,
+	type HlsMediaPlaylistAst,
+	type HlsVariant,
+	type HlsIFrameStream,
+	type HlsMediaRendition,
+	type HlsSegment,
+	type HlsMap,
+	type HlsKey,
+} from './hls/hls-playlist-parser';
+
+// HLS playlist concatenation building blocks.
+export {
+	concatHlsMediaPlaylists,
+	rewriteHlsMasterUrisToBasename,
+	type HlsMediaPlaylistConcatInput,
+	type HlsMediaPlaylistConcatResult,
+} from './hls/hls-concat';
+
 // HLS playlist generators (ported from shaka-packager).
 export {
 	Tag,
@@ -398,6 +420,13 @@ export {
 	type ByteRange as DashByteRange,
 	type ContentProtection,
 } from './dash/dash-mpd-parser';
+
+// DASH MPD concatenation building block (one `<Period>` per input).
+export {
+	concatMpdPeriods,
+	type MpdConcatInput,
+	type MpdConcatResult,
+} from './dash/dash-concat';
 
 // DASH MPD generators (ported from shaka-packager).
 export {

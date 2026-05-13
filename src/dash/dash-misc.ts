@@ -101,7 +101,12 @@ export const parseByteRange = (value: string | null | undefined): { start: numbe
 };
 
 /** Numerator/denominator pair used for DASH frame rates. @group DASH @public */
-export type DashRational = { numerator: number; denominator: number };
+export type DashRational = {
+	/** Frame-rate numerator. */
+	numerator: number;
+	/** Frame-rate denominator. */
+	denominator: number;
+};
 
 /** Parse a DASH frame-rate string (`"30"`, `"30000/1001"`, `"1/2"`). @group DASH @public */
 export const parseFrameRate = (value: string | null | undefined): DashRational | null => {

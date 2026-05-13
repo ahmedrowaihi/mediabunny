@@ -54,6 +54,7 @@ export type MpdAdaptationSet = {
 	maxHeight: number | null;
 	frameRate: DashRational | null;
 	roles: { schemeIdUri: string; value: string }[];
+	labels: { lang: string | null; value: string }[];
 	baseURLs: string[];
 	contentProtections: ContentProtection[];
 	segmentTemplate: SegmentTemplate | null;
@@ -72,6 +73,7 @@ export type MpdRepresentation = {
 	sar: string | null;
 	audioSamplingRate: number | null;
 	startWithSAP: number | null;
+	labels: { lang: string | null; value: string }[];
 	baseURLs: string[];
 	contentProtections: ContentProtection[];
 	segmentTemplate: SegmentTemplate | null;
@@ -221,6 +223,7 @@ const parseAdaptationSet = (el: Element): MpdAdaptationSet => {
 		maxHeight: numericAttr(el, 'maxHeight'),
 		frameRate: parseFrameRate(el.getAttribute('frameRate')),
 		roles: collectRoles(el),
+		labels: collectLabels(el),
 		baseURLs: collectBaseURLs(el),
 		contentProtections: collectContentProtections(el),
 		segmentTemplate: findFirst(el, 'SegmentTemplate', parseSegmentTemplate),
@@ -256,6 +259,7 @@ const parseRepresentation = (el: Element): MpdRepresentation => {
 		sar: el.getAttribute('sar'),
 		audioSamplingRate: numericAttr(el, 'audioSamplingRate'),
 		startWithSAP: numericAttr(el, 'startWithSAP'),
+		labels: collectLabels(el),
 		baseURLs: collectBaseURLs(el),
 		contentProtections: collectContentProtections(el),
 		segmentTemplate: findFirst(el, 'SegmentTemplate', parseSegmentTemplate),
@@ -368,6 +372,18 @@ const collectRoles = (parent: Element): { schemeIdUri: string; value: string }[]
 		if (schemeIdUri && value !== null) {
 			result.push({ schemeIdUri, value });
 		}
+	}
+	return result;
+};
+
+const collectLabels = (parent: Element): { lang: string | null; value: string }[] => {
+	const result: { lang: string | null; value: string }[] = [];
+	for (const el of childrenByLocalName(parent, 'Label')) {
+		const text = el.textContent?.trim();
+		if (!text) {
+			continue;
+		}
+		result.push({ lang: el.getAttribute('lang'), value: text });
 	}
 	return result;
 };

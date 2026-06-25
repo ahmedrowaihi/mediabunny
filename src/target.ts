@@ -150,6 +150,7 @@ export class BufferTarget extends Target {
 		this._supportsResize = 'resize' in new ArrayBuffer(0);
 		if (this._supportsResize) {
 			try {
+				// @ts-expect-error Don't want to bump "lib" in tsconfig
 				this._buffer = new ArrayBuffer(ARRAY_BUFFER_INITIAL_SIZE, { maxByteLength: ARRAY_BUFFER_MAX_SIZE });
 			} catch {
 				this._buffer = new ArrayBuffer(ARRAY_BUFFER_INITIAL_SIZE);
@@ -178,6 +179,8 @@ export class BufferTarget extends Target {
 
 		if (this._supportsResize) {
 			// Use resize if it exists
+			// @ts-expect-error Don't want to bump "lib" in tsconfig
+			// eslint-disable-next-line @typescript-eslint/no-unsafe-call
 			this._buffer.resize(newLength);
 			// The Uint8Array scales automatically
 		} else {

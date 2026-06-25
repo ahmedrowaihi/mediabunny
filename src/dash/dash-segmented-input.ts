@@ -169,7 +169,7 @@ export class DashSegmentedInput extends SegmentedInput {
 		this.initSegmentCache = {
 			timestamp: 0,
 			duration: 0,
-			relativeToUnixEpoch: false,
+			unixEpochTimestamp: null,
 			firstSegment: null,
 			number: null,
 			timeTicks: 0,
@@ -243,7 +243,7 @@ export class DashSegmentedInput extends SegmentedInput {
 			this.segments.push({
 				timestamp: this.context.periodStart,
 				duration: this.context.mediaPresentationDuration ?? 0,
-				relativeToUnixEpoch: this.isWallClockTimeline(),
+				unixEpochTimestamp: null,
 				firstSegment: null,
 				number: null,
 				timeTicks: 0,
@@ -316,7 +316,7 @@ export class DashSegmentedInput extends SegmentedInput {
 			const seg: DashSegment = {
 				timestamp,
 				duration: durationTicks / timescale,
-				relativeToUnixEpoch: wallClock,
+				unixEpochTimestamp: wallClock ? wallClockShift + relTimestamp : null,
 				firstSegment: this.segments[0] ?? null,
 				number,
 				timeTicks,
@@ -401,7 +401,7 @@ export class DashSegmentedInput extends SegmentedInput {
 			const seg: DashSegment = {
 				timestamp: wallClock ? wallClockShift + accTimeSec : this.context.periodStart + accTimeSec,
 				duration: durationSec,
-				relativeToUnixEpoch: wallClock,
+				unixEpochTimestamp: wallClock ? wallClockShift + accTimeSec : null,
 				firstSegment: this.segments[0] ?? null,
 				number: list.startNumber + i,
 				timeTicks: accTimeTicks,

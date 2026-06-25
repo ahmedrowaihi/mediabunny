@@ -1063,7 +1063,7 @@ export class UrlSource extends PathedSource {
 					return;
 				}
 
-				let readResult: ReadableStreamReadResult<Uint8Array>;
+				let readResult: Awaited<ReturnType<typeof reader.read>>;
 
 				try {
 					readResult = await reader.read();

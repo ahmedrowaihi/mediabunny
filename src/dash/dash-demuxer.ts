@@ -461,6 +461,10 @@ abstract class DashInputTrackBacking implements InputTrackBacking {
 		return this.internalTrack.id;
 	}
 
+	getUnixTimeForTimestamp(timestamp: number): MaybePromise<number | null> {
+		return this.delegate(() => this.internalTrack.backingTrack!.getUnixTimeForTimestamp(timestamp));
+	}
+
 	getPairingMask(): bigint {
 		return this.internalTrack.pairingMask;
 	}

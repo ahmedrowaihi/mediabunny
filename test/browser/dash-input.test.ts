@@ -182,3 +182,31 @@ test('Input + DASH_FORMATS: dynamic MPD reports live + refresh interval', async 
 	expect(await video.isLive()).toBe(true);
 	expect(await video.getLiveRefreshInterval()).toBe(5);
 });
+
+// Guards the wall-clock date-time adoption (upstream 1.49 unixEpochTimestamp model):
+// dynamic MPDs with availabilityStartTime carry a Unix time per segment, static do not.
+test('Input + DASH_FORMATS: getUnixTimeForTimestamp — wall-clock dynamic vs static', async () => {
+	const staticInput = new Input({ source: mpdSource(STATIC_MPD), formats: DASH_FORMATS });
+	const staticVideo = (await staticInput.getVideoTracks())[0]!;
+	expect(await staticVideo.getUnixTimeForTimestamp(0)).toBe(null);
+
+	const dynamicMpd = `<?xml version="1.0"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="dynamic"
+	availabilityStartTime="2026-01-01T00:00:00Z"
+	minimumUpdatePeriod="PT5S" publishTime="2026-01-01T00:00:05Z">
+	<Period id="p0">
+		<AdaptationSet id="1" contentType="video" mimeType="video/mp4" codecs="avc1.42c01e">
+			<SegmentTemplate media="v-$Number$.m4s" timescale="90000" duration="180000" startNumber="1">
+				<SegmentTimeline><S t="0" d="180000" r="2"/></SegmentTimeline>
+			</SegmentTemplate>
+			<Representation id="v1" bandwidth="1000000" width="640" height="360"/>
+		</AdaptationSet>
+	</Period>
+</MPD>`;
+	const dynamicInput = new Input({ source: mpdSource(dynamicMpd), formats: DASH_FORMATS });
+	const dynamicVideo = (await dynamicInput.getVideoTracks())[0]!;
+	// Wall-clock segments are shifted into Unix space, so the first segment's
+	// timestamp IS availabilityStartTime, and its Unix time equals itself.
+	const availabilityStart = Date.parse('2026-01-01T00:00:00Z') / 1000;
+	expect(await dynamicVideo.getUnixTimeForTimestamp(availabilityStart)).toBe(availabilityStart);
+});

@@ -609,7 +609,9 @@ export class Representation {
 			return duration;
 		}
 		const refTimeScale = this.mediaInfo.referenceTimeScale ?? 1;
-		const scaledTargetDuration = this.mpdOptions.mpdParams.targetSegmentDuration * refTimeScale;
+		// Shaka assigns the double product to an int64, truncating toward zero;
+		// mirror that so e.g. 0.01 * 1000 = 10.000000000000002 emits d="10".
+		const scaledTargetDuration = Math.trunc(this.mpdOptions.mpdParams.targetSegmentDuration * refTimeScale);
 		return this.approximatelyEqual(scaledTargetDuration, duration)
 			? scaledTargetDuration
 			: duration;

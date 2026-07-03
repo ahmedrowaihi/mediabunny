@@ -10,6 +10,7 @@
  */
 import { describe, expect, test } from 'vitest';
 import type { ContentProtectionElement } from '../../src/dash/dash-content-protection.js';
+import { removeDuplicateAttributes } from '../../src/dash/dash-mpd-utils.js';
 import {
 	RepresentationBaseXmlNode,
 	RepresentationXmlNode,
@@ -52,7 +53,12 @@ describe('RepresentationBaseXmlNode — content protection', () => {
 		);
 	});
 
-	test('top-level value/schemeIdUri win over duplicates in additionalAttributes', () => {
+	// Mirrors shaka's AddContentProtectionElement: it does NO inline dedup — it
+	// sets value/schemeIdUri first, then blindly SetStringAttributes every entry
+	// in additionalAttributes, so a duplicate key OVERWRITES the top-level one
+	// (later-set-wins). Shaka keeps output clean via RemoveDuplicateAttributes
+	// applied upstream, not here.
+	test('additionalAttributes overwrite top-level value/schemeIdUri (later-set-wins, no inline dedup)', () => {
 		const cp: ContentProtectionElement = {
 			value: 'official',
 			schemeIdUri: 'urn:uuid:abcd',
@@ -63,6 +69,32 @@ describe('RepresentationBaseXmlNode — content protection', () => {
 			]),
 			subelements: [],
 		};
+		const repr = new RepresentationXmlNode();
+		expect(repr.addContentProtectionElement(cp)).toBe(true);
+		expectXmlEqual(
+			repr.toString(),
+			'<Representation>'
+			+ '  <ContentProtection schemeIdUri="duplicate" value="duplicate"'
+			+ '                     cenc:default_KID="kept"/>'
+			+ '</Representation>',
+		);
+	});
+
+	// The clean-output path shaka actually relies on: removeDuplicateAttributes
+	// strips the duplicate value/schemeIdUri from additionalAttributes upstream,
+	// so the top-level fields survive and only cenc:default_KID remains extra.
+	test('removeDuplicateAttributes upstream keeps top-level fields intact', () => {
+		const cp: ContentProtectionElement = {
+			value: 'official',
+			schemeIdUri: 'urn:uuid:abcd',
+			additionalAttributes: new Map([
+				['value', 'duplicate'],
+				['schemeIdUri', 'duplicate'],
+				['cenc:default_KID', 'kept'],
+			]),
+			subelements: [],
+		};
+		removeDuplicateAttributes(cp);
 		const repr = new RepresentationXmlNode();
 		expect(repr.addContentProtectionElement(cp)).toBe(true);
 		expectXmlEqual(
@@ -331,6 +363,24 @@ describe('RepresentationXmlNode — addAudioInfo', () => {
 		);
 	});
 
+	// shaka: TEST(XmlNodeTest, AddDTSEAudioInfo)
+	test('DTS-E uses dts:2014 scheme with numChannels value (same as DTS-C)', () => {
+		const repr = new RepresentationXmlNode();
+		expect(repr.addAudioInfo({
+			codec: 'dtse',
+			samplingFrequency: 48000,
+			numChannels: 6,
+		})).toBe(true);
+		expectXmlEqual(
+			repr.toString(),
+			'<Representation audioSamplingRate="48000">'
+			+ '  <AudioChannelConfiguration'
+			+ '   schemeIdUri="tag:dts.com,2014:dash:audio_channel_configuration:2012"'
+			+ '   value="6"/>'
+			+ '</Representation>',
+		);
+	});
+
 	test('generic codec uses urn:mpeg:dash:23003:3 scheme with numChannels value', () => {
 		const repr = new RepresentationXmlNode();
 		expect(repr.addAudioInfo({
@@ -409,19 +459,88 @@ describe('RepresentationXmlNode — addVODOnlyInfo', () => {
 		);
 	});
 
-	test('text + presentationTimeOffset uses single-segment SegmentList with media= URL', () => {
+	test('text + presentationTimeOffset emits BaseURL + SegmentBase carrying the offset', () => {
 		const repr = new RepresentationXmlNode();
 		expect(repr.addVODOnlyInfo({
 			mediaFileUrl: 'subs.vtt',
 			textInfo: { codec: 'wvtt' },
-			presentationTimeOffset: 0,
+			presentationTimeOffset: 100,
 		}, false, 0)).toBe(true);
 		expectXmlEqual(
 			repr.toString(),
 			'<Representation>'
-			+ '  <SegmentList presentationTimeOffset="0">'
-			+ '    <SegmentURL media="subs.vtt"/>'
-			+ '  </SegmentList>'
+			+ '  <BaseURL>subs.vtt</BaseURL>'
+			+ '  <SegmentBase presentationTimeOffset="100"/>'
+			+ '</Representation>',
+		);
+	});
+
+	// shaka: TEST_F(OnDemandVODSegmentTest, TextInfoBaseUrl)
+	test('text track with no presentationTimeOffset emits BaseURL only', () => {
+		const repr = new RepresentationXmlNode();
+		expect(repr.addVODOnlyInfo({
+			mediaFileUrl: 'subtitle.xml',
+			textInfo: { codec: 'ttml' },
+		}, false, 100)).toBe(true);
+		expectXmlEqual(
+			repr.toString(),
+			'<Representation>'
+			+ '  <BaseURL>subtitle.xml</BaseURL>'
+			+ '</Representation>',
+		);
+	});
+
+	// shaka: TEST_F(OnDemandVODSegmentTest, TextInfoWithPresentationOffset)
+	test('text track with presentationTimeOffset emits BaseURL + SegmentBase', () => {
+		const repr = new RepresentationXmlNode();
+		expect(repr.addVODOnlyInfo({
+			mediaFileUrl: 'subtitle.xml',
+			textInfo: { codec: 'ttml' },
+			presentationTimeOffset: 100,
+		}, false, 100)).toBe(true);
+		expectXmlEqual(
+			repr.toString(),
+			'<Representation>'
+			+ '  <BaseURL>subtitle.xml</BaseURL>'
+			+ '  <SegmentBase presentationTimeOffset="100"/>'
+			+ '</Representation>',
+		);
+	});
+
+	// shaka: TEST_F(OnDemandVODSegmentTest, TextInfoVttWithPresentationOffset)
+	// Regression test for shaka-project/shaka-packager#1433: a VTT text track
+	// with a non-zero presentationTimeOffset (any period after the first) must
+	// produce BaseURL + SegmentBase, NOT SegmentList + SegmentURL.
+	test('VTT text track with presentationTimeOffset emits BaseURL + SegmentBase (#1433)', () => {
+		const repr = new RepresentationXmlNode();
+		expect(repr.addVODOnlyInfo({
+			mediaFileUrl: 'en-US.vtt',
+			textInfo: { codec: 'wvtt' },
+			presentationTimeOffset: 1283031,
+		}, false, 100)).toBe(true);
+		expectXmlEqual(
+			repr.toString(),
+			'<Representation>'
+			+ '  <BaseURL>en-US.vtt</BaseURL>'
+			+ '  <SegmentBase presentationTimeOffset="1283031"/>'
+			+ '</Representation>',
+		);
+	});
+
+	// shaka: TEST_F(OnDemandVODSegmentTest, TextInfoWithZeroPresentationOffset)
+	// PTO=0 is deliberately skipped by setPresentationTimeOffset (field stays
+	// unset), so the output must be identical to a text track with no PTO —
+	// a bare BaseURL, no SegmentBase.
+	test('text track with zero presentationTimeOffset emits BaseURL only', () => {
+		const repr = new RepresentationXmlNode();
+		expect(repr.addVODOnlyInfo({
+			mediaFileUrl: 'en-US.vtt',
+			textInfo: { codec: 'wvtt' },
+		}, false, 100)).toBe(true);
+		expectXmlEqual(
+			repr.toString(),
+			'<Representation>'
+			+ '  <BaseURL>en-US.vtt</BaseURL>'
 			+ '</Representation>',
 		);
 	});
@@ -450,6 +569,75 @@ describe('RepresentationXmlNode — addVODOnlyInfo', () => {
 			repr.toString(),
 			'<Representation>'
 			+ '  <BaseURL>a%20b/c.mp4</BaseURL>'
+			+ '</Representation>',
+		);
+	});
+
+	// shaka: TEST_F(OnDemandVODSegmentTest, SegmentBase)
+	test('SegmentBase carries indexRange + timescale + presentationTimeOffset + init range', () => {
+		const repr = new RepresentationXmlNode();
+		expect(repr.addVODOnlyInfo({
+			mediaFileUrl: 'encrypted_audio.mp4',
+			initRange: { begin: 0, end: 863 },
+			indexRange: { begin: 864, end: 931 },
+			referenceTimeScale: 44100,
+			presentationTimeOffset: 100,
+		}, false, 100)).toBe(true);
+		expectXmlEqual(
+			repr.toString(),
+			'<Representation>'
+			+ '<BaseURL>encrypted_audio.mp4</BaseURL>'
+			+ '<SegmentBase indexRange="864-931" timescale="44100" presentationTimeOffset="100">'
+			+ '<Initialization range="0-863"/>'
+			+ '</SegmentBase>'
+			+ '</Representation>',
+		);
+	});
+
+	// shaka: TEST_F(OnDemandVODSegmentTest, SegmentListWithoutUrls)
+	test('SegmentList without subsegments drops indexRange, computes duration', () => {
+		const repr = new RepresentationXmlNode();
+		expect(repr.addVODOnlyInfo({
+			mediaFileUrl: 'encrypted_audio.mp4',
+			initRange: { begin: 0, end: 863 },
+			indexRange: { begin: 864, end: 931 },
+			referenceTimeScale: 44100,
+			presentationTimeOffset: 100,
+		}, true, 100)).toBe(true);
+		expectXmlEqual(
+			repr.toString(),
+			'<Representation>'
+			+ '<BaseURL>encrypted_audio.mp4</BaseURL>'
+			+ '<SegmentList timescale="44100" duration="4410000" presentationTimeOffset="100">'
+			+ '<Initialization range="0-863"/>'
+			+ '</SegmentList>'
+			+ '</Representation>',
+		);
+	});
+
+	// shaka: TEST_F(OnDemandVODSegmentTest, SegmentUrlWithMediaRanges)
+	test('SegmentList emits one SegmentURL per subsegment range', () => {
+		const repr = new RepresentationXmlNode();
+		expect(repr.addVODOnlyInfo({
+			mediaFileUrl: 'encrypted_audio.mp4',
+			initRange: { begin: 0, end: 863 },
+			indexRange: { begin: 864, end: 931 },
+			referenceTimeScale: 44100,
+			presentationTimeOffset: 100,
+			subsegmentRanges: [
+				{ begin: 932, end: 9999 },
+				{ begin: 10000, end: 11000 },
+			],
+		}, true, 100)).toBe(true);
+		expectXmlEqual(
+			repr.toString(),
+			'<Representation>'
+			+ '<BaseURL>encrypted_audio.mp4</BaseURL>'
+			+ '<SegmentList timescale="44100" duration="4410000" presentationTimeOffset="100">'
+			+ '<Initialization range="0-863"/>'
+			+ '<SegmentURL mediaRange="932-9999"/>'
+			+ '<SegmentURL mediaRange="10000-11000"/>'
+			+ '</SegmentList>'
 			+ '</Representation>',
 		);
 	});
@@ -527,6 +715,154 @@ describe('RepresentationXmlNode — addLiveOnlyInfo', () => {
 			repr.toString(),
 			'<Representation>'
 			+ '  <SegmentTemplate timescale="90000" initialization="init.m4s"'
+			+ '                   media="$Number$.m4s" startNumber="1"/>'
+			+ '</Representation>',
+		);
+	});
+
+	// shaka: TEST_F(LiveSegmentTimelineTest, OneSegmentInfoMatchingStartTimeAndNumber)
+	// startTime 500 == duration 100 * (startNumber 6 - 1), so the timeline
+	// collapses to SegmentTemplate@duration.
+	test('OneSegmentInfoMatchingStartTimeAndNumber collapses to duration', () => {
+		const repr = new RepresentationXmlNode();
+		expect(repr.addLiveOnlyInfo(
+			{ segmentTemplateUrl: '$Number$.m4s' },
+			[{ startTime: 500, duration: 100, repeat: 9, startSegmentNumber: 6 }],
+			false,
+			false,
+			true, // segment_template_constant_duration
+		)).toBe(true);
+		expectXmlEqual(
+			repr.toString(),
+			'<Representation>'
+			+ '  <SegmentTemplate media="$Number$.m4s" startNumber="6" duration="100"/>'
+			+ '</Representation>',
+		);
+	});
+
+	// shaka: TEST_F(LiveSegmentTimelineTest, AllSegmentsSameDurationExpectLastOne)
+	// Two segment-infos where all but the last share a duration → collapses to
+	// SegmentTemplate@duration (the differing last segment is tolerated).
+	test('AllSegmentsSameDurationExpectLastOne collapses to duration', () => {
+		const repr = new RepresentationXmlNode();
+		expect(repr.addLiveOnlyInfo(
+			{ segmentTemplateUrl: '$Number$.m4s' },
+			[
+				{ startTime: 0, duration: 100, repeat: 9, startSegmentNumber: 1 },
+				{ startTime: 1000, duration: 200, repeat: 0, startSegmentNumber: 11 },
+			],
+			false,
+			false,
+			true, // segment_template_constant_duration
+		)).toBe(true);
+		expectXmlEqual(
+			repr.toString(),
+			'<Representation>'
+			+ '  <SegmentTemplate media="$Number$.m4s" startNumber="1" duration="100"/>'
+			+ '</Representation>',
+		);
+	});
+
+	// shaka: TEST_F(LiveSegmentTimelineTest, SecondSegmentInfoNonZeroRepeat)
+	// Last segment-info has repeat != 0, so it can't be the tolerated tail →
+	// falls back to a full SegmentTimeline.
+	test('SecondSegmentInfoNonZeroRepeat keeps SegmentTimeline', () => {
+		const repr = new RepresentationXmlNode();
+		expect(repr.addLiveOnlyInfo(
+			{ segmentTemplateUrl: '$Number$.m4s' },
+			[
+				{ startTime: 0, duration: 100, repeat: 9, startSegmentNumber: 1 },
+				{ startTime: 1000, duration: 200, repeat: 1, startSegmentNumber: 11 },
+			],
+			false,
+			false,
+			true, // segment_template_constant_duration
+		)).toBe(true);
+		expectXmlEqual(
+			repr.toString(),
+			'<Representation>'
+			+ '  <SegmentTemplate media="$Number$.m4s" startNumber="1">'
+			+ '    <SegmentTimeline>'
+			+ '      <S t="0" d="100" r="9"/>'
+			+ '      <S t="1000" d="200" r="1"/>'
+			+ '    </SegmentTimeline>'
+			+ '  </SegmentTemplate>'
+			+ '</Representation>',
+		);
+	});
+
+	// shaka: TEST_F(LiveSegmentTimelineTest, TwoSegmentInfoWithGap)
+	// A gap between the two segment-infos means the last segment's start time
+	// doesn't line up, so the timeline can't collapse.
+	test('TwoSegmentInfoWithGap keeps SegmentTimeline', () => {
+		const repr = new RepresentationXmlNode();
+		expect(repr.addLiveOnlyInfo(
+			{ segmentTemplateUrl: '$Number$.m4s' },
+			[
+				{ startTime: 0, duration: 100, repeat: 9, startSegmentNumber: 1 },
+				{ startTime: 1100, duration: 200, repeat: 0, startSegmentNumber: 11 },
+			],
+			false,
+			false,
+			true, // segment_template_constant_duration
+		)).toBe(true);
+		expectXmlEqual(
+			repr.toString(),
+			'<Representation>'
+			+ '  <SegmentTemplate media="$Number$.m4s" startNumber="1">'
+			+ '    <SegmentTimeline>'
+			+ '      <S t="0" d="100" r="9"/>'
+			+ '      <S t="1100" d="200"/>'
+			+ '    </SegmentTimeline>'
+			+ '  </SegmentTemplate>'
+			+ '</Representation>',
+		);
+	});
+
+	// shaka: TEST_F(LiveSegmentTimelineTest, LastSegmentNumberSupplementalProperty)
+	// dash_add_last_segment_number_when_needed flag emits a dashif
+	// last-segment-number SupplementalProperty (value = highest segment number).
+	test('LastSegmentNumberSupplementalProperty adds dashif last-segment-number', () => {
+		const repr = new RepresentationXmlNode();
+		expect(repr.addLiveOnlyInfo(
+			{ segmentTemplateUrl: '$Number$.m4s' },
+			[{ startTime: 0, duration: 100, repeat: 9, startSegmentNumber: 1 }],
+			false,
+			true, // dash_add_last_segment_number_when_needed
+			true, // segment_template_constant_duration
+		)).toBe(true);
+		expectXmlEqual(
+			repr.toString(),
+			'<Representation>'
+			+ '<SupplementalProperty schemeIdUri="http://dashif.org/guidelines/last-segment-number" value="10"/>'
+			+ '  <SegmentTemplate media="$Number$.m4s" startNumber="1" duration="100"/>'
+			+ '</Representation>',
+		);
+	});
+
+	// shaka: TEST_F(LowLatencySegmentTest, LowLatencySegmentTemplate)
+	// availabilityTimeOffset is rounded to 6 decimals (4.9750987314 → 4.975099);
+	// low-latency mode skips the SegmentTimeline entirely.
+	test('LowLatencySegmentTemplate rounds availabilityTimeOffset to 6 decimals', () => {
+		const repr = new RepresentationXmlNode();
+		expect(repr.addLiveOnlyInfo(
+			{
+				initSegmentUrl: 'init.m4s',
+				segmentTemplateUrl: '$Number$.m4s',
+				referenceTimeScale: 90000,
+				availabilityTimeOffset: 4.9750987314,
+				segmentDuration: 450000,
+			},
+			[{ startTime: 1, duration: 100, repeat: 0, startSegmentNumber: 1 }],
+			true,
+		)).toBe(true);
+		expectXmlEqual(
+			repr.toString(),
+			'<Representation>'
+			+ '  <SegmentTemplate timescale="90000" duration="450000"'
+			+ '                   availabilityTimeOffset="4.975099"'
+			+ '                   availabilityTimeComplete="false"'
+			+ '                   initialization="init.m4s"'
 			+ '                   media="$Number$.m4s" startNumber="1"/>'
 			+ '</Representation>',
 		);

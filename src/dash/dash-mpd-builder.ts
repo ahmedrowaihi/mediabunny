@@ -559,9 +559,12 @@ export class MpdBuilder {
 	 * @internal
 	 */
 	private getStaticMpdDuration(): number {
+		// Shaka accumulates in a C++ `float` (float32); each `+=` of a
+		// `double` period duration narrows back to float32. `Math.fround`
+		// mirrors that per-addition rounding.
 		let total = 0;
 		for (const period of this.periods) {
-			total += period.durationSeconds();
+			total = Math.fround(total + period.durationSeconds());
 		}
 		return total;
 	}
@@ -628,7 +631,23 @@ export class MpdBuilder {
 			}
 
 			if (earliestStart === null || latestEnd === null) {
-				return;
+				// No segment timestamps were found for this period. This happens for
+				// periods 1+ in multi-period on-demand DASH when representations are
+				// created via copy — the copy does not carry segment infos, so
+				// getStartAndEndTimestamps() returns null for all copied representations.
+				//
+				// Fall back to the period's own start time (set from the cue event
+				// timestamp that triggered the period boundary) as the
+				// presentationTimeOffset for every representation in this period, so
+				// that players know which byte-offset within the shared single-file
+				// asset to begin reading from.
+				const periodStartTime = period.startTimeSeconds();
+				for (const adaptationSet of period.getAdaptationSets()) {
+					for (const rep of adaptationSet.getRepresentations()) {
+						rep.setPresentationTimeOffset(periodStartTime);
+					}
+				}
+				continue;
 			}
 
 			period.setDurationSeconds(latestEnd - earliestStart);

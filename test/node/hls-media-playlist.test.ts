@@ -647,3 +647,526 @@ describe('MediaPlaylist — VIDEO-RANGE', () => {
 		expect(p.getVideoRange()).toBe('HLG');
 	});
 });
+
+describe('MediaPlaylist — EXT-X-START:TIME-OFFSET', () => {
+	// shaka: TEST_F(MediaPlaylistSingleSegmentTest, StartTimeEmpty)
+	test('omits the tag entirely when start-time offset is undefined', () => {
+		const p = new MediaPlaylist(vodParams(), 'media.m3u8', 'video', 'group');
+		p.setMediaInfo(videoMediaInfo());
+		expect(p.build({ endStream: true })).toBe(
+			'#EXTM3U\n'
+			+ '#EXT-X-VERSION:6\n'
+			+ `${SHAKA_BANNER}\n`
+			+ '#EXT-X-TARGETDURATION:0\n'
+			+ '#EXT-X-PLAYLIST-TYPE:VOD\n'
+			+ '#EXT-X-ENDLIST\n',
+		);
+	});
+
+	// shaka: TEST_F(MediaPlaylistSingleSegmentTest, StartTimeZero)
+	test('emits 0.000000 (printf %f) for a zero offset', () => {
+		const p = new MediaPlaylist({ ...vodParams(), startTimeOffset: 0 }, 'media.m3u8', 'video', 'group');
+		p.setMediaInfo(videoMediaInfo());
+		expect(p.build({ endStream: true })).toBe(
+			'#EXTM3U\n'
+			+ '#EXT-X-VERSION:6\n'
+			+ `${SHAKA_BANNER}\n`
+			+ '#EXT-X-TARGETDURATION:0\n'
+			+ '#EXT-X-PLAYLIST-TYPE:VOD\n'
+			+ '#EXT-X-START:TIME-OFFSET=0.000000\n'
+			+ '#EXT-X-ENDLIST\n',
+		);
+	});
+
+	// shaka: TEST_F(MediaPlaylistSingleSegmentTest, StartTimePositive)
+	test('emits 20.000000 for a positive offset', () => {
+		const p = new MediaPlaylist({ ...vodParams(), startTimeOffset: 20 }, 'media.m3u8', 'video', 'group');
+		p.setMediaInfo(videoMediaInfo());
+		expect(p.build({ endStream: true })).toBe(
+			'#EXTM3U\n'
+			+ '#EXT-X-VERSION:6\n'
+			+ `${SHAKA_BANNER}\n`
+			+ '#EXT-X-TARGETDURATION:0\n'
+			+ '#EXT-X-PLAYLIST-TYPE:VOD\n'
+			+ '#EXT-X-START:TIME-OFFSET=20.000000\n'
+			+ '#EXT-X-ENDLIST\n',
+		);
+	});
+
+	// shaka: TEST_F(MediaPlaylistSingleSegmentTest, StartTimeNegative)
+	test('emits -3.141590 for a negative fractional offset', () => {
+		const p = new MediaPlaylist({ ...vodParams(), startTimeOffset: -3.14159 }, 'media.m3u8', 'video', 'group');
+		p.setMediaInfo(videoMediaInfo());
+		expect(p.build({ endStream: true })).toBe(
+			'#EXTM3U\n'
+			+ '#EXT-X-VERSION:6\n'
+			+ `${SHAKA_BANNER}\n`
+			+ '#EXT-X-TARGETDURATION:0\n'
+			+ '#EXT-X-PLAYLIST-TYPE:VOD\n'
+			+ '#EXT-X-START:TIME-OFFSET=-3.141590\n'
+			+ '#EXT-X-ENDLIST\n',
+		);
+	});
+});
+
+describe('MediaPlaylist — GetLanguage', () => {
+	// shaka: TEST_F(MediaPlaylistMultiSegmentTest, GetLanguage)
+	const audioMediaInfo = (language: string): HlsMediaInfo => ({
+		audioInfo: { codec: 'mp4a.40.2', timeScale: TIME_SCALE, numChannels: 2, language },
+		containerType: 'mp4',
+	});
+
+	test('reduces a long-form code to its short form (eng → en)', () => {
+		const p = new MediaPlaylist(vodParams(), 'media.m3u8', 'audio', 'group');
+		expect(p.setMediaInfo(audioMediaInfo('eng'))).toBe(true);
+		expect(p.getLanguage()).toBe('en');
+	});
+
+	test('preserves the region subtag (eng-US → en-US)', () => {
+		const p = new MediaPlaylist(vodParams(), 'media.m3u8', 'audio', 'group');
+		expect(p.setMediaInfo(audioMediaInfo('eng-US'))).toBe(true);
+		expect(p.getLanguage()).toBe('en-US');
+	});
+
+	test('passes through a code with no short form (apa → apa)', () => {
+		const p = new MediaPlaylist(vodParams(), 'media.m3u8', 'audio', 'group');
+		expect(p.setMediaInfo(audioMediaInfo('apa'))).toBe(true);
+		expect(p.getLanguage()).toBe('apa');
+	});
+});
+
+// shaka: LiveMediaPlaylistTest (media_playlist_unittest.cc). kTimeShiftBufferDepth = 20.
+const TIME_SHIFT_BUFFER_DEPTH = 20;
+
+const liveParams = (overrides: Partial<HlsParams> = {}): HlsParams => ({
+	playlistType: 'live',
+	timeShiftBufferDepth: TIME_SHIFT_BUFFER_DEPTH,
+	...generatorBanner(),
+	...overrides,
+});
+
+describe('MediaPlaylist — live sliding window', () => {
+	// shaka: TEST_F(LiveMediaPlaylistTest, Basic)
+	test('does not slide while the buffer stays within timeShiftBufferDepth', () => {
+		const p = new MediaPlaylist(liveParams(), 'media.m3u8', 'video', 'group');
+		p.setMediaInfo(videoMediaInfo({ segmentTemplateUrl: 'file$Number$.ts' }));
+		p.addSegment('file1.ts', 0, 10 * TIME_SCALE, 0, MBYTES);
+		p.addSegment('file2.ts', 10 * TIME_SCALE, 20 * TIME_SCALE, 0, 2 * MBYTES);
+
+		expect(p.build({})).toBe(
+			'#EXTM3U\n'
+			+ '#EXT-X-VERSION:6\n'
+			+ `${SHAKA_BANNER}\n`
+			+ '#EXT-X-TARGETDURATION:20\n'
+			+ '#EXTINF:10.000,\n'
+			+ 'file1.ts\n'
+			+ '#EXTINF:20.000,\n'
+			+ 'file2.ts\n',
+		);
+	});
+
+	// shaka: TEST_F(LiveMediaPlaylistTest, TimeShifted)
+	test('drops the oldest segment and advances EXT-X-MEDIA-SEQUENCE', () => {
+		const p = new MediaPlaylist(liveParams(), 'media.m3u8', 'video', 'group');
+		p.setMediaInfo(videoMediaInfo({ segmentTemplateUrl: 'file$Number$.ts' }));
+		p.addSegment('file1.ts', 0, 10 * TIME_SCALE, 0, MBYTES);
+		p.addSegment('file2.ts', 10 * TIME_SCALE, 20 * TIME_SCALE, 0, 2 * MBYTES);
+		p.addSegment('file3.ts', 30 * TIME_SCALE, 20 * TIME_SCALE, 0, 2 * MBYTES);
+
+		expect(p.build({})).toBe(
+			'#EXTM3U\n'
+			+ '#EXT-X-VERSION:6\n'
+			+ `${SHAKA_BANNER}\n`
+			+ '#EXT-X-TARGETDURATION:20\n'
+			+ '#EXT-X-MEDIA-SEQUENCE:1\n'
+			+ '#EXTINF:20.000,\n'
+			+ 'file2.ts\n'
+			+ '#EXTINF:20.000,\n'
+			+ 'file3.ts\n',
+		);
+	});
+
+	// shaka: TEST_F(LiveMediaPlaylistTest, TimeShiftedWithEncryptionInfo)
+	test('preserves leading EXT-X-KEYs at the front after sliding', () => {
+		const p = new MediaPlaylist(liveParams(), 'media.m3u8', 'video', 'group');
+		p.setMediaInfo(videoMediaInfo({ segmentTemplateUrl: 'file$Number$.ts' }));
+		p.addEncryptionInfo({
+			method: 'SAMPLE-AES',
+			url: 'http://example.com',
+			iv: '0x12345678',
+			keyFormat: 'com.widevine',
+			keyFormatVersions: '1/2/4',
+		});
+		p.addEncryptionInfo({
+			method: 'SAMPLE-AES',
+			url: 'http://mydomain.com',
+			keyId: '0xfedc',
+			iv: '0x12345678',
+			keyFormat: 'com.widevine.someother',
+			keyFormatVersions: '1',
+		});
+		p.addSegment('file1.ts', 0, 10 * TIME_SCALE, 0, MBYTES);
+		p.addSegment('file2.ts', 10 * TIME_SCALE, 20 * TIME_SCALE, 0, 2 * MBYTES);
+		p.addSegment('file3.ts', 30 * TIME_SCALE, 20 * TIME_SCALE, 0, 2 * MBYTES);
+
+		expect(p.build({})).toBe(
+			'#EXTM3U\n'
+			+ '#EXT-X-VERSION:6\n'
+			+ `${SHAKA_BANNER}\n`
+			+ '#EXT-X-TARGETDURATION:20\n'
+			+ '#EXT-X-MEDIA-SEQUENCE:1\n'
+			+ '#EXT-X-KEY:METHOD=SAMPLE-AES,URI="http://example.com",IV=0x12345678,KEYFORMATVERSIONS="1/2/4",KEYFORMAT="com.widevine"\n'
+			+ '#EXT-X-KEY:METHOD=SAMPLE-AES,URI="http://mydomain.com",KEYID=0xfedc,IV=0x12345678,KEYFORMATVERSIONS="1",KEYFORMAT="com.widevine.someother"\n'
+			+ '#EXTINF:20.000,\n'
+			+ 'file2.ts\n'
+			+ '#EXTINF:20.000,\n'
+			+ 'file3.ts\n',
+		);
+	});
+
+	// shaka: TEST_F(LiveMediaPlaylistTest, TimeShiftedWithEncryptionInfoShifted)
+	test('advances EXT-X-DISCONTINUITY-SEQUENCE as the leading discontinuity slides out', () => {
+		const p = new MediaPlaylist(liveParams(), 'media.m3u8', 'video', 'group');
+		p.setMediaInfo(videoMediaInfo({ segmentTemplateUrl: 'file$Number$.ts' }));
+		p.addSegment('file1.ts', 0, 10 * TIME_SCALE, 0, MBYTES);
+
+		p.addEncryptionInfo({
+			method: 'SAMPLE-AES',
+			url: 'http://example.com',
+			iv: '0x12345678',
+			keyFormat: 'com.widevine',
+			keyFormatVersions: '1/2/4',
+		});
+		p.addEncryptionInfo({
+			method: 'SAMPLE-AES',
+			url: 'http://mydomain.com',
+			keyId: '0xfedc',
+			iv: '0x12345678',
+			keyFormat: 'com.widevine.someother',
+			keyFormatVersions: '1',
+		});
+		p.addSegment('file2.ts', 10 * TIME_SCALE, 20 * TIME_SCALE, 0, 2 * MBYTES);
+
+		p.addEncryptionInfo({
+			method: 'SAMPLE-AES',
+			url: 'http://example.com',
+			iv: '0x22345678',
+			keyFormat: 'com.widevine',
+			keyFormatVersions: '1/2/4',
+		});
+		p.addEncryptionInfo({
+			method: 'SAMPLE-AES',
+			url: 'http://mydomain.com',
+			keyId: '0xfedd',
+			iv: '0x22345678',
+			keyFormat: 'com.widevine.someother',
+			keyFormatVersions: '1',
+		});
+		p.addSegment('file3.ts', 30 * TIME_SCALE, 20 * TIME_SCALE, 0, 2 * MBYTES);
+
+		p.addEncryptionInfo({
+			method: 'SAMPLE-AES',
+			url: 'http://example.com',
+			iv: '0x32345678',
+			keyFormat: 'com.widevine',
+			keyFormatVersions: '1/2/4',
+		});
+		p.addEncryptionInfo({
+			method: 'SAMPLE-AES',
+			url: 'http://mydomain.com',
+			keyId: '0xfede',
+			iv: '0x32345678',
+			keyFormat: 'com.widevine.someother',
+			keyFormatVersions: '1',
+		});
+		p.addSegment('file4.ts', 50 * TIME_SCALE, 20 * TIME_SCALE, 0, 2 * MBYTES);
+
+		expect(p.build({})).toBe(
+			'#EXTM3U\n'
+			+ '#EXT-X-VERSION:6\n'
+			+ `${SHAKA_BANNER}\n`
+			+ '#EXT-X-TARGETDURATION:20\n'
+			+ '#EXT-X-MEDIA-SEQUENCE:2\n'
+			+ '#EXT-X-DISCONTINUITY-SEQUENCE:1\n'
+			+ '#EXT-X-KEY:METHOD=SAMPLE-AES,URI="http://example.com",IV=0x22345678,KEYFORMATVERSIONS="1/2/4",KEYFORMAT="com.widevine"\n'
+			+ '#EXT-X-KEY:METHOD=SAMPLE-AES,URI="http://mydomain.com",KEYID=0xfedd,IV=0x22345678,KEYFORMATVERSIONS="1",KEYFORMAT="com.widevine.someother"\n'
+			+ '#EXTINF:20.000,\n'
+			+ 'file3.ts\n'
+			+ '#EXT-X-KEY:METHOD=SAMPLE-AES,URI="http://example.com",IV=0x32345678,KEYFORMATVERSIONS="1/2/4",KEYFORMAT="com.widevine"\n'
+			+ '#EXT-X-KEY:METHOD=SAMPLE-AES,URI="http://mydomain.com",KEYID=0xfede,IV=0x32345678,KEYFORMATVERSIONS="1",KEYFORMAT="com.widevine.someother"\n'
+			+ '#EXTINF:20.000,\n'
+			+ 'file4.ts\n',
+		);
+	});
+});
+
+// shaka: MediaPlaylistDeleteSegmentsTest (TEST_P over $Number$ and $Time$ templates).
+// shaka's RemoveOldSegment deletes the file; this port has no filesystem, so it
+// hands names to getSegmentsToBeRemoved() and drops the front once the preserved
+// count is exceeded (that drop is our "deletion"). shaka uses media_info.segment_template
+// for the name; we only track segmentTemplateUrl, so it carries the "memory://…" template.
+describe('MediaPlaylist — segment deletion (live window)', () => {
+	const PRESERVED = 3;
+	const DURATION = TIME_SCALE; // one-second segments (kDuration == kTimeScale)
+	// kMaxNumSegmentsAvailable = timeShiftBufferDepth + 1 + preserved
+	const MAX_AVAILABLE = TIME_SHIFT_BUFFER_DEPTH + 1 + PRESERVED;
+
+	const templates = [
+		{ name: 'by $Number$', template: 'memory://$Number$.mp4' },
+		{ name: 'by $Time$', template: 'memory://$Time$.mp4' },
+	];
+
+	// Mirrors shaka's GetSegmentName: $Time$ → start time, else 1-based number.
+	const segName = (template: string, index: number): string =>
+		template.includes('$Time$')
+			? `memory://${index * DURATION}.mp4`
+			: `memory://${index + 1}.mp4`;
+
+	const build = (template: string, numSegments: number): MediaPlaylist => {
+		const p = new MediaPlaylist(
+			liveParams({ preservedSegmentsOutsideLiveWindow: PRESERVED }),
+			'media.m3u8',
+			'video',
+			'group',
+		);
+		p.setMediaInfo(videoMediaInfo({ segmentTemplateUrl: template }));
+		for (let i = 0; i < numSegments; i++) {
+			p.addSegment('ignored_segment_name', i * DURATION, DURATION, 0, MBYTES);
+		}
+		return p;
+	};
+
+	// The preserved buffer after N segments holds the last PRESERVED segments that
+	// have left the window: indices [N - MAX_AVAILABLE, N - MAX_AVAILABLE + PRESERVED).
+	const expectedPreserved = (template: string, numSegments: number): string[] => {
+		const firstPreservedIndex = numSegments - MAX_AVAILABLE;
+		return Array.from(
+			{ length: PRESERVED },
+			(_, k) => segName(template, firstPreservedIndex + k),
+		);
+	};
+
+	for (const { name, template } of templates) {
+		// shaka: TEST_P(MediaPlaylistDeleteSegmentsTest, NoSegmentsDeletedInitially)
+		test(`nothing is deleted until more than kMaxNumSegmentsAvailable exist (${name})`, () => {
+			const p = build(template, MAX_AVAILABLE);
+			// All that slid out are still preserved — none dropped/deleted.
+			expect(p.getSegmentsToBeRemoved()).toEqual(expectedPreserved(template, MAX_AVAILABLE));
+		});
+
+		// shaka: TEST_P(MediaPlaylistDeleteSegmentsTest, OneSegmentDeleted)
+		test(`the first segment is dropped once the buffer overflows (${name})`, () => {
+			const p = build(template, MAX_AVAILABLE + 1);
+			const removed = p.getSegmentsToBeRemoved();
+			expect(removed).toEqual(expectedPreserved(template, MAX_AVAILABLE + 1));
+			expect(removed).not.toContain(segName(template, 0)); // deleted
+			expect(removed).toContain(segName(template, 1)); // still preserved
+		});
+
+		// shaka: TEST_P(MediaPlaylistDeleteSegmentsTest, ManySegments)
+		test(`only the newest preserved segments remain after many (${name})`, () => {
+			const many = 50;
+			const p = build(template, many);
+			const lastAvailableIndex = many - MAX_AVAILABLE;
+			const removed = p.getSegmentsToBeRemoved();
+			expect(removed).toEqual(expectedPreserved(template, many));
+			expect(removed).not.toContain(segName(template, lastAvailableIndex - 1)); // deleted
+			expect(removed).toContain(segName(template, lastAvailableIndex)); // still preserved
+		});
+
+		// shaka: TEST_P(MediaPlaylistDeleteSegmentsTest, FileAlreadyDeleted)
+		// With no filesystem the drop is unconditional, so deletion is never blocked
+		// by an already-missing file — the outcome shaka asserts holds by construction.
+		test(`dropping is not blocked when segments overflow further (${name})`, () => {
+			const p = build(template, MAX_AVAILABLE + 2);
+			const removed = p.getSegmentsToBeRemoved();
+			expect(removed).toEqual(expectedPreserved(template, MAX_AVAILABLE + 2));
+			expect(removed).not.toContain(segName(template, 1)); // deleted, not blocked
+		});
+	}
+});
+
+describe('MediaPlaylist — audio codec-specific getters', () => {
+	// shaka: TEST_F(MediaPlaylistMultiSegmentTest, GetNumChannels)
+	test('GetNumChannels returns 0 when not audio, else the channel count', () => {
+		const p = new MediaPlaylist(vodParams(), 'media.m3u8', 'audio', 'group');
+		// Returns 0 by default (no media info set yet).
+		expect(p.getNumChannels()).toBe(0);
+
+		expect(p.setMediaInfo({
+			audioInfo: { codec: 'mp4a.40.2', timeScale: TIME_SCALE, numChannels: 2 },
+			referenceTimeScale: TIME_SCALE,
+		})).toBe(true);
+		expect(p.getNumChannels()).toBe(2);
+
+		expect(p.setMediaInfo({
+			audioInfo: { codec: 'mp4a.40.2', timeScale: TIME_SCALE, numChannels: 8 },
+			referenceTimeScale: TIME_SCALE,
+		})).toBe(true);
+		expect(p.getNumChannels()).toBe(8);
+	});
+
+	// shaka: TEST_F(MediaPlaylistMultiSegmentTest, GetEC3JocComplexity)
+	test('GetEC3JocComplexity returns 0 when not audio, else the EC-3 JOC complexity', () => {
+		const p = new MediaPlaylist(vodParams(), 'media.m3u8', 'audio', 'group');
+		expect(p.getEC3JocComplexity()).toBe(0);
+
+		expect(p.setMediaInfo({
+			audioInfo: { codec: 'ec-3', timeScale: TIME_SCALE, numChannels: 6, codecSpecificData: { ec3JocComplexity: 16 } },
+			referenceTimeScale: TIME_SCALE,
+		})).toBe(true);
+		expect(p.getEC3JocComplexity()).toBe(16);
+
+		expect(p.setMediaInfo({
+			audioInfo: { codec: 'ec-3', timeScale: TIME_SCALE, numChannels: 6, codecSpecificData: { ec3JocComplexity: 6 } },
+			referenceTimeScale: TIME_SCALE,
+		})).toBe(true);
+		expect(p.getEC3JocComplexity()).toBe(6);
+	});
+
+	// shaka: TEST_F(MediaPlaylistMultiSegmentTest, GetAC4ImsFlag)
+	test('GetAC4ImsFlag returns false when not audio, else the AC-4 IMS flag', () => {
+		const p = new MediaPlaylist(vodParams(), 'media.m3u8', 'audio', 'group');
+		expect(p.getAC4ImsFlag()).toBe(false);
+
+		expect(p.setMediaInfo({
+			audioInfo: { codec: 'ac-4', timeScale: TIME_SCALE, numChannels: 2, codecSpecificData: { ac4ImsFlag: false } },
+			referenceTimeScale: TIME_SCALE,
+		})).toBe(true);
+		expect(p.getAC4ImsFlag()).toBe(false);
+
+		expect(p.setMediaInfo({
+			audioInfo: { codec: 'ac-4', timeScale: TIME_SCALE, numChannels: 2, codecSpecificData: { ac4ImsFlag: true } },
+			referenceTimeScale: TIME_SCALE,
+		})).toBe(true);
+		expect(p.getAC4ImsFlag()).toBe(true);
+	});
+
+	// shaka: TEST_F(MediaPlaylistMultiSegmentTest, GetAC4CbiFlag)
+	test('GetAC4CbiFlag returns false when not audio, else the AC-4 CBI flag', () => {
+		const p = new MediaPlaylist(vodParams(), 'media.m3u8', 'audio', 'group');
+		expect(p.getAC4CbiFlag()).toBe(false);
+
+		expect(p.setMediaInfo({
+			audioInfo: { codec: 'ac-4', timeScale: TIME_SCALE, numChannels: 6, codecSpecificData: { ac4CbiFlag: false } },
+			referenceTimeScale: TIME_SCALE,
+		})).toBe(true);
+		expect(p.getAC4CbiFlag()).toBe(false);
+
+		expect(p.setMediaInfo({
+			audioInfo: { codec: 'ac-4', timeScale: TIME_SCALE, numChannels: 6, codecSpecificData: { ac4CbiFlag: true } },
+			referenceTimeScale: TIME_SCALE,
+		})).toBe(true);
+		expect(p.getAC4CbiFlag()).toBe(true);
+	});
+});
+
+describe('MediaPlaylist — characteristics', () => {
+	// shaka: TEST_F(MediaPlaylistMultiSegmentTest, Characteristics)
+	test('returns the CHARACTERISTICS attribute values in order', () => {
+		const p = new MediaPlaylist(vodParams(), 'media.m3u8', 'video', 'group');
+		const characteristics = ['some.characteristic', 'another.characteristic'];
+		expect(p.setMediaInfo({
+			referenceTimeScale: TIME_SCALE,
+			hlsCharacteristics: characteristics,
+		})).toBe(true);
+		expect(p.getCharacteristics()).toEqual(characteristics);
+	});
+});
+
+describe('MediaPlaylist — bitrate & duration accessors', () => {
+	// shaka: TEST_F(MediaPlaylistMultiSegmentTest, UseBitrateInMediaInfo)
+	test('MaxBitrate uses the bandwidth supplied in media info', () => {
+		const p = new MediaPlaylist(vodParams(), 'media.m3u8', 'video', 'group');
+		expect(p.setMediaInfo(videoMediaInfo({ segmentTemplateUrl: 'file$Number$.ts', bandwidth: 8191 }))).toBe(true);
+		expect(p.getMaxBitrate()).toBe(8191);
+	});
+
+	// shaka: TEST_F(MediaPlaylistMultiSegmentTest, GetBitrateFromSegments)
+	test('MaxBitrate/AvgBitrate are computed from segments when no bandwidth is set', () => {
+		const p = new MediaPlaylist(vodParams(), 'media.m3u8', 'video', 'group');
+		expect(p.setMediaInfo(videoMediaInfo({ segmentTemplateUrl: 'file$Number$.ts' }))).toBe(true);
+		p.addSegment('file1.ts', 0, 10 * TIME_SCALE, 0, MBYTES);
+		p.addSegment('file2.ts', 10 * TIME_SCALE, 20 * TIME_SCALE, 0, 5 * MBYTES);
+		expect(p.getMaxBitrate()).toBe(2000000);
+		expect(p.getAvgBitrate()).toBe(1600000);
+	});
+
+	// shaka: TEST_F(MediaPlaylistMultiSegmentTest, GetLongestSegmentDuration)
+	test('GetLongestSegmentDuration returns the longest EXTINF duration seen', () => {
+		const p = new MediaPlaylist(vodParams(), 'media.m3u8', 'video', 'group');
+		expect(p.setMediaInfo(videoMediaInfo({ segmentTemplateUrl: 'file$Number$.ts' }))).toBe(true);
+		p.addSegment('file1.ts', 0, 10 * TIME_SCALE, 0, MBYTES);
+		p.addSegment('file2.ts', 10 * TIME_SCALE, 30 * TIME_SCALE, 0, 5 * MBYTES);
+		p.addSegment('file3.ts', 40 * TIME_SCALE, 14 * TIME_SCALE, 0, 3 * MBYTES);
+		expect(p.getLongestSegmentDuration()).toBeCloseTo(30.0, 2);
+	});
+
+	// shaka: TEST_F(MediaPlaylistMultiSegmentTest, SetTargetDuration)
+	test('SetTargetDuration overrides the auto-computed EXT-X-TARGETDURATION', () => {
+		const p = new MediaPlaylist(vodParams(), 'media.m3u8', 'video', 'group');
+		p.setMediaInfo(videoMediaInfo({ segmentTemplateUrl: 'file$Number$.ts' }));
+		p.setTargetDuration(20);
+		expect(p.build({ endStream: true })).toBe(
+			'#EXTM3U\n'
+			+ '#EXT-X-VERSION:6\n'
+			+ `${SHAKA_BANNER}\n`
+			+ '#EXT-X-TARGETDURATION:20\n'
+			+ '#EXT-X-PLAYLIST-TYPE:VOD\n'
+			+ '#EXT-X-ENDLIST\n',
+		);
+	});
+});
+
+describe('MediaPlaylist — AdjustVideoCodec', () => {
+	// shaka: TEST_P(MediaPlaylistCodecTest, AdjustVideoCodec)
+	const codecRows: [input: string, expected: string][] = [
+		['avc1.4d401e', 'avc1.4d401e'],
+		// Replace avc3 with avc1.
+		['avc3.4d401e', 'avc1.4d401e'],
+		['hvc1.2.4.L63.90', 'hvc1.2.4.L63.90'],
+		// Replace hev1 with hvc1.
+		['hev1.2.4.L63.90', 'hvc1.2.4.L63.90'],
+		['dvh1.05.08', 'dvh1.05.08'],
+		// Replace dvhe with dvh1.
+		['dvhe.05.08', 'dvh1.05.08'],
+	];
+
+	for (const [input, expected] of codecRows) {
+		test(`${input} → ${expected}`, () => {
+			const p = new MediaPlaylist(vodParams(), 'media.m3u8', 'video', 'group');
+			expect(p.setMediaInfo(videoMediaInfo({
+				videoInfo: { codec: input, width: 1920, height: 1080, timeScale: TIME_SCALE },
+			}))).toBe(true);
+			expect(p.getCodec()).toBe(expected);
+		});
+	}
+});
+
+describe('MediaPlaylist — EXT-X-MAP init segment', () => {
+	// shaka: TEST_F(MediaPlaylistMultiSegmentTest, InitSegment)
+	test('emits #EXT-X-MAP with URI only (no BYTERANGE) for a standalone init segment', () => {
+		const p = new MediaPlaylist(vodParams(), 'media.m3u8', 'video', 'group');
+		p.setMediaInfo(videoMediaInfo({
+			referenceTimeScale: TIME_SCALE,
+			segmentTemplateUrl: 'file$Number$.ts',
+			initSegmentUrl: 'init_segment.mp4',
+		}));
+		p.addSegment('file1.mp4', 0, 10 * TIME_SCALE, 0, MBYTES);
+		p.addSegment('file2.mp4', 10 * TIME_SCALE, 30 * TIME_SCALE, 0, 5 * MBYTES);
+
+		expect(p.build({ endStream: true })).toBe(
+			'#EXTM3U\n'
+			+ '#EXT-X-VERSION:6\n'
+			+ `${SHAKA_BANNER}\n`
+			+ '#EXT-X-TARGETDURATION:30\n'
+			+ '#EXT-X-PLAYLIST-TYPE:VOD\n'
+			+ '#EXT-X-MAP:URI="init_segment.mp4"\n'
+			+ '#EXTINF:10.000,\n'
+			+ 'file1.mp4\n'
+			+ '#EXTINF:30.000,\n'
+			+ 'file2.mp4\n'
+			+ '#EXT-X-ENDLIST\n',
+		);
+	});
+});

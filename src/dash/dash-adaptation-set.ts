@@ -13,7 +13,7 @@
  */
 
 import type { ContentProtectionElement } from './dash-content-protection';
-import type { MediaInfo, ProtectedContent, VideoInfo } from './dash-media-info';
+import type { ContentProtectionEntry, MediaInfo, ProtectedContent, VideoInfo } from './dash-media-info';
 import {
 	getBaseCodec,
 	removeDuplicateAttributes,
@@ -201,21 +201,61 @@ const addPictureAspectRatio = (videoInfo: VideoInfo, pictureAspectRatio: Set<str
 type SegmentAlignmentStatus = 'unknown' | 'true' | 'false';
 
 /**
+ * Compare two optional proto `bytes` fields the way proto serialization does:
+ * an absent field never serializes the same as a present one (proto2 presence),
+ * and two present fields are equal iff their bytes match in order.
+ *
+ * @internal
+ */
+const optionalBytesEq = (a: Uint8Array | undefined, b: Uint8Array | undefined): boolean => {
+	if ((a === undefined) !== (b === undefined)) {
+		return false;
+	}
+	if (a === undefined || b === undefined) {
+		return true;
+	}
+	if (a.length !== b.length) {
+		return false;
+	}
+	for (let i = 0; i < a.length; i++) {
+		if (a[i] !== b[i]) {
+			return false;
+		}
+	}
+	return true;
+};
+
+/**
+ * Compare two `ContentProtectionEntry` proto messages field-by-field. Every
+ * field (uuid, nameVersion, pssh) must be equal, including proto2 presence.
+ *
+ * @internal
+ */
+const contentProtectionEntryEq = (a: ContentProtectionEntry, b: ContentProtectionEntry): boolean => {
+	return a.uuid === b.uuid
+		&& a.nameVersion === b.nameVersion
+		&& optionalBytesEq(a.pssh, b.pssh);
+};
+
+/**
  * Compare two `ProtectedContent` blocks for equality. Mirrors shaka's
- * `ProtectedContentEq` (which serializes proto messages to compare). Here we
- * compare structural shape: the set of UUIDs and PSSHs is enough for the
- * AdaptationSet matching logic shaka actually uses.
+ * `ProtectedContentEq`, which compares `a.SerializeAsString() ==
+ * b.SerializeAsString()` — i.e. two `ProtectedContent` are equal iff every
+ * field is equal. We reproduce that by comparing all fields (defaultKeyId,
+ * protectionScheme, includeMsprPro, and the ordered contentProtectionEntry
+ * list) with proto2 presence semantics: an unset optional field is never equal
+ * to one set to its default, and repeated fields are order-sensitive.
  *
  * @internal
  */
 const protectedContentEq = (a: ProtectedContent, b: ProtectedContent): boolean => {
-	if (JSON.stringify(a.defaultKeyId ?? null) !== JSON.stringify(b.defaultKeyId ?? null)) {
+	if (!optionalBytesEq(a.defaultKeyId, b.defaultKeyId)) {
 		return false;
 	}
-	if ((a.protectionScheme ?? 'cenc') !== (b.protectionScheme ?? 'cenc')) {
+	if (a.protectionScheme !== b.protectionScheme) {
 		return false;
 	}
-	if ((a.includeMsprPro ?? true) !== (b.includeMsprPro ?? true)) {
+	if (a.includeMsprPro !== b.includeMsprPro) {
 		return false;
 	}
 	const aEntries = a.contentProtectionEntry ?? [];
@@ -224,20 +264,8 @@ const protectedContentEq = (a: ProtectedContent, b: ProtectedContent): boolean =
 		return false;
 	}
 	for (let i = 0; i < aEntries.length; i++) {
-		const aE = aEntries[i]!;
-		const bE = bEntries[i]!;
-		if (aE.uuid !== bE.uuid || aE.nameVersion !== bE.nameVersion) {
+		if (!contentProtectionEntryEq(aEntries[i]!, bEntries[i]!)) {
 			return false;
-		}
-		const aP = aE.pssh ?? new Uint8Array();
-		const bP = bE.pssh ?? new Uint8Array();
-		if (aP.length !== bP.length) {
-			return false;
-		}
-		for (let j = 0; j < aP.length; j++) {
-			if (aP[j] !== bP[j]) {
-				return false;
-			}
 		}
 	}
 	return true;

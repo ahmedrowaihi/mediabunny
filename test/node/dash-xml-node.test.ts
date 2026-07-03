@@ -5,6 +5,93 @@
 import { describe, expect, test } from 'vitest';
 import { XmlNode } from '../../src/dash/dash-xml-node.js';
 import type { Element } from '../../src/dash/dash-content-protection.js';
+import { xmlEqual } from './_xml-equal.js';
+
+describe('xmlEqual — meta matcher', () => {
+	// shaka: TEST(XmlNodeTest, MetaTestXmlElementsEqual)
+	test('MetaTestXmlElementsEqual — structural equality ignores attribute order but not child order', () => {
+		const kXml1 = '<A>\n'
+			+ '  <B\n'
+			+ '    c="1"'
+			+ '    e="foobar"'
+			+ '    somelongnameattribute="somevalue">\n'
+			+ '      <Bchild childvalue="3"\n'
+			+ '              f="4"/>\n'
+			+ '  </B>\n'
+			+ '  <C />\n'
+			+ '</A>';
+
+		// Same as kXml1 but the attributes are reordered (children are not).
+		const kXml1AttributeReorder = '<A>\n'
+			+ '  <B\n'
+			+ '    c="1"'
+			+ '    somelongnameattribute="somevalue"\n'
+			+ '    e="foobar">'
+			+ '      <Bchild childvalue="3"\n'
+			+ '              f="4"/>\n'
+			+ '  </B>\n'
+			+ '  <C />\n'
+			+ '</A>';
+
+		// <C> is before <B>.
+		const kXml1ChildrenReordered = '<A>\n'
+			+ '  <C />\n'
+			+ '  <B\n'
+			+ '    d="2"'
+			+ '    c="1"'
+			+ '    somelongnameattribute="somevalue"\n'
+			+ '    e="foobar">'
+			+ '      <Bchild childvalue="3"\n'
+			+ '              f="4"/>\n'
+			+ '  </B>\n'
+			+ '</A>';
+
+		const kXml1RemovedAttributes = '<A>\n'
+			+ '  <B\n'
+			+ '    d="2"\n>'
+			+ '      <Bchild f="4"/>\n'
+			+ '  </B>\n'
+			+ '  <C />\n'
+			+ '</A>';
+
+		const kXml2 = '<A>\n'
+			+ '  <C />\n'
+			+ '</A>';
+
+		// In XML <C />, <C></C>, and <C/> mean the same thing.
+		const kXml2DifferentSyntax = '<A>\n'
+			+ '  <C></C>\n'
+			+ '</A>';
+
+		const kXml2MoreDifferentSyntax = '<A>\n'
+			+ '  <C/>\n'
+			+ '</A>';
+
+		// Identity.
+		expect(xmlEqual(kXml1, kXml1).ok).toBe(true);
+
+		// Equivalent.
+		expect(xmlEqual(kXml1, kXml1AttributeReorder).ok).toBe(true);
+		expect(xmlEqual(kXml2, kXml2DifferentSyntax).ok).toBe(true);
+		expect(xmlEqual(kXml2, kXml2MoreDifferentSyntax).ok).toBe(true);
+
+		// Different.
+		expect(xmlEqual(kXml1, kXml2).ok).toBe(false);
+		expect(xmlEqual(kXml1, kXml1ChildrenReordered).ok).toBe(false);
+		expect(xmlEqual(kXml1, kXml1RemovedAttributes).ok).toBe(false);
+		expect(xmlEqual(kXml1AttributeReorder, kXml1ChildrenReordered).ok).toBe(false);
+	});
+
+	// shaka: TEST(XmlNodeTest, MetaTestXmlEqualDifferentContent)
+	// Catches the case where naive whole-subtree text concatenation would make
+	// two structurally different trees compare equal.
+	test('MetaTestXmlEqualDifferentContent — per-element text is compared, not concatenated', () => {
+		expect(xmlEqual(
+			'<A><B>content1</B><B>content2</B></A>',
+			'<A><B>c</B><B>ontent1content2</B></A>',
+		).ok).toBe(false);
+	});
+});
 
 describe('XmlNode — namespace extraction', () => {
 	// shaka: TEST(XmlNodeTest, ExtractReferencedNamespaces)

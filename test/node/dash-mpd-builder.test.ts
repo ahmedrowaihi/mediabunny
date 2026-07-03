@@ -314,6 +314,97 @@ describe('OnDemandMpdBuilderTest', () => {
 			'<SegmentBase indexRange="121-221" timescale="1000" presentationTimeOffset="1500">',
 		);
 	});
+
+	// shaka: TEST_F(OnDemandMpdBuilderTest, MultiPeriodTextTracksUseConsistentSegmentStructure)
+	// Multi-period on-demand DASH sharing a single VTT file must keep a
+	// consistent segment structure across ALL periods. Period 0 has PTO=0 (field
+	// never set), so text emits just <BaseURL>. Period 1+ have PTO > 0 and must
+	// emit <BaseURL> + <SegmentBase presentationTimeOffset="...">, NOT
+	// <SegmentList> + <SegmentURL media="...">.
+	test('MultiPeriodTextTracksUseConsistentSegmentStructure', () => {
+		// A single VTT file referenced by both periods (same URL, different
+		// presentationTimeOffset). reference_time_scale must be set: without it
+		// setPresentationTimeOffset computes pto = seconds * 0 = 0 and silently
+		// skips setting the field, so the bug would never trigger. With it set to
+		// 1000, period 1's pto = 5500.
+		const vttMediaInfo: MediaInfo = {
+			textInfo: { codec: 'wvtt', language: 'en-US', type: 'subtitle' },
+			mediaDurationSeconds: 1800,
+			bandwidth: 0,
+			mediaFileUrl: 'en-US.vtt',
+			containerType: 'text',
+			referenceTimeScale: 1000,
+		};
+
+		const mpd = new MpdBuilder(onDemandOptions());
+
+		// Period 0: video + text.
+		const period1 = mpd.getOrCreatePeriod(0.0);
+		addSegmentToPeriod(0.0, 3.0, period1);
+		const textAs1 = period1.getOrCreateAdaptationSet(vttMediaInfo, false);
+		expect(textAs1).not.toBeNull();
+		expect(textAs1!.addRepresentation(vttMediaInfo)).not.toBeNull();
+
+		// Period 1: video + text.
+		const period2 = mpd.getOrCreatePeriod(3.1);
+		addSegmentToPeriod(5.5, 10.5, period2);
+		const textAs2 = period2.getOrCreateAdaptationSet(vttMediaInfo, false);
+		expect(textAs2).not.toBeNull();
+		expect(textAs2!.addRepresentation(vttMediaInfo)).not.toBeNull();
+
+		const out = mpd.toString();
+		expect(out).not.toBeNull();
+
+		// Both periods must reference the VTT file via BaseURL, not via a
+		// SegmentURL inside a SegmentList (the wrong, inconsistent form).
+		expect(out).toContain('<BaseURL>en-US.vtt</BaseURL>');
+		// Period 1 text uses SegmentBase (PTO=5500), not SegmentList.
+		expect(out).toContain('<SegmentBase timescale="1000" presentationTimeOffset="5500"');
+		expect(out).not.toContain('<SegmentList');
+	});
+
+	// shaka: TEST_F(OnDemandMpdBuilderTest, MultiPeriodTextMp4UsesCorrectPto)
+	// Regression test for issue #1493: multi-period on-demand DASH with
+	// text-in-MP4 tracks. Period 1+ representations created via copy carry no
+	// segment infos, so updatePeriodDurationAndPresentationTimestamp finds no
+	// timestamps and must fall back to the period's own start time as the PTO
+	// (and 'continue' to later periods, not abort).
+	test('MultiPeriodTextMp4UsesCorrectPto', () => {
+		const mpd = new MpdBuilder(onDemandOptions());
+
+		// Period 0: video with a segment so timestamps can be computed.
+		const period1 = mpd.getOrCreatePeriod(0.0);
+		addSegmentToPeriod(0.0, 5.5, period1);
+
+		// Period 1: a text-in-MP4 representation WITHOUT any segments, mirroring
+		// the copy path where the copied representation has empty segment infos.
+		const period2 = mpd.getOrCreatePeriod(5.5);
+		expect(period2).not.toBeNull();
+
+		const textMediaInfo: MediaInfo = {
+			textInfo: { codec: 'wvtt', language: 'en-US', type: 'subtitle' },
+			mediaDurationSeconds: 1800,
+			bandwidth: 0,
+			mediaFileUrl: 'en-US.mp4',
+			containerType: 'mp4',
+			referenceTimeScale: 1000,
+			initRange: { begin: 0, end: 734 },
+			indexRange: { begin: 735, end: 5710 },
+		};
+		const adaptationSet = period2.getOrCreateAdaptationSet(textMediaInfo, false);
+		expect(adaptationSet).not.toBeNull();
+		// Intentionally do NOT call addNewSegment — segment infos stay empty.
+		expect(adaptationSet!.addRepresentation(textMediaInfo)).not.toBeNull();
+
+		const out = mpd.toString();
+		expect(out).not.toBeNull();
+
+		// Period 1 (start=5.5s) should have presentationTimeOffset = 5.5 * 1000 = 5500.
+		expect(out).toContain('<BaseURL>en-US.mp4</BaseURL>');
+		expect(out).toContain('presentationTimeOffset="5500"');
+		// SegmentBase (not SegmentList) must be used for single-file text tracks.
+		expect(out).not.toContain('<SegmentList');
+	});
 });
 
 describe('LiveMpdBuilderTest', () => {

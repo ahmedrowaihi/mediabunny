@@ -395,6 +395,7 @@ export {
 	type HlsTextInfo,
 	type HlsMediaInfo,
 	type HlsParams,
+	type HlsCeaCaption,
 	adjustHlsVideoCodec,
 } from './hls/hls-types';
 export {

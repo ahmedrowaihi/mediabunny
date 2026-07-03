@@ -16,6 +16,7 @@
 import { EncryptionInfoEntry } from './hls-entries';
 import type { MediaPlaylist } from './hls-media-playlist';
 import { Tag } from './hls-tag';
+import type { HlsCeaCaption } from './hls-types';
 
 const DEFAULT_AUDIO_GROUP_ID = 'default-audio-group';
 const DEFAULT_SUBTITLE_GROUP_ID = 'default-text-group';
@@ -31,6 +32,7 @@ interface Variant {
 	subtitleCodecs: string[];
 	maxAudioBitrate: number;
 	avgAudioBitrate: number;
+	haveInstreamClosedCaption: boolean;
 }
 
 const groupId = (p: MediaPlaylist): string => {
@@ -58,7 +60,8 @@ const groupCodecs = (group: MediaPlaylist[]): string[] => {
 	if (codecs.delete('ttml')) {
 		codecs.add('stpp.ttml.im1t');
 	}
-	return [...codecs];
+	// shaka's GetGroupCodecString returns a std::set — alphabetically sorted.
+	return [...codecs].sort();
 };
 
 const groupMaxBitrate = (group: MediaPlaylist[]): number =>
@@ -131,6 +134,25 @@ const buildMediaTag = (
 };
 
 /**
+ * Mirrors shaka's `BuildCeaMediaTag`. Renders one
+ * `#EXT-X-MEDIA:TYPE=CLOSED-CAPTIONS` tag for a registered CEA caption. All
+ * captions share the `CC` group id.
+ */
+const buildCeaMediaTag = (caption: HlsCeaCaption): string => {
+	const tag = new Tag('#EXT-X-MEDIA');
+	tag.addString('TYPE', 'CLOSED-CAPTIONS');
+	tag.addQuotedString('GROUP-ID', 'CC');
+	tag.addQuotedString('NAME', caption.name);
+	if (caption.language) {
+		tag.addQuotedString('LANGUAGE', caption.language);
+	}
+	tag.addString('DEFAULT', (caption.isDefault ?? false) ? 'YES' : 'NO');
+	tag.addString('AUTOSELECT', (caption.autoselect ?? true) ? 'YES' : 'NO');
+	tag.addQuotedString('INSTREAM-ID', caption.channel);
+	return tag.toString();
+};
+
+/**
  * Mirrors shaka's `BuildStreamInfTag`. Renders one `#EXT-X-STREAM-INF` for a
  * regular video or audio variant; `#EXT-X-I-FRAME-STREAM-INF` for I-frame-only.
  */
@@ -183,8 +205,11 @@ const buildStreamInfTag = (
 		if (variant.subtitleGroupId) {
 			tag.addQuotedString('SUBTITLES', variant.subtitleGroupId);
 		}
-		// CLOSED-CAPTIONS=NONE is shaka's default when no captions registered.
-		tag.addString('CLOSED-CAPTIONS', 'NONE');
+		if (variant.haveInstreamClosedCaption) {
+			tag.addQuotedString('CLOSED-CAPTIONS', 'CC');
+		} else {
+			tag.addString('CLOSED-CAPTIONS', 'NONE');
+		}
 	}
 
 	if (isIFrame) {
@@ -201,6 +226,7 @@ const buildStreamInfTag = (
 const buildVariants = (
 	audioGroups: Map<string, MediaPlaylist[]>,
 	subtitleGroups: Map<string, MediaPlaylist[]>,
+	haveInstreamClosedCaption: boolean,
 ): Variant[] => {
 	const audioVariants: Variant[] = [];
 	if (audioGroups.size === 0) {
@@ -209,6 +235,7 @@ const buildVariants = (
 			subtitleCodecs: [],
 			maxAudioBitrate: 0,
 			avgAudioBitrate: 0,
+			haveInstreamClosedCaption: false,
 		});
 	} else {
 		for (const [id, group] of audioGroups) {
@@ -218,6 +245,7 @@ const buildVariants = (
 				subtitleCodecs: [],
 				maxAudioBitrate: groupMaxBitrate(group),
 				avgAudioBitrate: groupAvgBitrate(group),
+				haveInstreamClosedCaption: false,
 			});
 		}
 	}
@@ -241,6 +269,7 @@ const buildVariants = (
 				subtitleCodecs: s.codecs,
 				maxAudioBitrate: a.maxAudioBitrate,
 				avgAudioBitrate: a.avgAudioBitrate,
+				haveInstreamClosedCaption,
 			});
 		}
 	}
@@ -275,6 +304,8 @@ export class MasterPlaylist {
 			generatorBanner?: string;
 			/** Collect every unique `#EXT-X-KEY` and emit `#EXT-X-SESSION-KEY` at the master level. */
 			createSessionKeys?: boolean;
+			/** CEA closed captions to register as `#EXT-X-MEDIA:TYPE=CLOSED-CAPTIONS` renditions. */
+			closedCaptions?: HlsCeaCaption[];
 		} = {},
 	) {}
 
@@ -324,42 +355,27 @@ export class MasterPlaylist {
 			playlist: MediaPlaylist;
 			groupId: string;
 			isDefault: boolean;
+			isAutoselect: boolean;
 		};
 		const audioTags: MediaTagInfo[] = [];
 		const subtitleTags: MediaTagInfo[] = [];
 		const videoPlaylists: MediaPlaylist[] = [];
 		const iframePlaylists: MediaPlaylist[] = [];
-		const audioGroupCounts = new Map<string, number>();
-		const subtitleGroupCounts = new Map<string, number>();
 
+		// First pass: classify playlists and capture their group ids. The
+		// default/autoselect flags are assigned in the second pass below, after
+		// sorting, so "first rendition per (group, language)" refers to the first
+		// in the final output order.
+		let hasIndex = true;
 		for (const p of this.playlists) {
+			hasIndex = hasIndex && p.hasIndex();
 			switch (p.getStreamType()) {
-				case 'audio': {
-					const id = groupId(p);
-					const idx = audioGroupCounts.get(id) ?? 0;
-					audioGroupCounts.set(id, idx + 1);
-					const isLanguageDefault = !!this.opts.defaultAudioLanguage
-						&& p.getLanguage() === this.opts.defaultAudioLanguage;
-					const isFirstInGroup = idx === 0;
-					const isDefault = this.opts.defaultAudioLanguage
-						? isLanguageDefault
-						: isFirstInGroup;
-					audioTags.push({ playlist: p, groupId: id, isDefault });
+				case 'audio':
+					audioTags.push({ playlist: p, groupId: groupId(p), isDefault: false, isAutoselect: false });
 					break;
-				}
-				case 'subtitle': {
-					const id = groupId(p);
-					const idx = subtitleGroupCounts.get(id) ?? 0;
-					subtitleGroupCounts.set(id, idx + 1);
-					const isLanguageDefault = !!this.opts.defaultSubtitleLanguage
-						&& p.getLanguage() === this.opts.defaultSubtitleLanguage;
-					const isFirstInGroup = idx === 0;
-					const isDefault = this.opts.defaultSubtitleLanguage
-						? isLanguageDefault
-						: isFirstInGroup;
-					subtitleTags.push({ playlist: p, groupId: id, isDefault });
+				case 'subtitle':
+					subtitleTags.push({ playlist: p, groupId: groupId(p), isDefault: false, isAutoselect: false });
 					break;
-				}
 				case 'video':
 					videoPlaylists.push(p);
 					break;
@@ -369,17 +385,93 @@ export class MasterPlaylist {
 			}
 		}
 
+		// Sort renditions before assigning default/autoselect. When every playlist
+		// carries an index, order video / I-frame / audio / subtitle by it
+		// (PlaylistOrderFn / MediaTagsOrderByIndexFn). Otherwise order audio and
+		// subtitle by group id (MediaTagsOrderByGroupIdFn), matching shaka's
+		// std::map ordering, and leave video / I-frame in input order.
+		const byPlaylistIndex = (a: MediaPlaylist, b: MediaPlaylist): number =>
+			a.getIndex() - b.getIndex();
+		const byTagIndex = (a: MediaTagInfo, b: MediaTagInfo): number =>
+			a.playlist.getIndex() - b.playlist.getIndex();
+		const byTagGroupId = (a: MediaTagInfo, b: MediaTagInfo): number => {
+			if (a.groupId < b.groupId) {
+				return -1;
+			}
+			if (a.groupId > b.groupId) {
+				return 1;
+			}
+			return 0;
+		};
+		if (hasIndex) {
+			videoPlaylists.sort(byPlaylistIndex);
+			iframePlaylists.sort(byPlaylistIndex);
+			audioTags.sort(byTagIndex);
+			subtitleTags.sort(byTagIndex);
+		} else {
+			audioTags.sort(byTagGroupId);
+			subtitleTags.sort(byTagGroupId);
+		}
+
+		// Second pass: assign default/autoselect, iterating in the same order the
+		// tags are emitted so "first rendition per (group, language)" refers to the
+		// first in output order.
+		//
+		// Per HLS spec 4.3.4.1.1 Rendition Groups: a group MUST NOT have more than
+		// one DEFAULT=YES member. We tag the first rendition in a group with a
+		// particular language 'AUTOSELECT'; it is 'DEFAULT' too if the language
+		// matches the configured default language.
+		const audioGroupLanguages = new Map<string, Set<string>>();
+		for (const t of audioTags) {
+			// HLS Authoring Specification for Apple Devices §2.13: a DVS rendition
+			// MUST be AUTOSELECT=YES, and never contributes to the per-language
+			// default bookkeeping.
+			if (t.playlist.isDvs()) {
+				t.isAutoselect = true;
+				continue;
+			}
+			const language = t.playlist.getLanguage();
+			let languages = audioGroupLanguages.get(t.groupId);
+			if (!languages) {
+				languages = new Set<string>();
+				audioGroupLanguages.set(t.groupId, languages);
+			}
+			if (!languages.has(language)) {
+				t.isDefault = !!language && language === this.opts.defaultAudioLanguage;
+				t.isAutoselect = true;
+				languages.add(language);
+			}
+		}
+
+		const subtitleGroupLanguages = new Map<string, Set<string>>();
+		for (const t of subtitleTags) {
+			const language = t.playlist.getLanguage();
+			let languages = subtitleGroupLanguages.get(t.groupId);
+			if (!languages) {
+				languages = new Set<string>();
+				subtitleGroupLanguages.set(t.groupId, languages);
+			}
+			if (!languages.has(language)) {
+				t.isDefault = !!language && language === this.opts.defaultSubtitleLanguage;
+				t.isAutoselect = true;
+				languages.add(language);
+			}
+			if (t.playlist.isForcedSubtitle()) {
+				t.isAutoselect = true;
+			}
+		}
+
 		if (audioTags.length > 0) {
 			lines.push('');
 			for (const t of audioTags) {
-				lines.push(buildMediaTag(t.playlist, t.groupId, t.isDefault, true, baseUrl));
+				lines.push(buildMediaTag(t.playlist, t.groupId, t.isDefault, t.isAutoselect, baseUrl));
 			}
 		}
 
 		if (subtitleTags.length > 0) {
 			lines.push('');
 			for (const t of subtitleTags) {
-				lines.push(buildMediaTag(t.playlist, t.groupId, t.isDefault, true, baseUrl));
+				lines.push(buildMediaTag(t.playlist, t.groupId, t.isDefault, t.isAutoselect, baseUrl));
 			}
 		}
 
@@ -396,8 +488,16 @@ export class MasterPlaylist {
 			subtitleGroups.set(t.groupId, list);
 		}
 
+		const closedCaptions = this.opts.closedCaptions ?? [];
+		if (closedCaptions.length > 0) {
+			lines.push('');
+			for (const caption of closedCaptions) {
+				lines.push(buildCeaMediaTag(caption));
+			}
+		}
+
 		// Variant streams
-		const variants = buildVariants(audioGroups, subtitleGroups);
+		const variants = buildVariants(audioGroups, subtitleGroups, closedCaptions.length > 0);
 		for (const variant of variants) {
 			if (videoPlaylists.length === 0) {
 				break;
@@ -416,6 +516,7 @@ export class MasterPlaylist {
 				subtitleCodecs: [],
 				maxAudioBitrate: 0,
 				avgAudioBitrate: 0,
+				haveInstreamClosedCaption: false,
 			};
 			for (const ip of iframePlaylists) {
 				lines.push(buildStreamInfTag(ip, empty, baseUrl));
@@ -432,6 +533,7 @@ export class MasterPlaylist {
 					subtitleCodecs: [],
 					maxAudioBitrate: 0,
 					avgAudioBitrate: 0,
+					haveInstreamClosedCaption: false,
 				};
 				for (const p of group) {
 					lines.push(buildStreamInfTag(p, variant, baseUrl));

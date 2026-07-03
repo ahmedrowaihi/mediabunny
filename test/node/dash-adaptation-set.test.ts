@@ -439,3 +439,562 @@ describe('AdaptationSet — id / sortIndex / setProtectedContent', () => {
 		expect(() => adaptationSet.setProtectedContent(mediaInfo)).toThrow();
 	});
 });
+
+const bytes = (text: string): Uint8Array => new TextEncoder().encode(text);
+
+describe('AdaptationSet — matchAdaptationSet / protected content', () => {
+	// shaka: TEST_P(PeriodTestWithContentProtection, DifferentProtectedContent)
+	// Different protected_content (different uuid / name_version / pssh /
+	// default_key_id) → a second AdaptationSet is created, i.e. no match. With
+	// content protection ignored, the codecs alone match → one AdaptationSet.
+	test('different protected content → no match (two AdaptationSets)', () => {
+		const sd: MediaInfo = {
+			videoInfo: {
+				codec: 'avc1',
+				width: 640,
+				height: 360,
+				timeScale: 10,
+				frameDuration: 10,
+				pixelWidth: 1,
+				pixelHeight: 1,
+			},
+			containerType: 'mp4',
+			protectedContent: {
+				contentProtectionEntry: [
+					{ uuid: 'myuuid', nameVersion: 'MyContentProtection version 1', pssh: bytes('pssh1') },
+				],
+				defaultKeyId: bytes('_default_key_id_'),
+			},
+		};
+		const hd: MediaInfo = {
+			videoInfo: {
+				codec: 'avc1',
+				width: 1280,
+				height: 720,
+				timeScale: 10,
+				frameDuration: 10,
+				pixelWidth: 1,
+				pixelHeight: 1,
+			},
+			containerType: 'mp4',
+			protectedContent: {
+				contentProtectionEntry: [
+					{ uuid: 'anotheruuid', nameVersion: 'SomeOtherProtection version 3', pssh: bytes('pssh2') },
+				],
+				defaultKeyId: bytes('.default.key.id.'),
+			},
+		};
+
+		const adaptationSet = new AdaptationSet(NO_LANGUAGE, newOptions(), newCounter());
+		adaptationSet.setCodec('avc1');
+		expect(adaptationSet.addRepresentation(sd)).not.toBeNull();
+		adaptationSet.setProtectedContent(sd);
+
+		expect(adaptationSet.matchAdaptationSet(hd, true)).toBe(false);
+		// With content protection not carried on the AdaptationSet, only the
+		// base codec is compared → they match.
+		expect(adaptationSet.matchAdaptationSet(hd, false)).toBe(true);
+	});
+
+	// shaka: TEST_P(PeriodTestWithContentProtection, SameProtectedContent)
+	// Identical protected_content → only one AdaptationSet, i.e. a match, so
+	// both Representations land in the same set.
+	test('same protected content → match (one merged AdaptationSet)', () => {
+		const protectedContent = {
+			contentProtectionEntry: [
+				{ uuid: 'myuuid', nameVersion: 'MyContentProtection version 1', pssh: bytes('psshbox') },
+			],
+			defaultKeyId: bytes('.DEFAULT.KEY.ID.'),
+		};
+		const sd: MediaInfo = {
+			videoInfo: {
+				codec: 'avc1',
+				width: 640,
+				height: 360,
+				timeScale: 10,
+				frameDuration: 10,
+				pixelWidth: 1,
+				pixelHeight: 1,
+			},
+			containerType: 'mp4',
+			protectedContent,
+		};
+		const hd: MediaInfo = {
+			videoInfo: {
+				codec: 'avc1',
+				width: 1280,
+				height: 720,
+				timeScale: 10,
+				frameDuration: 10,
+				pixelWidth: 1,
+				pixelHeight: 1,
+			},
+			containerType: 'mp4',
+			protectedContent,
+		};
+
+		const adaptationSet = new AdaptationSet(NO_LANGUAGE, newOptions(), newCounter());
+		adaptationSet.setCodec('avc1');
+		expect(adaptationSet.addRepresentation(sd)).not.toBeNull();
+		adaptationSet.setProtectedContent(sd);
+
+		expect(adaptationSet.matchAdaptationSet(hd, true)).toBe(true);
+		// The match means the HD Representation joins the same AdaptationSet.
+		expect(adaptationSet.addRepresentation(hd)).not.toBeNull();
+		expect(adaptationSet.getRepresentations()).toHaveLength(2);
+	});
+
+	// Regression: shaka compares the whole ProtectedContent proto via
+	// SerializeAsString, so a field that differs only in proto2 presence — here
+	// protectionScheme unset vs explicitly set to its 'cenc' default — makes the
+	// two unequal. The previous subset compare coalesced the default and falsely
+	// matched them.
+	test('protectionScheme present vs absent → no match (presence-sensitive)', () => {
+		const withScheme: MediaInfo = {
+			videoInfo: { codec: 'avc1', width: 640, height: 360 },
+			containerType: 'mp4',
+			protectedContent: {
+				contentProtectionEntry: [{ uuid: 'myuuid', nameVersion: 'v1', pssh: bytes('pssh') }],
+				protectionScheme: 'cenc',
+			},
+		};
+		const withoutScheme: MediaInfo = {
+			videoInfo: { codec: 'avc1', width: 1280, height: 720 },
+			containerType: 'mp4',
+			protectedContent: {
+				contentProtectionEntry: [{ uuid: 'myuuid', nameVersion: 'v1', pssh: bytes('pssh') }],
+			},
+		};
+
+		const adaptationSet = new AdaptationSet(NO_LANGUAGE, newOptions(), newCounter());
+		adaptationSet.setCodec('avc1');
+		expect(adaptationSet.addRepresentation(withScheme)).not.toBeNull();
+		adaptationSet.setProtectedContent(withScheme);
+
+		expect(adaptationSet.matchAdaptationSet(withoutScheme, true)).toBe(false);
+	});
+
+	test('null protected content matches only unprotected media', () => {
+		const unprotected: MediaInfo = {
+			videoInfo: { codec: 'avc1', width: 640, height: 360 },
+			containerType: 'mp4',
+		};
+		const protectedInfo: MediaInfo = {
+			videoInfo: { codec: 'avc1', width: 1280, height: 720 },
+			containerType: 'mp4',
+			protectedContent: {
+				contentProtectionEntry: [{ uuid: 'myuuid', nameVersion: 'v1', pssh: bytes('pssh') }],
+			},
+		};
+
+		const adaptationSet = new AdaptationSet(NO_LANGUAGE, newOptions(), newCounter());
+		adaptationSet.setCodec('avc1');
+		expect(adaptationSet.addRepresentation(unprotected)).not.toBeNull();
+
+		expect(adaptationSet.matchAdaptationSet(unprotected, true)).toBe(true);
+		expect(adaptationSet.matchAdaptationSet(protectedInfo, true)).toBe(false);
+	});
+});
+
+describe('AdaptationSet — representation copy / ordering', () => {
+	// shaka: TEST_F(AdaptationSetTest, CopyRepresentation)
+	test('copyRepresentation returns a new Representation', () => {
+		const video: MediaInfo = {
+			videoInfo: {
+				codec: 'avc1',
+				width: 1280,
+				height: 720,
+				timeScale: 10,
+				frameDuration: 10,
+				pixelWidth: 1,
+				pixelHeight: 1,
+			},
+			containerType: 'mp4',
+		};
+
+		const adaptationSet = new AdaptationSet(NO_LANGUAGE, newOptions(), newCounter());
+		const representation = adaptationSet.addRepresentation(video)!;
+		const newRepresentation = adaptationSet.copyRepresentation(representation);
+		expect(newRepresentation).toBeTruthy();
+	});
+
+	// shaka: TEST_F(AdaptationSetTest, GetRepresentations)
+	test('getRepresentations reflects insertion, copies land id-ordered', () => {
+		const mediaInfo1: MediaInfo = {
+			videoInfo: {
+				codec: 'avc1',
+				width: 720,
+				height: 480,
+				timeScale: 10,
+				frameDuration: 10,
+				pixelWidth: 8,
+				pixelHeight: 9,
+			},
+			containerType: 'mp4',
+		};
+		const mediaInfo2: MediaInfo = {
+			videoInfo: {
+				codec: 'avc1',
+				width: 640,
+				height: 360,
+				timeScale: 10,
+				frameDuration: 10,
+				pixelWidth: 1,
+				pixelHeight: 1,
+			},
+			containerType: 'mp4',
+		};
+
+		const adaptationSet = new AdaptationSet(NO_LANGUAGE, newOptions(), newCounter());
+
+		const representation1 = adaptationSet.addRepresentation(mediaInfo1)!;
+		expect(adaptationSet.getRepresentations()).toEqual([representation1]);
+
+		const representation2 = adaptationSet.addRepresentation(mediaInfo2)!;
+		expect(adaptationSet.getRepresentations()).toEqual([representation1, representation2]);
+
+		const newAdaptationSet = new AdaptationSet(NO_LANGUAGE, newOptions(), newCounter());
+		const newRepresentation2 = newAdaptationSet.copyRepresentation(representation2);
+		const newRepresentation1 = newAdaptationSet.copyRepresentation(representation1);
+
+		// Elements are ordered by id().
+		const reps = newAdaptationSet.getRepresentations();
+		expect(reps).toHaveLength(2);
+		expect(reps[0]).toBe(newRepresentation1);
+		expect(reps[1]).toBe(newRepresentation2);
+	});
+});
+
+describe('AdaptationSet — attribute bubbling', () => {
+	// shaka: TEST_F(AdaptationSetTest, BubbleUpAttributesToAdaptationSet)
+	test('common width/height/frameRate bubble up, drop out as reps diverge', () => {
+		const r1080p: MediaInfo = {
+			videoInfo: {
+				codec: 'avc1',
+				width: 1920,
+				height: 1080,
+				timeScale: 30,
+				frameDuration: 1,
+				pixelWidth: 1,
+				pixelHeight: 1,
+			},
+			containerType: 'mp4',
+		};
+		const differentWidth: MediaInfo = {
+			videoInfo: {
+				codec: 'avc1',
+				width: 1080,
+				height: 1080,
+				timeScale: 30,
+				frameDuration: 1,
+				pixelWidth: 1,
+				pixelHeight: 1,
+			},
+			containerType: 'mp4',
+		};
+		const differentHeight: MediaInfo = {
+			videoInfo: {
+				codec: 'avc1',
+				width: 1440,
+				height: 900,
+				timeScale: 30,
+				frameDuration: 1,
+				pixelWidth: 1,
+				pixelHeight: 1,
+			},
+			containerType: 'mp4',
+		};
+		const differentFrameRate: MediaInfo = {
+			videoInfo: {
+				codec: 'avc1',
+				width: 1920,
+				height: 1080,
+				timeScale: 15,
+				frameDuration: 1,
+				pixelWidth: 1,
+				pixelHeight: 1,
+			},
+			containerType: 'mp4',
+		};
+
+		const adaptationSet = new AdaptationSet(NO_LANGUAGE, newOptions(), newCounter());
+		expect(adaptationSet.addRepresentation(r1080p)).not.toBeNull();
+
+		const allAttributes = adaptationSet.getXml()!;
+		expect(allAttributes.getAttribute('width')).toBe('1920');
+		expect(allAttributes.getAttribute('height')).toBe('1080');
+		expect(allAttributes.getAttribute('frameRate')).toBe('30/1');
+
+		expect(adaptationSet.addRepresentation(differentWidth)).not.toBeNull();
+		const widthNotSet = adaptationSet.getXml()!;
+		expect(widthNotSet.getAttribute('width')).toBeUndefined();
+		expect(widthNotSet.getAttribute('height')).toBe('1080');
+		expect(widthNotSet.getAttribute('frameRate')).toBe('30/1');
+
+		expect(adaptationSet.addRepresentation(differentHeight)).not.toBeNull();
+		const widthHeightNotSet = adaptationSet.getXml()!;
+		expect(widthHeightNotSet.getAttribute('width')).toBeUndefined();
+		expect(widthHeightNotSet.getAttribute('height')).toBeUndefined();
+		expect(widthHeightNotSet.getAttribute('frameRate')).toBe('30/1');
+
+		expect(adaptationSet.addRepresentation(differentFrameRate)).not.toBeNull();
+		const noCommonAttributes = adaptationSet.getXml()!;
+		expect(noCommonAttributes.getAttribute('width')).toBeUndefined();
+		expect(noCommonAttributes.getAttribute('height')).toBeUndefined();
+		expect(noCommonAttributes.getAttribute('frameRate')).toBeUndefined();
+	});
+});
+
+describe('AdaptationSet — picture aspect ratio / frame rate edge cases', () => {
+	// shaka: TEST_F(AdaptationSetTest, AdaptationSetParUnknown)
+	test('missing pixel width/height → no @par', () => {
+		const unknownPixelWidthAndHeight: MediaInfo = {
+			videoInfo: {
+				codec: 'avc1',
+				width: 1280,
+				height: 720,
+				timeScale: 3000,
+				frameDuration: 100,
+			},
+			containerType: 'mp4',
+		};
+
+		const adaptationSet = new AdaptationSet(NO_LANGUAGE, newOptions(), newCounter());
+		expect(adaptationSet.addRepresentation(unknownPixelWidthAndHeight)).not.toBeNull();
+		expect(adaptationSet.getXml()!.getAttribute('par')).toBeUndefined();
+	});
+
+	// shaka: TEST_F(AdaptationSetTest, AdapatationSetMaxFrameRateIntegerDivisionEdgeCase)
+	// 11/3 != 10/3 but IntegerDiv(11,3) == IntegerDiv(10,3), so maxFrameRate wins.
+	test('near-equal frame rates that differ → maxFrameRate, not frameRate', () => {
+		const info1: MediaInfo = {
+			videoInfo: { codec: 'avc1', width: 720, height: 480, timeScale: 11, frameDuration: 3 },
+			containerType: 'mp4',
+		};
+		const info2: MediaInfo = {
+			videoInfo: { codec: 'avc1', width: 720, height: 480, timeScale: 10, frameDuration: 3 },
+			containerType: 'mp4',
+		};
+
+		const adaptationSet = new AdaptationSet(NO_LANGUAGE, newOptions(), newCounter());
+		expect(adaptationSet.addRepresentation(info1)).not.toBeNull();
+		expect(adaptationSet.addRepresentation(info2)).not.toBeNull();
+
+		const xml = adaptationSet.getXml()!;
+		expect(xml.getAttribute('maxFrameRate')).toBe('11/3');
+		expect(xml.getAttribute('frameRate')).toBeUndefined();
+	});
+
+	// shaka: TEST_F(AdaptationSetTest, AdaptationSetParAllSame)
+	test('all reps share the same par (incl. 8:9-pixel 360p) → @par="16:9"', () => {
+		const r480p: MediaInfo = {
+			videoInfo: {
+				codec: 'avc1',
+				width: 854,
+				height: 480,
+				timeScale: 3000,
+				frameDuration: 100,
+				pixelWidth: 1,
+				pixelHeight: 1,
+			},
+			containerType: 'mp4',
+		};
+		const r720p: MediaInfo = {
+			videoInfo: {
+				codec: 'avc1',
+				width: 1280,
+				height: 720,
+				timeScale: 3000,
+				frameDuration: 100,
+				pixelWidth: 1,
+				pixelHeight: 1,
+			},
+			containerType: 'mp4',
+		};
+		const r1080p: MediaInfo = {
+			videoInfo: {
+				codec: 'avc1',
+				width: 1920,
+				height: 1080,
+				timeScale: 3000,
+				frameDuration: 100,
+				pixelWidth: 1,
+				pixelHeight: 1,
+			},
+			containerType: 'mp4',
+		};
+		// Non-1 pixel width and height, which makes the par 16:9.
+		const r360p: MediaInfo = {
+			videoInfo: {
+				codec: 'avc1',
+				width: 720,
+				height: 360,
+				timeScale: 3000,
+				frameDuration: 100,
+				pixelWidth: 8,
+				pixelHeight: 9,
+			},
+			containerType: 'mp4',
+		};
+
+		const adaptationSet = new AdaptationSet(NO_LANGUAGE, newOptions(), newCounter());
+		expect(adaptationSet.addRepresentation(r480p)).not.toBeNull();
+		expect(adaptationSet.addRepresentation(r720p)).not.toBeNull();
+		expect(adaptationSet.addRepresentation(r1080p)).not.toBeNull();
+		expect(adaptationSet.addRepresentation(r360p)).not.toBeNull();
+
+		expect(adaptationSet.getXml()!.getAttribute('par')).toBe('16:9');
+	});
+});
+
+describe('AdaptationSet — segment alignment (segment-driven)', () => {
+	const k480pMediaInfo: MediaInfo = {
+		videoInfo: {
+			codec: 'avc1',
+			width: 720,
+			height: 480,
+			timeScale: 10,
+			frameDuration: 10,
+			pixelWidth: 8,
+			pixelHeight: 9,
+		},
+		containerType: 'mp4',
+	};
+	const k360pMediaInfo: MediaInfo = {
+		videoInfo: {
+			codec: 'avc1',
+			width: 640,
+			height: 360,
+			timeScale: 10,
+			frameDuration: 10,
+			pixelWidth: 1,
+			pixelHeight: 1,
+		},
+		containerType: 'mp4',
+	};
+
+	const kStartTime = 0;
+	const kDuration = 10;
+	const kAnySize = 19834;
+	const kAnySegmentNumber = 1;
+
+	// shaka: TEST_F(OnDemandAdaptationSetTest, SubsegmentAlignment)
+	test('on-demand aligned → subsegmentAlignment, then unknown, then unset', () => {
+		const opts = newOptions({ dashProfile: 'onDemand' });
+		const adaptationSet = new AdaptationSet(NO_LANGUAGE, opts, newCounter());
+
+		const representation480p = adaptationSet.addRepresentation(k480pMediaInfo)!;
+		// Add a subsegment immediately before adding the 360p Representation.
+		// This should still work for VOD.
+		representation480p.addNewSegment(kStartTime, kDuration, kAnySize, kAnySegmentNumber);
+
+		const representation360p = adaptationSet.addRepresentation(k360pMediaInfo)!;
+		representation360p.addNewSegment(kStartTime, kDuration, kAnySize, kAnySegmentNumber);
+
+		const aligned = adaptationSet.getXml()!;
+		expect(aligned.getAttribute('subsegmentAlignment')).toBe('true');
+
+		// Unknown because 480p has an extra subsegment.
+		representation480p.addNewSegment(11, 20, kAnySize, kAnySegmentNumber);
+		const alignmentUnknown = adaptationSet.getXml()!;
+		expect(alignmentUnknown.getAttribute('subsegmentAlignment')).toBeUndefined();
+
+		// Add segments that make them not aligned.
+		representation360p.addNewSegment(10, 1, kAnySize, kAnySegmentNumber);
+		representation360p.addNewSegment(11, 19, kAnySize, kAnySegmentNumber);
+
+		const unaligned = adaptationSet.getXml()!;
+		expect(unaligned.getAttribute('subsegmentAlignment')).toBeUndefined();
+	});
+
+	// shaka: TEST_F(OnDemandAdaptationSetTest, ForceSetsubsegmentAlignment)
+	test('on-demand unaligned → forceSetSegmentAlignment(true) sets subsegmentAlignment', () => {
+		const opts = newOptions({ dashProfile: 'onDemand' });
+		const adaptationSet = new AdaptationSet(NO_LANGUAGE, opts, newCounter());
+		const representation480p = adaptationSet.addRepresentation(k480pMediaInfo)!;
+		const representation360p = adaptationSet.addRepresentation(k360pMediaInfo)!;
+
+		// Different starting times to make the segments "not aligned".
+		representation480p.addNewSegment(1, kDuration, kAnySize, kAnySegmentNumber);
+		representation360p.addNewSegment(2, kDuration, kAnySize, kAnySegmentNumber);
+		const unaligned = adaptationSet.getXml()!;
+		expect(unaligned.getAttribute('subsegmentAlignment')).toBeUndefined();
+
+		adaptationSet.forceSetSegmentAlignment(true);
+		const aligned = adaptationSet.getXml()!;
+		expect(aligned.getAttribute('subsegmentAlignment')).toBe('true');
+	});
+
+	// shaka: TEST_F(LiveAdaptationSetTest, SegmentAlignmentDynamicMpd)
+	test('live + dynamic aligned → segmentAlignment, then unset when unaligned', () => {
+		const opts = newOptions({ dashProfile: 'live', mpdType: 'dynamic' });
+		const adaptationSet = new AdaptationSet(NO_LANGUAGE, opts, newCounter());
+
+		// For dynamic MPD the Representations are synchronized, so both are added
+		// before any segments.
+		const representation480p = adaptationSet.addRepresentation(k480pMediaInfo)!;
+		const representation360p = adaptationSet.addRepresentation(k360pMediaInfo)!;
+
+		representation480p.addNewSegment(kStartTime, kDuration, kAnySize, kAnySegmentNumber);
+		representation360p.addNewSegment(kStartTime, kDuration, kAnySize, kAnySegmentNumber);
+		const aligned = adaptationSet.getXml()!;
+		expect(aligned.getAttribute('segmentAlignment')).toBe('true');
+
+		// Add segments that make them not aligned.
+		representation480p.addNewSegment(11, 20, kAnySize, kAnySegmentNumber);
+		representation360p.addNewSegment(10, 1, kAnySize, kAnySegmentNumber);
+		representation360p.addNewSegment(11, 19, kAnySize, kAnySegmentNumber);
+
+		const unaligned = adaptationSet.getXml()!;
+		expect(unaligned.getAttribute('segmentAlignment')).toBeUndefined();
+	});
+
+	// shaka: TEST_F(LiveAdaptationSetTest, SegmentAlignmentStaticMpd)
+	test('live + static aligned → segmentAlignment', () => {
+		const opts = newOptions({ dashProfile: 'live', mpdType: 'static' });
+		const adaptationSet = new AdaptationSet(NO_LANGUAGE, opts, newCounter());
+
+		// For static MPD the Representations are not synchronized, so the second
+		// may be added after segments are added to the first.
+		const representation480p = adaptationSet.addRepresentation(k480pMediaInfo)!;
+		representation480p.addNewSegment(kStartTime, kDuration, kAnySize, kAnySegmentNumber);
+
+		const representation360p = adaptationSet.addRepresentation(k360pMediaInfo)!;
+		representation360p.addNewSegment(kStartTime, kDuration, kAnySize, kAnySegmentNumber);
+
+		representation480p.addNewSegment(kStartTime + kDuration, kDuration, kAnySize, kAnySegmentNumber);
+		representation360p.addNewSegment(kStartTime + kDuration, kDuration, kAnySize, kAnySegmentNumber);
+
+		const aligned = adaptationSet.getXml()!;
+		expect(aligned.getAttribute('segmentAlignment')).toBe('true');
+	});
+});
+
+describe('AdaptationSet — text', () => {
+	// shaka: TEST_F(OnDemandAdaptationSetTest, Text)
+	test('SUBTITLE text type → Role value="subtitle" + BaseURL', () => {
+		const opts = newOptions({ dashProfile: 'onDemand' });
+		const textMediaInfo: MediaInfo = {
+			textInfo: { codec: 'ttml', language: 'en', type: 'subtitle' },
+			mediaDurationSeconds: 35,
+			bandwidth: 1000,
+			mediaFileUrl: 'subtitle.xml',
+			containerType: 'text',
+		};
+
+		const adaptationSet = new AdaptationSet('en', opts, newCounter());
+		expect(adaptationSet.addRepresentation(textMediaInfo)).not.toBeNull();
+
+		expectXmlEqual(
+			renderAs(adaptationSet),
+			'<AdaptationSet contentType="text" lang="en">'
+			+ '  <Role schemeIdUri="urn:mpeg:dash:role:2011"'
+			+ '   value="subtitle"/>\n'
+			+ '  <Representation id="0" bandwidth="1000"'
+			+ '   mimeType="application/ttml+xml">'
+			+ '    <BaseURL>subtitle.xml</BaseURL>'
+			+ '  </Representation>'
+			+ '</AdaptationSet>',
+		);
+	});
+});

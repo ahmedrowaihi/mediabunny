@@ -12,21 +12,24 @@
  * This file is dual-licensed under BSD-3-Clause (original) and MPL-2.0 (mediabunny).
  */
 
+import { languageToShortestForm } from '../dash/dash-language-utils';
+import { getSegmentName } from '../dash/dash-segment-name';
 import { BandwidthEstimator } from './hls-bandwidth-estimator';
 import {
 	DiscontinuityEntry,
 	EncryptionInfoEntry,
 	type HlsEntry,
+	type HlsEntryType,
 	PlacementOpportunityEntry,
 	ProgramDateTimeEntry,
 	SegmentInfoEntry,
 } from './hls-entries';
 import { Tag } from './hls-tag';
-import type { HlsEncryptionMethod } from './hls-types';
 import {
 	adjustHlsVideoCodec,
 	getMediaInfoLanguage,
 	getTimeScale,
+	type HlsEncryptionMethod,
 	type HlsMediaInfo,
 	type HlsMediaPlaylistStreamType,
 	type HlsParams,
@@ -86,7 +89,8 @@ const buildPlaylistHeader = (
 	}
 
 	if (startTimeOffset !== undefined) {
-		lines.push(`#EXT-X-START:TIME-OFFSET=${startTimeOffset}`);
+		// Mirror shaka's `absl::StrFormat("...=%f...")`: printf %f is fixed 6 decimals.
+		lines.push(`#EXT-X-START:TIME-OFFSET=${startTimeOffset.toFixed(6)}`);
 	}
 
 	// EXT-X-MAP comes last in the header — segments and key info follow.
@@ -142,6 +146,32 @@ export class MediaPlaylist {
 	private insertedDiscontinuityTag = false;
 	/** @internal */
 	private referenceTimeMs: number | null = null;
+	/**
+	 * Sum of segment durations currently in the playlist (live sliding window).
+	 * @internal
+	 */
+	private currentBufferDepth = 0;
+	/**
+	 * Current `#EXT-X-MEDIA-SEQUENCE`. Seeded from `HlsParams.mediaSequenceNumber`
+	 * and advanced by {@link MediaPlaylist.slideWindow}. Mirrors shaka's
+	 * `media_sequence_number_`.
+	 * @internal
+	 */
+	private mediaSequenceNumber = 0;
+	/**
+	 * Current `#EXT-X-DISCONTINUITY-SEQUENCE`, advanced by
+	 * {@link MediaPlaylist.slideWindow} as discontinuities slide out. Mirrors
+	 * shaka's `discontinuity_sequence_number_`.
+	 * @internal
+	 */
+	private discontinuitySequenceNumber = 0;
+	/**
+	 * File names of segments that have left the live window and are ready for the
+	 * caller to delete. Bounded to `preservedSegmentsOutsideLiveWindow`. Mirrors
+	 * shaka's `segments_to_be_removed_`.
+	 * @internal
+	 */
+	private readonly segmentsToBeRemoved: string[] = [];
 	/** @internal */
 	private readonly bandwidthEstimator = new BandwidthEstimator();
 	/**
@@ -161,9 +191,12 @@ export class MediaPlaylist {
 		/** Group identifier (used as `GROUP-ID` in `#EXT-X-MEDIA`). */
 		private readonly groupId: string,
 	) {
+		this.mediaSequenceNumber = hlsParams.mediaSequenceNumber ?? 0;
+		this.discontinuitySequenceNumber = hlsParams.discontinuitySequenceNumber ?? 0;
+
 		// Mirror shaka: when a forced media sequence number is set, the playlist
 		// starts with a discontinuity tag.
-		if ((hlsParams.mediaSequenceNumber ?? 0) > 0) {
+		if (this.mediaSequenceNumber > 0) {
 			this.entries.push(new DiscontinuityEntry());
 		}
 	}
@@ -248,12 +281,19 @@ export class MediaPlaylist {
 		startByteOffset: number,
 		size: number,
 	): void {
+		// In order for the oldest segment to be accessible for at least
+		// timeShiftBufferDepth seconds, the latest segment should not be in the
+		// sliding window, so the window is slid BEFORE this segment's duration is
+		// added to currentBufferDepth. Mirrors shaka's AddSegmentInfoEntry.
+		this.slideWindow();
+
 		const durationSeconds = this.timeScale > 0 ? duration / this.timeScale : 0;
 		this.longestSegmentDurationSeconds = Math.max(
 			this.longestSegmentDurationSeconds,
 			durationSeconds,
 		);
 		this.bandwidthEstimator.addBlock(size, durationSeconds);
+		this.currentBufferDepth += durationSeconds;
 
 		// Out-of-order detection (matches shaka): if the most recent EXTINF has a
 		// later start_time than this segment, insert an EXT-X-DISCONTINUITY.
@@ -275,6 +315,101 @@ export class MediaPlaylist {
 		});
 		this.entries.push(entry);
 		this.previousSegmentEndOffset = startByteOffset + size - 1;
+	}
+
+	/**
+	 * Slide the live window: drop leading segments that fall completely outside
+	 * `timeShiftBufferDepth`, advancing the media- and discontinuity-sequence
+	 * numbers. Leading `#EXT-X-KEY` entries are preserved and re-added at the
+	 * front so the remaining segments keep their encryption context. Mirrors
+	 * shaka's `SlideWindow`; no-op unless the playlist is `live` with a positive
+	 * `timeShiftBufferDepth`.
+	 * @internal
+	 */
+	private slideWindow(): void {
+		const timeShiftBufferDepth = this.hlsParams.timeShiftBufferDepth ?? 0;
+		if (timeShiftBufferDepth <= 0 || this.hlsParams.playlistType !== 'live') {
+			return;
+		}
+		if (this.currentBufferDepth <= timeShiftBufferDepth) {
+			return;
+		}
+
+		// Temporary list to hold the EXT-X-KEYs. This lets us remove an EXTINF
+		// without dropping the EXT-X-KEYs that precede it — they are moved here and
+		// re-added afterwards. Consecutive key entries are either all removed or all
+		// kept, so prevEntryType tracks whether we are in a key run.
+		let extXKeys: HlsEntry[] = [];
+		let prevEntryType: HlsEntryType = 'extInf';
+
+		let last = 0;
+		for (; last < this.entries.length; last++) {
+			const entry = this.entries[last]!;
+			const entryType = entry.type;
+			if (entryType === 'extKey') {
+				if (prevEntryType !== 'extKey') {
+					extXKeys = [];
+				}
+				extXKeys.push(entry);
+			} else if (entryType === 'extDiscontinuity') {
+				this.discontinuitySequenceNumber++;
+			} else if (entryType === 'extInf') {
+				const segmentInfo = entry as SegmentInfoEntry;
+				// Remove the current segment only if it falls completely out of the
+				// time shift buffer range.
+				const segmentWithinTimeShiftBuffer
+					= this.currentBufferDepth - segmentInfo.getDurationSeconds() < timeShiftBufferDepth;
+				if (segmentWithinTimeShiftBuffer) {
+					break;
+				}
+				this.currentBufferDepth -= segmentInfo.getDurationSeconds();
+				this.removeOldSegment(segmentInfo.getStartTime());
+				this.mediaSequenceNumber++;
+			}
+			prevEntryType = entryType;
+		}
+		this.entries.splice(0, last);
+		// Add key entries back at the front.
+		this.entries.unshift(...extXKeys);
+	}
+
+	/**
+	 * Queue the segment that just left the live window for deletion. Shaka deletes
+	 * the file here; this port has no filesystem, so it retains the name in
+	 * {@link MediaPlaylist.getSegmentsToBeRemoved} (bounded to
+	 * `preservedSegmentsOutsideLiveWindow`) for the caller to delete. Mirrors
+	 * shaka's `RemoveOldSegment`.
+	 * @internal
+	 */
+	private removeOldSegment(startTime: number): void {
+		const preserved = this.hlsParams.preservedSegmentsOutsideLiveWindow ?? 0;
+		if (preserved === 0) {
+			return;
+		}
+		if (this.streamType === 'videoIFramesOnly') {
+			return;
+		}
+
+		this.segmentsToBeRemoved.push(getSegmentName(
+			this.mediaInfo?.segmentTemplateUrl ?? '',
+			startTime,
+			this.mediaSequenceNumber + 1,
+			this.mediaInfo?.bandwidth ?? 0,
+		));
+		// Shaka retries deletion on failure; without filesystem access we drop the
+		// front name once the preserved count is exceeded.
+		while (this.segmentsToBeRemoved.length > preserved) {
+			this.segmentsToBeRemoved.shift();
+		}
+	}
+
+	/**
+	 * File names of segments that have slid out of the live window and are ready
+	 * to be deleted by the caller (this port performs no filesystem I/O). The list
+	 * is bounded to `HlsParams.preservedSegmentsOutsideLiveWindow`.
+	 */
+	getSegmentsToBeRemoved(): readonly string[] {
+		return this.segmentsToBeRemoved;
 	}
 
 	/**
@@ -450,9 +585,13 @@ export class MediaPlaylist {
 		return this.compatibleBrand;
 	}
 
-	/** Returns the playlist's language tag (`audioInfo.language` || `textInfo.language` || `''`). */
+	/**
+	 * Returns the playlist's language tag reduced to its BCP-47 shortest form.
+	 * Mirrors shaka's `MediaPlaylist::GetLanguage`, which applies
+	 * `LanguageToShortestForm` (e.g. `eng` → `en`, `eng-US` → `en-US`).
+	 */
 	getLanguage(): string {
-		return this.language;
+		return languageToShortestForm(this.language);
 	}
 
 	/** Returns the configured `CHARACTERISTICS` attribute values. */
@@ -463,6 +602,18 @@ export class MediaPlaylist {
 	/** Returns `true` when this is a forced subtitle rendition. */
 	isForcedSubtitle(): boolean {
 		return this.forcedSubtitle;
+	}
+
+	/**
+	 * Returns `true` when this rendition is Descriptive Video Service (DVS) audio,
+	 * i.e. its sole characteristic is `public.accessibility.describes-video`.
+	 * Mirrors shaka's `MediaPlaylist::is_dvs`. Per the HLS Authoring Specification
+	 * for Apple Devices §2.12, a DVS rendition must be `AUTOSELECT=YES`.
+	 */
+	isDvs(): boolean {
+		const dvsCharacteristic = 'public.accessibility.describes-video';
+		return this.characteristics.length === 1
+			&& this.characteristics[0] === dvsCharacteristic;
 	}
 
 	/** Returns the output filename for this `.m3u8` playlist. */
@@ -483,6 +634,22 @@ export class MediaPlaylist {
 	/** Returns the media-info supplied to {@link MediaPlaylist.setMediaInfo}, if any. */
 	getMediaInfo(): HlsMediaInfo | undefined {
 		return this.mediaInfo;
+	}
+
+	/**
+	 * Returns `true` when a stream index has been supplied via
+	 * `HlsMediaInfo.index`. Mirrors shaka's `MediaInfo::has_index`.
+	 */
+	hasIndex(): boolean {
+		return this.mediaInfo?.index !== undefined;
+	}
+
+	/**
+	 * Returns the stream index used to order renditions in the master playlist,
+	 * or `0` when unset. Mirrors shaka's `MediaInfo::index`.
+	 */
+	getIndex(): number {
+		return this.mediaInfo?.index ?? 0;
 	}
 
 	/**
@@ -618,8 +785,8 @@ export class MediaPlaylist {
 			this.targetDurationSeconds,
 			playlistType,
 			this.streamType,
-			this.hlsParams.mediaSequenceNumber ?? 0,
-			this.hlsParams.discontinuitySequenceNumber ?? 0,
+			this.mediaSequenceNumber,
+			this.discontinuitySequenceNumber,
 			this.hlsParams.startTimeOffset,
 			generatorBanner,
 		);

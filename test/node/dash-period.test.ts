@@ -160,6 +160,75 @@ describe('Period — content type behaviour', () => {
 	});
 });
 
+describe('Period — text default language', () => {
+	const englishTextInfo: MediaInfo = {
+		textInfo: { codec: 'webvtt', language: 'en', type: 'subtitle' },
+		containerType: 'text',
+	};
+
+	// shaka: TEST_F(PeriodTest, TextAdaptationSetDefaultLanguage)
+	test('TextAdaptationSetDefaultLanguage', () => {
+		const opts = newOptions({});
+		opts.mpdParams.defaultLanguage = 'en';
+		const period = new Period(DEFAULT_PERIOD_ID, DEFAULT_PERIOD_START_TIME, opts, newCounter());
+		const addRoleSpy = vi.spyOn(AdaptationSet.prototype, 'addRole');
+		const forceAlignSpy = vi.spyOn(AdaptationSet.prototype, 'forceSetSegmentAlignment');
+		const set = period.getOrCreateAdaptationSet(englishTextInfo, true);
+		expect(set).not.toBeNull();
+		expect(addRoleSpy).toHaveBeenCalledWith('main');
+		expect(forceAlignSpy).toHaveBeenCalledWith(true);
+		addRoleSpy.mockRestore();
+		forceAlignSpy.mockRestore();
+	});
+
+	// shaka: TEST_F(PeriodTest, TextAdaptationSetNonDefaultLanguage)
+	test('TextAdaptationSetNonDefaultLanguage', () => {
+		const opts = newOptions({});
+		opts.mpdParams.defaultLanguage = 'fr';
+		const period = new Period(DEFAULT_PERIOD_ID, DEFAULT_PERIOD_START_TIME, opts, newCounter());
+		const addRoleSpy = vi.spyOn(AdaptationSet.prototype, 'addRole');
+		const forceAlignSpy = vi.spyOn(AdaptationSet.prototype, 'forceSetSegmentAlignment');
+		const set = period.getOrCreateAdaptationSet(englishTextInfo, true);
+		expect(set).not.toBeNull();
+		expect(addRoleSpy).not.toHaveBeenCalledWith('main');
+		expect(forceAlignSpy).toHaveBeenCalledWith(true);
+		addRoleSpy.mockRestore();
+		forceAlignSpy.mockRestore();
+	});
+
+	// shaka: TEST_F(PeriodTest, TextAdaptationSetNonDefaultLanguageButDefaultTextLanguage)
+	test('TextAdaptationSetNonDefaultLanguageButDefaultTextLanguage', () => {
+		const opts = newOptions({});
+		opts.mpdParams.defaultLanguage = 'fr';
+		opts.mpdParams.defaultTextLanguage = 'en';
+		const period = new Period(DEFAULT_PERIOD_ID, DEFAULT_PERIOD_START_TIME, opts, newCounter());
+		const addRoleSpy = vi.spyOn(AdaptationSet.prototype, 'addRole');
+		const forceAlignSpy = vi.spyOn(AdaptationSet.prototype, 'forceSetSegmentAlignment');
+		const set = period.getOrCreateAdaptationSet(englishTextInfo, true);
+		expect(set).not.toBeNull();
+		expect(addRoleSpy).toHaveBeenCalledWith('main');
+		expect(forceAlignSpy).toHaveBeenCalledWith(true);
+		addRoleSpy.mockRestore();
+		forceAlignSpy.mockRestore();
+	});
+
+	// shaka: TEST_F(PeriodTest, TextAdaptationSetDefaultLanguageButNonDefaultTextLanguage)
+	test('TextAdaptationSetDefaultLanguageButNonDefaultTextLanguage', () => {
+		const opts = newOptions({});
+		opts.mpdParams.defaultLanguage = 'en';
+		opts.mpdParams.defaultTextLanguage = 'fr';
+		const period = new Period(DEFAULT_PERIOD_ID, DEFAULT_PERIOD_START_TIME, opts, newCounter());
+		const addRoleSpy = vi.spyOn(AdaptationSet.prototype, 'addRole');
+		const forceAlignSpy = vi.spyOn(AdaptationSet.prototype, 'forceSetSegmentAlignment');
+		const set = period.getOrCreateAdaptationSet(englishTextInfo, true);
+		expect(set).not.toBeNull();
+		expect(addRoleSpy).not.toHaveBeenCalledWith('main');
+		expect(forceAlignSpy).toHaveBeenCalledWith(true);
+		addRoleSpy.mockRestore();
+		forceAlignSpy.mockRestore();
+	});
+});
+
 describe('Period — closed captions', () => {
 	// shaka: TEST_F(PeriodTest, ClosedCaptions) — CEA-608 channel
 	test('ClosedCaptions emit Accessibility on video AdaptationSets', () => {
@@ -304,5 +373,170 @@ describe('Period — accessors', () => {
 		period.getXml(true);
 		expect(audioSet.id()).toBe(0);
 		expect(videoSet.id()).toBe(1);
+	});
+});
+
+const bytes = (text: string): Uint8Array => new TextEncoder().encode(text);
+
+// shaka: PeriodTestWithContentProtection (parametrized on
+// content_protection_in_adaptation_set_ via ::testing::Bool()). These exercise
+// Period-level orchestration — AdaptationSet creation, ContentProtection
+// emission, and switchable cross-linking — which is distinct from the
+// AdaptationSet.matchAdaptationSet unit coverage in dash-adaptation-set.test.ts.
+describe('Period — content protection', () => {
+	const sdVideoInfo = {
+		codec: 'avc1',
+		width: 640,
+		height: 360,
+		timeScale: 10,
+		frameDuration: 10,
+		pixelWidth: 1,
+		pixelHeight: 1,
+	};
+	const hdVideoInfo = {
+		codec: 'avc1',
+		width: 1280,
+		height: 720,
+		timeScale: 10,
+		frameDuration: 10,
+		pixelWidth: 1,
+		pixelHeight: 1,
+	};
+
+	// shaka: TEST_P(PeriodTestWithContentProtection, DifferentProtectedContent)
+	// Different protected content → two AdaptationSets when protection is carried
+	// on the AdaptationSet; a single AdaptationSet when it is not. Their DRM UUIDs
+	// differ, so the two sets are NOT switchable.
+	test.each([true, false])('DifferentProtectedContent (cpInAdaptationSet=%s)', (cpInAS) => {
+		const sd: MediaInfo = {
+			videoInfo: sdVideoInfo,
+			protectedContent: {
+				contentProtectionEntry: [
+					{ uuid: 'myuuid', nameVersion: 'MyContentProtection version 1', pssh: bytes('pssh1') },
+				],
+				defaultKeyId: bytes('_default_key_id_'),
+			},
+			containerType: 'mp4',
+		};
+		const hd: MediaInfo = {
+			videoInfo: hdVideoInfo,
+			protectedContent: {
+				contentProtectionEntry: [
+					{ uuid: 'anotheruuid', nameVersion: 'SomeOtherProtection version 3', pssh: bytes('pssh2') },
+				],
+				defaultKeyId: bytes('.default.key.id.'),
+			},
+			containerType: 'mp4',
+		};
+
+		const period = new Period(DEFAULT_PERIOD_ID, DEFAULT_PERIOD_START_TIME, newOptions(), newCounter());
+		const switchingSpy = vi.spyOn(AdaptationSet.prototype, 'addAdaptationSetSwitching');
+		const sdSet = period.getOrCreateAdaptationSet(sd, cpInAS)!;
+		const hdSet = period.getOrCreateAdaptationSet(hd, cpInAS)!;
+
+		if (cpInAS) {
+			expect(hdSet).not.toBe(sdSet);
+			expect(period.getAdaptationSets()).toHaveLength(2);
+			// Different DRM UUIDs → not switchable.
+			expect(switchingSpy).not.toHaveBeenCalled();
+		} else {
+			expect(hdSet).toBe(sdSet);
+			expect(period.getAdaptationSets()).toHaveLength(1);
+		}
+		switchingSpy.mockRestore();
+	});
+
+	// shaka: TEST_P(PeriodTestWithContentProtection, SameProtectedContent)
+	// Identical protected content → a single AdaptationSet regardless of whether
+	// protection is carried on the AdaptationSet.
+	test.each([true, false])('SameProtectedContent (cpInAdaptationSet=%s)', (cpInAS) => {
+		const protectedContent = {
+			contentProtectionEntry: [
+				{ uuid: 'myuuid', nameVersion: 'MyContentProtection version 1', pssh: bytes('psshbox') },
+			],
+			defaultKeyId: bytes('.DEFAULT.KEY.ID.'),
+		};
+		const sd: MediaInfo = { videoInfo: sdVideoInfo, protectedContent, containerType: 'mp4' };
+		const hd: MediaInfo = { videoInfo: hdVideoInfo, protectedContent, containerType: 'mp4' };
+
+		const period = new Period(DEFAULT_PERIOD_ID, DEFAULT_PERIOD_START_TIME, newOptions(), newCounter());
+		const switchingSpy = vi.spyOn(AdaptationSet.prototype, 'addAdaptationSetSwitching');
+		const sdSet = period.getOrCreateAdaptationSet(sd, cpInAS)!;
+		const hdSet = period.getOrCreateAdaptationSet(hd, cpInAS)!;
+
+		expect(hdSet).toBe(sdSet);
+		expect(period.getAdaptationSets()).toHaveLength(1);
+		// Only one AdaptationSet → nothing to switch to.
+		expect(switchingSpy).not.toHaveBeenCalled();
+		switchingSpy.mockRestore();
+	});
+
+	// shaka: TEST_P(PeriodTestWithContentProtection, SetAdaptationSetSwitching)
+	// Same DRM UUID but different default key IDs → separate AdaptationSets that
+	// are all switchable with one another (SD↔HD, then SD↔4k and HD↔4k). With
+	// protection not carried on the AdaptationSet, all three collapse to one set.
+	test.each([true, false])('SetAdaptationSetSwitching (cpInAdaptationSet=%s)', (cpInAS) => {
+		const sd: MediaInfo = {
+			videoInfo: sdVideoInfo,
+			protectedContent: {
+				contentProtectionEntry: [
+					{ uuid: 'myuuid', nameVersion: 'MyContentProtection version 1', pssh: bytes('pssh_sd') },
+				],
+				defaultKeyId: bytes('_default_key_id_'),
+			},
+			containerType: 'mp4',
+		};
+		const hd: MediaInfo = {
+			videoInfo: hdVideoInfo,
+			protectedContent: {
+				contentProtectionEntry: [
+					{ uuid: 'myuuid', nameVersion: 'MyContentProtection version 1', pssh: bytes('pssh_hd') },
+				],
+				defaultKeyId: bytes('.DEFAULT.KEY.ID.'),
+			},
+			containerType: 'mp4',
+		};
+		const fourK: MediaInfo = {
+			videoInfo: {
+				codec: 'avc1',
+				width: 4096,
+				height: 2160,
+				timeScale: 10,
+				frameDuration: 10,
+				pixelWidth: 1,
+				pixelHeight: 1,
+			},
+			protectedContent: {
+				contentProtectionEntry: [
+					{ uuid: 'myuuid', nameVersion: 'MyContentProtection version 1', pssh: bytes('pssh_4k') },
+				],
+				defaultKeyId: bytes('some16bytestring'),
+			},
+			containerType: 'mp4',
+		};
+
+		const period = new Period(DEFAULT_PERIOD_ID, DEFAULT_PERIOD_START_TIME, newOptions(), newCounter());
+		const switchingSpy = vi.spyOn(AdaptationSet.prototype, 'addAdaptationSetSwitching');
+		const sdSet = period.getOrCreateAdaptationSet(sd, cpInAS)!;
+		const hdSet = period.getOrCreateAdaptationSet(hd, cpInAS)!;
+		const fourKSet = period.getOrCreateAdaptationSet(fourK, cpInAS)!;
+
+		if (cpInAS) {
+			expect(hdSet).not.toBe(sdSet);
+			expect(fourKSet).not.toBe(sdSet);
+			expect(fourKSet).not.toBe(hdSet);
+			expect(period.getAdaptationSets()).toHaveLength(3);
+			// SD↔HD (2 calls), then SD↔4k + HD↔4k (4 calls) = 6 cross-links.
+			expect(switchingSpy).toHaveBeenCalledTimes(6);
+			expect(switchingSpy).toHaveBeenCalledWith(hdSet);
+			expect(switchingSpy).toHaveBeenCalledWith(sdSet);
+			expect(switchingSpy).toHaveBeenCalledWith(fourKSet);
+		} else {
+			expect(hdSet).toBe(sdSet);
+			expect(fourKSet).toBe(sdSet);
+			expect(period.getAdaptationSets()).toHaveLength(1);
+			expect(switchingSpy).not.toHaveBeenCalled();
+		}
+		switchingSpy.mockRestore();
 	});
 });

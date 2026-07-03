@@ -125,9 +125,11 @@ export class RepresentationBaseXmlNode extends XmlNode {
 	 * Append one `<ContentProtection>` child built from the supplied descriptor.
 	 * Mirrors shaka's `RepresentationBaseXmlNode::AddContentProtectionElement`.
 	 *
-	 * Field-precedence rule: when `value` or `schemeIdUri` are non-empty AND
-	 * `additionalAttributes` also contains keys with the same names, the
-	 * top-level fields win — duplicates in `additionalAttributes` are ignored.
+	 * Sets `value` (when non-empty) and `schemeIdUri` first, then blindly sets
+	 * every entry in `additionalAttributes` — so a duplicate `value` /
+	 * `schemeIdUri` key in the map overwrites the top-level one (later-set-wins).
+	 * Shaka keeps output clean by running `removeDuplicateAttributes` upstream,
+	 * not by skipping duplicates here.
 	 */
 	addContentProtectionElement(element: ContentProtectionElement): boolean {
 		const node = new XmlNode('ContentProtection');
@@ -142,12 +144,6 @@ export class RepresentationBaseXmlNode extends XmlNode {
 		}
 
 		for (const [key, value] of element.additionalAttributes) {
-			if (key === 'value' && element.value.length > 0) {
-				continue;
-			}
-			if (key === 'schemeIdUri' && element.schemeIdUri.length > 0) {
-				continue;
-			}
 			if (!node.setStringAttribute(key, value)) {
 				return false;
 			}
@@ -341,10 +337,7 @@ export class RepresentationXmlNode extends RepresentationBaseXmlNode {
 		useSegmentList: boolean,
 		targetSegmentDuration: number,
 	): boolean {
-		const useSingleSegmentUrlWithMedia = mediaInfo.textInfo !== undefined
-			&& mediaInfo.presentationTimeOffset !== undefined;
-
-		if (mediaInfo.mediaFileUrl !== undefined && !useSingleSegmentUrlWithMedia) {
+		if (mediaInfo.mediaFileUrl !== undefined) {
 			const baseUrl = new XmlNode('BaseURL');
 			baseUrl.setPathContent(mediaInfo.mediaFileUrl);
 			if (!this.addChild(baseUrl)) {
@@ -352,19 +345,20 @@ export class RepresentationXmlNode extends RepresentationBaseXmlNode {
 			}
 		}
 
+		// For single-file text tracks with a presentationTimeOffset we still need a
+		// SegmentBase element to carry the offset — SegmentBase is correct here
+		// because the track is a single segment, not a segmented stream.
 		const needSegmentBaseOrList = useSegmentList
 			|| mediaInfo.indexRange !== undefined
 			|| mediaInfo.initRange !== undefined
 			|| (mediaInfo.referenceTimeScale !== undefined && mediaInfo.textInfo === undefined)
-			|| useSingleSegmentUrlWithMedia;
+			|| (mediaInfo.textInfo !== undefined && mediaInfo.presentationTimeOffset !== undefined);
 
 		if (!needSegmentBaseOrList) {
 			return true;
 		}
 
-		const child = new XmlNode(
-			(useSegmentList || useSingleSegmentUrlWithMedia) ? 'SegmentList' : 'SegmentBase',
-		);
+		const child = new XmlNode(useSegmentList ? 'SegmentList' : 'SegmentBase');
 
 		// Forcing SegmentList for longer audio causes sidx atom to not be
 		// generated, therefore indexRange is not added to MPD if flag is set.
@@ -378,7 +372,7 @@ export class RepresentationXmlNode extends RepresentationBaseXmlNode {
 			if (!child.setIntegerAttribute('timescale', mediaInfo.referenceTimeScale)) {
 				return false;
 			}
-			if (useSegmentList && !useSingleSegmentUrlWithMedia) {
+			if (useSegmentList) {
 				const durationSeconds = Math.floor(targetSegmentDuration * mediaInfo.referenceTimeScale);
 				if (!child.setIntegerAttribute('duration', durationSeconds)) {
 					return false;
@@ -398,18 +392,6 @@ export class RepresentationXmlNode extends RepresentationBaseXmlNode {
 				return false;
 			}
 			if (!child.addChild(initialization)) {
-				return false;
-			}
-		}
-
-		if (useSingleSegmentUrlWithMedia && mediaInfo.mediaFileUrl !== undefined) {
-			const mediaUrl = new XmlNode('SegmentURL');
-			// shaka writes the URL-encoded version directly into the `media`
-			// attribute (not as content). Replicating that exactly.
-			if (!mediaUrl.setStringAttribute('media', urlEncodeAttribute(mediaInfo.mediaFileUrl))) {
-				return false;
-			}
-			if (!child.addChild(mediaUrl)) {
 				return false;
 			}
 		}
@@ -642,24 +624,3 @@ export class RepresentationXmlNode extends RepresentationBaseXmlNode {
 		return this.setIntegerAttribute('audioSamplingRate', audioInfo.samplingFrequency);
 	}
 }
-
-// Re-use the same RFC 3986 percent-encoding shaka does for `<SegmentURL>` @media.
-// Inlined here so we don't need to plumb an internal helper out of dash-xml-node.ts.
-/** @internal */
-const urlEncodeAttribute = (input: string): string => {
-	const bytes = new TextEncoder().encode(input);
-	let out = '';
-	for (let i = 0; i < bytes.length; i++) {
-		const b = bytes[i]!;
-		const isUnreserved = (b >= 0x41 && b <= 0x5a)
-			|| (b >= 0x61 && b <= 0x7a)
-			|| (b >= 0x30 && b <= 0x39)
-			|| b === 0x2d || b === 0x5f || b === 0x2e || b === 0x7e;
-		if (isUnreserved) {
-			out += String.fromCharCode(b);
-		} else {
-			out += '%' + b.toString(16).toUpperCase().padStart(2, '0');
-		}
-	}
-	return out;
-};

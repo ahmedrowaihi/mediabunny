@@ -167,6 +167,33 @@ export interface HlsMediaInfo {
 	hlsCharacteristics?: string[];
 	/** Reference timescale used as fallback when neither video nor audio info is set. */
 	referenceTimeScale?: number;
+	/**
+	 * Stream index used to order renditions in the master playlist. Mirrors shaka's
+	 * `MediaInfo.index`: when every registered playlist sets it, the master playlist
+	 * sorts video / I-frame / audio / subtitle renditions by this value.
+	 */
+	index?: number;
+}
+
+/**
+ * CEA (closed-caption) rendition description, registered at the master-playlist
+ * level. Mirrors shaka's `CeaCaption` struct; each entry renders one
+ * `#EXT-X-MEDIA:TYPE=CLOSED-CAPTIONS` tag.
+ *
+ * @group HLS
+ * @public
+ */
+export interface HlsCeaCaption {
+	/** Display name of the caption (rendered as `NAME`). */
+	name: string;
+	/** Language of the caption (rendered as `LANGUAGE`; omitted when empty). */
+	language: string;
+	/** Instream channel, e.g. `CC1`, `SERVICE2` (rendered as `INSTREAM-ID`). */
+	channel: string;
+	/** Whether this is the default caption (`DEFAULT=YES`). Defaults to `false`. */
+	isDefault?: boolean;
+	/** Whether this caption should be autoselected (`AUTOSELECT=YES`). Defaults to `true`. */
+	autoselect?: boolean;
 }
 
 /**
@@ -182,6 +209,19 @@ export interface HlsParams {
 	mediaSequenceNumber?: number;
 	/** Initial `#EXT-X-DISCONTINUITY-SEQUENCE` value (live only). */
 	discontinuitySequenceNumber?: number;
+	/**
+	 * Live sliding-window depth in seconds. When `> 0` and `playlistType` is `live`,
+	 * segments older than this window are dropped from the playlist, advancing
+	 * `#EXT-X-MEDIA-SEQUENCE` / `#EXT-X-DISCONTINUITY-SEQUENCE`. Mirrors shaka's
+	 * `time_shift_buffer_depth`.
+	 */
+	timeShiftBufferDepth?: number;
+	/**
+	 * Number of segments kept accessible after they leave the live window before
+	 * they are handed to {@link MediaPlaylist.getSegmentsToBeRemoved} for deletion.
+	 * Mirrors shaka's `preserved_segments_outside_live_window`.
+	 */
+	preservedSegmentsOutsideLiveWindow?: number;
 	/** Optional `#EXT-X-START:TIME-OFFSET` value in seconds. */
 	startTimeOffset?: number;
 	/** When `true`, auto-inject `#EXT-X-PROGRAM-DATE-TIME` before the first segment and after every discontinuity. */

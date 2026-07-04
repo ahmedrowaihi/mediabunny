@@ -53,6 +53,7 @@ import {
 } from '../codec-data';
 import { MetadataTags, RichImageData } from '../metadata';
 import { Bitstream } from '../../shared/bitstream';
+import { buildContentLightPayload, buildMasteringDisplayPayload } from '../hdr-metadata';
 
 export class IsobmffBoxWriter {
 	private helper = new Uint8Array(8);
@@ -797,7 +798,29 @@ export const videoSampleDescription = (
 	colorSpaceIsEmpty(trackData.info.decoderConfig.colorSpace)
 		? null
 		: colr(trackData),
+	mdcv(trackData),
+	clli(trackData),
 ]);
+
+/** Mastering Display Colour Volume Box: HDR10 mastering-display static metadata (SMPTE ST 2086). */
+export const mdcv = (trackData: IsobmffVideoTrackData) => {
+	const masteringDisplay = trackData.info.decoderConfig.hdrStaticMetadata?.masteringDisplay;
+	if (!masteringDisplay) {
+		return null;
+	}
+
+	return box('mdcv', [...buildMasteringDisplayPayload(masteringDisplay)]);
+};
+
+/** Content Light Level Box: HDR10 content-light static metadata (MaxCLL / MaxFALL, CTA-861.3). */
+export const clli = (trackData: IsobmffVideoTrackData) => {
+	const contentLight = trackData.info.decoderConfig.hdrStaticMetadata?.contentLight;
+	if (!contentLight) {
+		return null;
+	}
+
+	return box('clli', [...buildContentLightPayload(contentLight)]);
+};
 
 /** Pixel Aspect Ratio Box: Specifies pixel width:height spacing for non-square pixels. */
 export const pasp = (trackData: IsobmffVideoTrackData) => {

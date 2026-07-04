@@ -537,5 +537,31 @@ export {
 	hexToUUID,
 	updateContentProtectionPsshHelper,
 } from './dash/dash-mpd-utils';
+export {
+	type EncryptCmafOptions,
+	encryptCmaf,
+	encryptCmafInit,
+	encryptCmafSegment,
+} from './crypto/cmaf-encryptor';
+export {
+	type ProtectionScheme,
+} from './crypto/subsample-generator';
+export {
+	type DrmSystem,
+	WIDEVINE_UUID,
+	FAIRPLAY_UUID,
+	CBCS_HLS_METHOD,
+	buildCbcsContentProtections,
+	serializeContentProtection,
+	patchMpdContentProtection,
+	buildCbcsHlsKey,
+	patchMediaPlaylistKeys,
+} from './crypto/manifest-protection';
+export {
+	WIDEVINE_SYSTEM_ID,
+	COMMON_SYSTEM_ID,
+	buildWidevinePssh,
+	buildCommonPssh,
+} from './crypto/pssh';
 
 // 🐡🦔

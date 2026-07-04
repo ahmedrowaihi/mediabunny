@@ -168,7 +168,8 @@ export const extractNalUnitTypeForAvc = (byte: number) => {
 	return byte & 0x1F;
 };
 
-const removeEmulationPreventionBytes = (data: Uint8Array) => {
+/** @internal */
+export const removeEmulationPreventionBytes = (data: Uint8Array) => {
 	const result: number[] = [];
 	const len = data.length;
 
@@ -1182,7 +1183,8 @@ export const extractHevcDecoderConfigurationRecord = (packetData: Uint8Array) =>
 	}
 };
 
-const parseProfileTierLevel = (
+/** @internal */
+export const parseProfileTierLevel = (
 	bitstream: Bitstream,
 	maxNumSubLayersMinus1: number,
 ) => {
@@ -1254,7 +1256,8 @@ const skipAllStRefPicSets = (bitstream: Bitstream, num_short_term_ref_pic_sets: 
 	}
 };
 
-const skipStRefPicSet = (
+/** @internal */
+export const skipStRefPicSet = (
 	bitstream: Bitstream,
 	stRpsIdx: number,
 	num_short_term_ref_pic_sets: number,

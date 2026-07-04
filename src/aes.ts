@@ -13,6 +13,10 @@ import { readBytes, Reader } from './reader';
 
 export const AES_128_BLOCK_SIZE = 16;
 
+const Te0 = new Uint32Array(256);
+const Te1 = new Uint32Array(256);
+const Te2 = new Uint32Array(256);
+const Te3 = new Uint32Array(256);
 const Te4 = new Uint32Array(256);
 const Td0 = new Uint32Array(256);
 const Td1 = new Uint32Array(256);
@@ -59,6 +63,15 @@ const generateAesTables = () => {
 		// Te4: Forward S-Box packed
 		Te4[i] = (s << 24) | (s << 16) | (s << 8) | s;
 
+		// Te0-Te3: MixColumns applied to the Forward S-Box. Coefficients 0x02, 0x01, 0x01, 0x03.
+		const e0 = mul(s, 0x02);
+		const e3 = mul(s, 0x03);
+		const we = (e0 << 24) | (s << 16) | (s << 8) | e3;
+		Te0[i] = we;
+		Te1[i] = (we >>> 8) | (we << 24); // Rotate right 8
+		Te2[i] = (we >>> 16) | (we << 16); // Rotate right 16
+		Te3[i] = (we >>> 24) | (we << 8); // Rotate right 24
+
 		// Td4: Inverse S-Box packed
 		Td4[i] = (is << 24) | (is << 16) | (is << 8) | is;
 
@@ -94,6 +107,8 @@ export type Aes128CbcContextInit = {
 /** A context for doing AES-128-CBC operations. Better than the Web Crypto API since we can stream it. */
 export class Aes128CbcContext {
 	roundkey = new Uint32Array(44);
+	/** Forward (encryption) round keys, captured before {@link init} inverts `roundkey` for decryption. */
+	encryptRoundkey = new Uint32Array(44);
 	iv = new Uint32Array(AES_128_BLOCK_SIZE / Uint32Array.BYTES_PER_ELEMENT);
 	in = new Uint8Array(AES_128_BLOCK_SIZE);
 	out = new Uint8Array(AES_128_BLOCK_SIZE);
@@ -134,6 +149,9 @@ export class Aes128CbcContext {
 			this.roundkey[index + 3] = this.roundkey[index - 1]! ^ this.roundkey[index + 2]!;
 		}
 
+		// Keep the forward key schedule for encryption before the decrypt-only transforms below.
+		this.encryptRoundkey.set(this.roundkey);
+
 		// Invert the order of the round keys
 		for (let i = 0, j = 40; i < j; i += 4, j -= 4) {
 			for (let k = 0; k < 4; k++) {
@@ -154,6 +172,90 @@ export class Aes128CbcContext {
 						^ Td3[Te4[(rk >>> 0) & 0xff]! & 0xff]!;
 			}
 		}
+	}
+
+	/** Reset the IV without re-deriving the key schedule. A short IV (e.g. 8-byte cbcs) is right-padded with zeros. */
+	setIv(iv: Uint8Array) {
+		const padded = new Uint8Array(AES_128_BLOCK_SIZE);
+		padded.set(iv.subarray(0, AES_128_BLOCK_SIZE));
+		const view = new DataView(padded.buffer);
+		this.iv[0] = view.getUint32(0, false);
+		this.iv[1] = view.getUint32(4, false);
+		this.iv[2] = view.getUint32(8, false);
+		this.iv[3] = view.getUint32(12, false);
+	}
+
+	encrypt() {
+		// CBC: XOR the plaintext block with the IV, then AES-encrypt; the ciphertext becomes the next IV.
+		let s0 = (this.inView.getUint32(0, false) ^ this.iv[0]!) ^ this.encryptRoundkey[0]!;
+		let s1 = (this.inView.getUint32(4, false) ^ this.iv[1]!) ^ this.encryptRoundkey[1]!;
+		let s2 = (this.inView.getUint32(8, false) ^ this.iv[2]!) ^ this.encryptRoundkey[2]!;
+		let s3 = (this.inView.getUint32(12, false) ^ this.iv[3]!) ^ this.encryptRoundkey[3]!;
+
+		let t0, t1, t2, t3;
+
+		// Rounds 1-9
+		for (let round = 1; round < 10; round++) {
+			const offset = round * 4;
+			t0 = Te0[s0 >>> 24]!
+				^ Te1[(s1 >>> 16) & 0xff]!
+				^ Te2[(s2 >>> 8) & 0xff]!
+				^ Te3[s3 & 0xff]!
+				^ this.encryptRoundkey[offset]!;
+			t1 = Te0[s1 >>> 24]!
+				^ Te1[(s2 >>> 16) & 0xff]!
+				^ Te2[(s3 >>> 8) & 0xff]!
+				^ Te3[s0 & 0xff]!
+				^ this.encryptRoundkey[offset + 1]!;
+			t2 = Te0[s2 >>> 24]!
+				^ Te1[(s3 >>> 16) & 0xff]!
+				^ Te2[(s0 >>> 8) & 0xff]!
+				^ Te3[s1 & 0xff]!
+				^ this.encryptRoundkey[offset + 2]!;
+			t3 = Te0[s3 >>> 24]!
+				^ Te1[(s0 >>> 16) & 0xff]!
+				^ Te2[(s1 >>> 8) & 0xff]!
+				^ Te3[s2 & 0xff]!
+				^ this.encryptRoundkey[offset + 3]!;
+
+			s0 = t0;
+			s1 = t1;
+			s2 = t2;
+			s3 = t3;
+		}
+
+		// Final Round (10): S-Box (Te4) with forward ShiftRows, no MixColumns.
+		const f0 = (Te4[s0 >>> 24]! & 0xff000000)
+			^ (Te4[(s1 >>> 16) & 0xff]! & 0x00ff0000)
+			^ (Te4[(s2 >>> 8) & 0xff]! & 0x0000ff00)
+			^ (Te4[s3 & 0xff]! & 0x000000ff)
+			^ this.encryptRoundkey[40]!;
+		const f1 = (Te4[s1 >>> 24]! & 0xff000000)
+			^ (Te4[(s2 >>> 16) & 0xff]! & 0x00ff0000)
+			^ (Te4[(s3 >>> 8) & 0xff]! & 0x0000ff00)
+			^ (Te4[s0 & 0xff]! & 0x000000ff)
+			^ this.encryptRoundkey[41]!;
+		const f2 = (Te4[s2 >>> 24]! & 0xff000000)
+			^ (Te4[(s3 >>> 16) & 0xff]! & 0x00ff0000)
+			^ (Te4[(s0 >>> 8) & 0xff]! & 0x0000ff00)
+			^ (Te4[s1 & 0xff]! & 0x000000ff)
+			^ this.encryptRoundkey[42]!;
+		const f3 = (Te4[s3 >>> 24]! & 0xff000000)
+			^ (Te4[(s0 >>> 16) & 0xff]! & 0x00ff0000)
+			^ (Te4[(s1 >>> 8) & 0xff]! & 0x0000ff00)
+			^ (Te4[s2 & 0xff]! & 0x000000ff)
+			^ this.encryptRoundkey[43]!;
+
+		this.outView.setUint32(0, f0, false);
+		this.outView.setUint32(4, f1, false);
+		this.outView.setUint32(8, f2, false);
+		this.outView.setUint32(12, f3, false);
+
+		// Ciphertext becomes the IV for the next block.
+		this.iv[0] = f0;
+		this.iv[1] = f1;
+		this.iv[2] = f2;
+		this.iv[3] = f3;
 	}
 
 	decrypt() {

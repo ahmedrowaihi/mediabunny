@@ -67,7 +67,8 @@ export class SampleEncryptor {
 		/** Override the video slice-header parser (tests inject a mock). */
 		videoSliceHeaderParser?: VideoSliceHeaderParser;
 	}) {
-		this.generator = new SubsampleGenerator(false, false);
+		// VP9 defaults to subsample encryption (shaka's `vp9_subsample_encryption`); other codecs ignore it.
+		this.generator = new SubsampleGenerator(opts.streamInfo.codec === 'vp9', false);
 		this.generator.initialize(opts.scheme, opts.streamInfo);
 
 		const parser = opts.videoSliceHeaderParser ?? this.createParser(opts.streamInfo);
@@ -104,16 +105,18 @@ export class SampleEncryptor {
 	/** @internal */
 	private createCipher(opts: {
 		streamType: 'video' | 'audio';
+		streamInfo: EncryptionStreamInfo;
 		scheme: ProtectionScheme;
 		key: Uint8Array;
 		iv: Uint8Array;
 		cryptByteBlock?: number;
 		skipByteBlock?: number;
 	}): SampleCipher {
-		// Audio in a pattern scheme uses whole-block full-sample encryption (no pattern).
-		const isVideo = opts.streamType === 'video';
-		const cryptByteBlock = isVideo ? (opts.cryptByteBlock ?? DEFAULT_CRYPT_BYTE_BLOCK) : 1;
-		const skipByteBlock = isVideo ? (opts.skipByteBlock ?? DEFAULT_SKIP_BYTE_BLOCK) : 0;
+		// Video and AC-4 use pattern encryption in a pattern scheme; other audio uses whole-block
+		// full-sample encryption. Mirrors shaka's `EncryptionHandler::SetupProtectionPattern`.
+		const usesPattern = opts.streamType === 'video' || opts.streamInfo.codec === 'ac4';
+		const cryptByteBlock = usesPattern ? (opts.cryptByteBlock ?? DEFAULT_CRYPT_BYTE_BLOCK) : 1;
+		const skipByteBlock = usesPattern ? (opts.skipByteBlock ?? DEFAULT_SKIP_BYTE_BLOCK) : 0;
 
 		if (opts.scheme === 'cenc') {
 			// cenc: block-aligned subsample encryption with AES-CTR (no pattern), per-sample IV.
@@ -125,6 +128,21 @@ export class SampleEncryptor {
 				cryptRegion: (region) => {
 					const copy = new Uint8Array(region);
 					ctr.crypt(copy);
+					return copy;
+				},
+			};
+		}
+
+		if (opts.scheme === 'cbc1') {
+			// cbc1: block-aligned subsample encryption with AES-CBC (no pattern), per-sample IV.
+			const cbc = new AesCbcEncryptor(false);
+			cbc.initializeWithIv(opts.key, opts.iv);
+			return {
+				getIv: () => cbc.getIv(),
+				updateIv: () => cbc.updateIv(),
+				cryptRegion: (region) => {
+					const copy = new Uint8Array(region);
+					cbc.crypt(copy);
 					return copy;
 				},
 			};

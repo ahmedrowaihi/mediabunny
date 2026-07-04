@@ -4,11 +4,19 @@ import {
 	WIDEVINE_UUID,
 	buildCbcsContentProtections,
 	buildCbcsHlsKey,
+	buildContentProtections,
 	patchMediaPlaylistKeys,
 	patchMpdContentProtection,
 	serializeContentProtection,
 } from '../../src/crypto/manifest-protection.js';
-import { COMMON_SYSTEM_ID, WIDEVINE_SYSTEM_ID, buildCommonPssh, buildWidevinePssh } from '../../src/crypto/pssh.js';
+import {
+	COMMON_SYSTEM_ID,
+	PLAYREADY_SYSTEM_ID,
+	WIDEVINE_SYSTEM_ID,
+	buildCommonPssh,
+	buildPlayReadyPssh,
+	buildWidevinePssh,
+} from '../../src/crypto/pssh.js';
 
 const KID = new Uint8Array(16).fill(0xa0);
 const KID_UUID = 'a0a0a0a0-a0a0-a0a0-a0a0-a0a0a0a0a0a0';
@@ -20,6 +28,19 @@ describe('DASH cbcs ContentProtection', () => {
 			'<ContentProtection schemeIdUri="urn:mpeg:dash:mp4protection:2011" value="cbcs" '
 			+ `cenc:default_KID="${KID_UUID}"/>`,
 		);
+	});
+
+	test('WebM (AES-CTR) signals value=cenc with the same default_KID + per-DRM pssh', () => {
+		const elements = buildContentProtections({
+			scheme: 'cenc',
+			defaultKid: KID,
+			drmSystems: [{ uuid: WIDEVINE_UUID, pssh: new Uint8Array([9, 9]), nameVersion: 'Widevine' }],
+		});
+		expect(serializeContentProtection(elements[0]!)).toBe(
+			'<ContentProtection schemeIdUri="urn:mpeg:dash:mp4protection:2011" value="cenc" '
+			+ `cenc:default_KID="${KID_UUID}"/>`,
+		);
+		expect(serializeContentProtection(elements[1]!)).toContain(`urn:uuid:${WIDEVINE_UUID}`);
 	});
 
 	test('per-DRM descriptor renders urn:uuid + base64 <cenc:pssh>', () => {
@@ -114,6 +135,44 @@ describe('PSSH builders', () => {
 		expect(dv.getUint32(28)).toBe(1); // KID count
 		expect(hex(pssh.subarray(32, 48))).toBe(hex(KID));
 		expect(dv.getUint32(48)).toBe(0); // empty data
+	});
+
+	// shaka ConvertGuidEndianness: groups 1-3 little-endian, bytes 8-15 unchanged.
+	const swappedKid = Uint8Array.from([3, 2, 1, 0, 5, 4, 7, 6, 8, 9, 10, 11, 12, 13, 14, 15]);
+	const playReadyPro = (pssh: Uint8Array): string => {
+		const dv = new DataView(pssh.buffer);
+		expect(String.fromCharCode(...pssh.subarray(4, 8))).toBe('pssh');
+		expect(pssh[8]).toBe(0); // version 0
+		expect(hex(pssh.subarray(12, 28))).toBe(uuidHex(PLAYREADY_SYSTEM_ID));
+		const dataSize = dv.getUint32(28);
+		const pro = pssh.subarray(32, 32 + dataSize);
+		const proDv = new DataView(pro.buffer, pro.byteOffset, pro.byteLength);
+		expect(proDv.getUint32(0, true)).toBe(dataSize); // PRO total size (LE)
+		expect(proDv.getUint16(4, true)).toBe(1); // record count
+		expect(proDv.getUint16(6, true)).toBe(1); // record type = RM header
+		return new TextDecoder('utf-16le').decode(pro.subarray(10));
+	};
+
+	test('buildPlayReadyPssh cbcs: v4.3.0.0 AESCBC header (shaka-faithful)', () => {
+		const kid = Uint8Array.from({ length: 16 }, (_, i) => i);
+		const wrm = playReadyPro(buildPlayReadyPssh(kid, { scheme: 'cbcs', laUrl: 'https://la.example/rl' }));
+		expect(wrm).toContain('version="4.3.0.0"');
+		expect(wrm).toContain(`<KID ALGID="AESCBC" VALUE="${Buffer.from(swappedKid).toString('base64')}">`);
+		expect(wrm).toContain('<LA_URL>https://la.example/rl</LA_URL>');
+	});
+
+	test('buildPlayReadyPssh cenc: v4.0.0.0 AESCTR header with a key-derived checksum (shaka-faithful)', () => {
+		const kid = Uint8Array.from({ length: 16 }, (_, i) => i);
+		const wrm = playReadyPro(buildPlayReadyPssh(kid, { scheme: 'cenc', key: new Uint8Array(16).fill(0x2b) }));
+		expect(wrm).toContain('version="4.0.0.0"');
+		expect(wrm).toContain('<ALGID>AESCTR</ALGID>');
+		expect(wrm).toContain(`<KID>${Buffer.from(swappedKid).toString('base64')}</KID>`);
+		expect(wrm).toMatch(/<CHECKSUM>[A-Za-z0-9+/=]{12}<\/CHECKSUM>/); // base64 of 8 bytes
+	});
+
+	test('buildPlayReadyPssh cenc without a key throws (checksum needs it)', () => {
+		expect(() => buildPlayReadyPssh(Uint8Array.from({ length: 16 }, (_, i) => i), { scheme: 'cenc' }))
+			.toThrow(/checksum/);
 	});
 
 	test('a built Widevine PSSH feeds buildCbcsContentProtections → base64 <cenc:pssh>', () => {

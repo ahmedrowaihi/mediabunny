@@ -15,6 +15,9 @@
 
 import { AES_128_BLOCK_SIZE } from '../aes';
 import { iterateNalUnitsInLengthPrefixed } from '../codec-data';
+import { parseAc4TocSizeBits } from './ac4-parser';
+import { type Av1TileParser, createAv1TileParser } from './av1-parser';
+import { createVp9FrameParser, type Vp9FrameParser } from './vp9-parser';
 
 /**
  * CENC protection scheme FourCC. Mirrors shaka's `FourCC` for encryption.
@@ -191,6 +194,11 @@ export class SubsampleGenerator {
 	private minProtectedDataSize = 0;
 	/** @internal */
 	private headerParser: VideoSliceHeaderParser | null = null;
+	// VP9/AV1 carry reference state across frames, so one stateful parser is reused for the whole track.
+	/** @internal */
+	private vp9Parser: Vp9FrameParser | null = null;
+	/** @internal */
+	private av1Parser: Av1TileParser | null = null;
 
 	constructor(
 		/** Whether VP9 uses subsample (vs full-sample) encryption. Only relevant for VP9. */
@@ -244,10 +252,20 @@ export class SubsampleGenerator {
 				this.generateFromH26xFrame(frame, subsamples);
 				break;
 			}
-			case 'vp9':
-			case 'av1':
 			case 'ac4': {
-				throw new Error(`Subsample encryption for codec '${this.codec}' is not yet ported.`);
+				this.generateFromAc4Frame(frame, subsamples);
+				break;
+			}
+			case 'vp9': {
+				// VP9 is subsample-encrypted only when requested; otherwise full-sample (no subsamples).
+				if (this.vp9SubsampleEncryption) {
+					this.generateFromVp9Frame(frame, subsamples);
+				}
+				break;
+			}
+			case 'av1': {
+				this.generateFromAv1Frame(frame, subsamples);
+				break;
 			}
 			default: {
 				// Full-sample encrypted unless there is a leading clear region (SAMPLE-AES audio).
@@ -302,6 +320,57 @@ export class SubsampleGenerator {
 			}
 			organizer.addSubsample(this.naluLengthSize + clearBytes, naluTotalSize - clearBytes);
 		}
+		organizer.finalize();
+	}
+
+	/** @internal */
+	private generateFromAv1Frame(frame: Uint8Array, subsamples: SubsampleEntry[]): void {
+		this.av1Parser ??= createAv1TileParser();
+		const tiles = this.av1Parser.parse(frame);
+		if (tiles === null) {
+			throw new Error('Failed to parse AV1 frame.');
+		}
+		const organizer = new SubsampleOrganizer(this.alignProtectedData, subsamples);
+		// Per AV1-in-ISOBMFF, only tile data is encrypted; the gaps between tiles stay clear.
+		let lastTileEnd = 0;
+		for (const { startOffset, size } of tiles) {
+			organizer.addSubsample(startOffset - lastTileEnd, size);
+			lastTileEnd = startOffset + size;
+		}
+		if (lastTileEnd < frame.length) {
+			organizer.addSubsample(frame.length - lastTileEnd, 0);
+		}
+		organizer.finalize();
+	}
+
+	/** @internal */
+	private generateFromVp9Frame(frame: Uint8Array, subsamples: SubsampleEntry[]): void {
+		this.vp9Parser ??= createVp9FrameParser();
+		const vpxFrames = this.vp9Parser.parse(frame);
+		if (vpxFrames === null) {
+			throw new Error('Failed to parse vpx frame.');
+		}
+		const organizer = new SubsampleOrganizer(this.alignProtectedData, subsamples);
+		let totalSize = 0;
+		for (const { frameSize, uncompressedHeaderSize } of vpxFrames) {
+			organizer.addSubsample(uncompressedHeaderSize, frameSize - uncompressedHeaderSize);
+			totalSize += frameSize;
+		}
+		// A superframe carries a trailing index (clear) after the last frame.
+		if (vpxFrames.length > 1) {
+			organizer.addSubsample(frame.length - totalSize, 0);
+		}
+		organizer.finalize();
+	}
+
+	/** @internal */
+	private generateFromAc4Frame(frame: Uint8Array, subsamples: SubsampleEntry[]): void {
+		const organizer = new SubsampleOrganizer(this.alignProtectedData, subsamples);
+		// A failed TOC parse leaves toc_size 0 → the whole frame is encrypted (shaka's fallback).
+		const tocSizeBits = parseAc4TocSizeBits(frame) ?? 0;
+		// shaka rounds the TOC bit count up to the next multiple of 8 and treats it as clear bytes.
+		const clearBytes = Math.min(frame.length, Math.floor((tocSizeBits + 7) / 8) * 8);
+		organizer.addSubsample(clearBytes, frame.length - clearBytes);
 		organizer.finalize();
 	}
 }

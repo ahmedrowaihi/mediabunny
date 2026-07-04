@@ -108,6 +108,11 @@ import { AC3_SAMPLE_RATES } from '../../shared/ac3-misc';
 import { Bitstream } from '../../shared/bitstream';
 import { Aes128CbcContext } from '../aes';
 import { Logging } from '../logging';
+import {
+	type HdrStaticMetadata,
+	parseContentLightLevel,
+	parseMasteringDisplayMetadata,
+} from '../hdr-metadata';
 
 type InternalTrack = {
 	id: number;
@@ -161,6 +166,7 @@ type InternalTrack = {
 		vp9CodecInfo: Vp9CodecInfo | null;
 		av1CodecInfo: Av1CodecInfo | null;
 		proresFormat: ProresFourCc | null;
+		hdrStaticMetadata: HdrStaticMetadata | null;
 	};
 } | {
 	info: {
@@ -1042,6 +1048,7 @@ export class IsobmffDemuxer extends Demuxer {
 						vp9CodecInfo: null,
 						av1CodecInfo: null,
 						proresFormat: null,
+						hdrStaticMetadata: null,
 					};
 				} else if (handlerType === 'soun') {
 					track.info = {
@@ -1505,6 +1512,32 @@ export class IsobmffDemuxer extends Demuxer {
 					matrix: MATRIX_COEFFICIENTS_MAP_INVERSE[matrixCoefficients],
 					fullRange,
 				} as VideoColorSpaceInit;
+			}; break;
+
+			case 'mdcv': {
+				const track = this.currentTrack;
+				if (!track) {
+					break;
+				}
+				assert(track.info?.type === 'video');
+
+				const masteringDisplay = parseMasteringDisplayMetadata(readBytes(slice, 24));
+				if (masteringDisplay) {
+					(track.info.hdrStaticMetadata ??= {}).masteringDisplay = masteringDisplay;
+				}
+			}; break;
+
+			case 'clli': {
+				const track = this.currentTrack;
+				if (!track) {
+					break;
+				}
+				assert(track.info?.type === 'video');
+
+				const contentLight = parseContentLightLevel(readBytes(slice, 4));
+				if (contentLight) {
+					(track.info.hdrStaticMetadata ??= {}).contentLight = contentLight;
+				}
 			}; break;
 
 			case 'pasp': {
@@ -3463,13 +3496,17 @@ class IsobmffVideoTrackBacking extends IsobmffTrackBacking implements InputVideo
 				this.internalTrack.info.av1CodecInfo = firstPacket && extractAv1CodecInfoFromPacket(firstPacket.data);
 			}
 
-			const config: VideoDecoderConfig = {
+			const config: VideoDecoderConfig & { hdrStaticMetadata?: HdrStaticMetadata } = {
 				codec: extractVideoCodecString(this.internalTrack.info),
 				codedWidth: this.internalTrack.info.width,
 				codedHeight: this.internalTrack.info.height,
 				description: this.internalTrack.info.codecDescription ?? undefined,
 				colorSpace: this.internalTrack.info.colorSpace ?? undefined,
 			};
+
+			if (this.internalTrack.info.hdrStaticMetadata) {
+				config.hdrStaticMetadata = this.internalTrack.info.hdrStaticMetadata;
+			}
 
 			if (
 				this.internalTrack.info.width !== this.internalTrack.info.squarePixelWidth

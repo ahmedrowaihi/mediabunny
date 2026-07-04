@@ -65,10 +65,10 @@ describe('SubsampleGenerator', () => {
 		expect(generator.generateSubsamples(new Uint8Array(100))).toEqual([]);
 	});
 
-	// A deferred (non-H26x/non-audio) codec must throw explicitly, never silently mis-encrypt.
-	test('AV1 subsample encryption throws (not yet ported)', () => {
+	// A malformed AV1 temporal unit must throw, never silently mis-encrypt.
+	test('AV1 subsample encryption throws on a malformed frame', () => {
 		const generator = new SubsampleGenerator(false, false);
 		generator.initialize('cbcs', { codec: 'av1', codecConfig: new Uint8Array(), naluLengthSize: 0 });
-		expect(() => generator.generateSubsamples(new Uint8Array(10))).toThrow(/not yet ported/);
+		expect(() => generator.generateSubsamples(new Uint8Array(10))).toThrow(/Failed to parse AV1/);
 	});
 });

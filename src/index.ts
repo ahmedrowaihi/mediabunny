@@ -583,5 +583,21 @@ export {
 	buildPlayReadyObject,
 	buildPlayReadyPssh,
 } from './crypto/pssh';
+export {
+	type DoviConfig,
+	parseDoviConfigRecord,
+	doviCodecString,
+	doviCompatibleBrand,
+} from './dovi';
+export {
+	type MasteringDisplayMetadata,
+	type ContentLightLevel,
+	type HdrStaticMetadata,
+	parseMasteringDisplayMetadata,
+	parseContentLightLevel,
+	parseHevcSeiHdrMetadata,
+	buildMdcvBox,
+	buildClliBox,
+} from './hdr-metadata';
 
 // 🐡🦔

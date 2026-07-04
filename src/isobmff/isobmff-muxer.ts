@@ -21,6 +21,7 @@ import {
 	vttc,
 	vtte,
 } from './isobmff-boxes';
+import { type HdrStaticMetadata } from '../hdr-metadata';
 import { Muxer } from '../muxer';
 import { Output, OutputAudioTrack, OutputSubtitleTrack, OutputTrack, OutputVideoTrack, TrackType } from '../output';
 import { Writer } from '../writer';
@@ -101,7 +102,7 @@ export type IsobmffTrackData = {
 		width: number;
 		height: number;
 		pixelAspectRatio: Rational;
-		decoderConfig: VideoDecoderConfig;
+		decoderConfig: VideoDecoderConfig & { hdrStaticMetadata?: HdrStaticMetadata };
 		/**
 		 * The "Annex B transformation" involves converting the raw packet data from Annex B to
 		 * "MP4" (length-prefixed) format.

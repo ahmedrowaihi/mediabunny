@@ -101,6 +101,22 @@ const audioCodec = (sampleEntryType: string): EncryptionCodec => {
 	return 'aac';
 };
 
+// AV1 (`av01`) and VP9 (`vp09`) carry no NAL units and need no codec config for subsample generation
+// (the tile/uncompressed-header parsers read the frame directly); H26x needs avcC/hvcC for the NAL
+// length size and slice-header parsing.
+const videoStreamInfo = (sampleEntry: MutableBox): EncryptionStreamInfo => {
+	if (sampleEntry.type === 'av01') {
+		return { codec: 'av1', codecConfig: new Uint8Array(0), naluLengthSize: 0 };
+	}
+	if (sampleEntry.type === 'vp09') {
+		return { codec: 'vp9', codecConfig: new Uint8Array(0), naluLengthSize: 0 };
+	}
+	const isHevc = sampleEntry.type === 'hvc1' || sampleEntry.type === 'hev1';
+	const codecConfig = findBox([sampleEntry], isHevc ? 'hvcC' : 'avcC')!.data!;
+	const naluLengthSize = (((isHevc ? codecConfig[21]! : codecConfig[4]!) & 0x03) + 1) as 1 | 2 | 4;
+	return { codec: isHevc ? 'hevc' : 'avc', codecConfig, naluLengthSize };
+};
+
 const findEncryptableTracks = (moov: MutableBox): TrackInfo[] => {
 	const tracks: TrackInfo[] = [];
 	for (const trak of (moov.children ?? []).filter(b => b.type === 'trak')) {
@@ -114,15 +130,7 @@ const findEncryptableTracks = (moov: MutableBox): TrackInfo[] => {
 		const sampleEntry = findBox([trak], 'stsd')!.children![0]!;
 
 		if (handlerType === 'vide') {
-			const isHevc = sampleEntry.type === 'hvc1' || sampleEntry.type === 'hev1';
-			const codecConfig = findBox([sampleEntry], isHevc ? 'hvcC' : 'avcC')!.data!;
-			const naluLengthSize = (((isHevc ? codecConfig[21]! : codecConfig[4]!) & 0x03) + 1) as 1 | 2 | 4;
-			tracks.push({
-				trackId,
-				sampleEntry,
-				kind: 'video',
-				streamInfo: { codec: isHevc ? 'hevc' : 'avc', codecConfig, naluLengthSize },
-			});
+			tracks.push({ trackId, sampleEntry, kind: 'video', streamInfo: videoStreamInfo(sampleEntry) });
 		} else if (handlerType === 'soun') {
 			tracks.push({
 				trackId,
@@ -156,16 +164,22 @@ export type EncryptCmafOptions = {
 	skipByteBlock?: number;
 };
 
-const usesPerSampleIv = (scheme: ProtectionScheme): boolean => scheme === 'cenc' || scheme === 'cens';
+const usesPerSampleIv = (scheme: ProtectionScheme): boolean =>
+	scheme === 'cenc' || scheme === 'cens' || scheme === 'cbc1';
 
-// Video carries the pattern (cbcs/cens); audio uses whole-block full-sample encryption (no pattern).
-const patternFor = (kind: 'video' | 'audio', cryptByteBlock: number, skipByteBlock: number) =>
-	kind === 'video' ? { cryptByteBlock, skipByteBlock } : { cryptByteBlock: 0, skipByteBlock: 0 };
+// Pattern encryption applies only in a pattern scheme (cbcs/cens) and only to video or AC-4; every
+// other case (non-AC-4 audio, or the non-pattern cenc/cbc1 schemes) encrypts whole blocks with no
+// pattern. Mirrors shaka's `EncryptionHandler::SetupProtectionPattern`.
+const usesPatternEncryption = (track: TrackInfo, scheme: ProtectionScheme): boolean =>
+	(scheme === 'cbcs' || scheme === 'cens') && (track.kind === 'video' || track.streamInfo.codec === 'ac4');
+
+const patternFor = (track: TrackInfo, scheme: ProtectionScheme, cryptByteBlock: number, skipByteBlock: number) =>
+	usesPatternEncryption(track, scheme) ? { cryptByteBlock, skipByteBlock } : { cryptByteBlock: 0, skipByteBlock: 0 };
 
 // Rewrite each init sample entry to encv/enca + sinf/tenc, in place.
 const transformInit = (tracks: TrackInfo[], scheme: ProtectionScheme, opts: EncryptCmafOptions): void => {
 	for (const track of tracks) {
-		const pattern = patternFor(track.kind, opts.cryptByteBlock ?? 1, opts.skipByteBlock ?? 9);
+		const pattern = patternFor(track, scheme, opts.cryptByteBlock ?? 1, opts.skipByteBlock ?? 9);
 		const originalFormat = track.sampleEntry.type;
 		track.sampleEntry.type = track.kind === 'video' ? 'encv' : 'enca';
 		track.sampleEntry.children = [

@@ -16,8 +16,9 @@ import type {
 	VideoSliceHeaderParser,
 } from './subsample-generator';
 
-/** Whether a scheme carries a per-sample IV (cenc/cens) or a single constant IV (cbcs). */
-const usesPerSampleIv = (scheme: ProtectionScheme): boolean => scheme === 'cenc' || scheme === 'cens';
+/** Whether a scheme carries a per-sample IV (cenc/cens/cbc1) or a single constant IV (cbcs). */
+const usesPerSampleIv = (scheme: ProtectionScheme): boolean =>
+	scheme === 'cenc' || scheme === 'cens' || scheme === 'cbc1';
 
 /** The cbcs-encrypted samples of one CMAF fragment plus the boxes describing them. */
 export type EncryptedFragment = {

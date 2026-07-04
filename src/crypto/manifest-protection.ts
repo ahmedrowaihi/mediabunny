@@ -41,15 +41,17 @@ export type DrmSystem = {
 };
 
 /**
- * Build the DASH `<ContentProtection>` descriptors for a `cbcs` stream: the base
- * `urn:mpeg:dash:mp4protection:2011` descriptor carrying `cenc:default_KID`, followed by one
- * per DRM system with a `<cenc:pssh>`. FairPlay is skipped (DASH cannot signal it). Mirrors
- * shaka-packager's `AddContentProtectionElements` for MP4 containers.
+ * Build the DASH `<ContentProtection>` descriptors for an encrypted stream: the base
+ * `urn:mpeg:dash:mp4protection:2011` descriptor carrying the protection scheme (`value`) and
+ * `cenc:default_KID`, followed by one per DRM system with a `<cenc:pssh>`. FairPlay is skipped (DASH
+ * cannot signal it). Works for fMP4 (cbcs/cenc/cens/cbc1) and WebM (AES-CTR, signalled as `cenc`).
+ * Mirrors shaka-packager's `AddContentProtectionElements`.
  *
  * @group Encryption
  * @public
  */
-export const buildCbcsContentProtections = (opts: {
+export const buildContentProtections = (opts: {
+	scheme: string;
 	defaultKid: Uint8Array;
 	drmSystems?: DrmSystem[];
 }): ContentProtectionElement[] => {
@@ -59,7 +61,7 @@ export const buildCbcsContentProtections = (opts: {
 	}
 
 	const elements: ContentProtectionElement[] = [{
-		value: 'cbcs',
+		value: opts.scheme,
 		schemeIdUri: ENCRYPTED_MP4_SCHEME,
 		additionalAttributes: new Map([['cenc:default_KID', kidUuid]]),
 		subelements: [],
@@ -78,6 +80,18 @@ export const buildCbcsContentProtections = (opts: {
 	}
 	return elements;
 };
+
+/**
+ * Build the DASH `<ContentProtection>` descriptors for a `cbcs` stream. Convenience wrapper over
+ * {@link buildContentProtections}; WebM CTR streams should use `buildContentProtections({ scheme: 'cenc' })`.
+ *
+ * @group Encryption
+ * @public
+ */
+export const buildCbcsContentProtections = (opts: {
+	defaultKid: Uint8Array;
+	drmSystems?: DrmSystem[];
+}): ContentProtectionElement[] => buildContentProtections({ scheme: 'cbcs', ...opts });
 
 const escapeXml = (text: string): string => text
 	.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');

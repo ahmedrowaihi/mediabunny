@@ -9,6 +9,20 @@
 import { AES_128_BLOCK_SIZE, Aes128CbcContext } from '../aes';
 
 /**
+ * Advance a per-sample IV for the next sample (ISO/IEC 23001-7): an 8-byte IV increments by 1,
+ * a 16-byte IV increments by the block count of the last sample. Shared by CTR and per-sample CBC.
+ * @internal
+ */
+export const advanceCencIv = (iv: Uint8Array, numCryptBytes: number): void => {
+	let increment = iv.length === 8 ? 1 : Math.ceil(numCryptBytes / AES_128_BLOCK_SIZE);
+	for (let i = iv.length - 1; increment > 0 && i >= 0; i--) {
+		increment += iv[i]!;
+		iv[i] = increment & 0xff;
+		increment = Math.floor(increment / 256);
+	}
+};
+
+/**
  * A block cryptor that transforms the full 16-byte blocks of a buffer in place,
  * chaining cipher state across calls. Consumed by {@link AesPatternCryptor} so the
  * pattern (cbcs) logic can be tested independently of the underlying cipher.
@@ -31,15 +45,19 @@ export type BlockCryptor = {
 };
 
 /**
- * AES-128-CBC encryptor with no padding: encrypts the full 16-byte blocks of the
- * input in place (chaining the cipher block state across `crypt` calls) and leaves
- * any trailing partial block untouched. Equivalent to shaka-packager's
- * `AesCbcEncryptor(kNoPadding)`, backed by the fork's own {@link Aes128CbcContext}.
+ * AES-128-CBC encryptor with no padding: encrypts the full 16-byte blocks of the input in place
+ * (chaining the cipher block state across `crypt` calls) and leaves any trailing partial block
+ * untouched. Equivalent to shaka-packager's `AesCbcEncryptor(kNoPadding)`, backed by the fork's own
+ * {@link Aes128CbcContext}. With `constantIv` false (cbc1) the IV advances per sample; true (cbcs,
+ * used inside {@link AesPatternCryptor}) keeps it constant.
  * @internal
  */
 export class AesCbcEncryptor implements BlockCryptor {
 	private readonly context = new Aes128CbcContext();
 	private iv = new Uint8Array(AES_128_BLOCK_SIZE);
+	private numCryptBytes = 0;
+
+	constructor(private readonly constantIv = true) {}
 
 	initializeWithIv(key: Uint8Array, iv: Uint8Array): void {
 		// init() needs a 16-byte IV for the key schedule; seed with zeros then set the real IV.
@@ -49,6 +67,7 @@ export class AesCbcEncryptor implements BlockCryptor {
 
 	setIv(iv: Uint8Array): void {
 		this.iv = new Uint8Array(iv);
+		this.numCryptBytes = 0;
 		this.context.setIv(iv);
 	}
 
@@ -56,7 +75,14 @@ export class AesCbcEncryptor implements BlockCryptor {
 		return this.iv;
 	}
 
-	updateIv(): void {}
+	updateIv(): void {
+		if (this.constantIv) {
+			return;
+		}
+		advanceCencIv(this.iv, this.numCryptBytes);
+		this.numCryptBytes = 0;
+		this.context.setIv(this.iv);
+	}
 
 	crypt(text: Uint8Array): void {
 		const fullBlocks = Math.floor(text.length / AES_128_BLOCK_SIZE);
@@ -66,6 +92,7 @@ export class AesCbcEncryptor implements BlockCryptor {
 			this.context.encrypt();
 			text.set(this.context.out, offset);
 		}
+		this.numCryptBytes += text.length;
 	}
 }
 

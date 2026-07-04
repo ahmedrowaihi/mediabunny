@@ -558,6 +558,22 @@ export {
 	encryptCmafSegment,
 } from './crypto/cmaf-encryptor';
 export {
+	type EncryptWebmOptions,
+	encryptWebm,
+	encryptWebmInit,
+	encryptWebmSegment,
+} from './crypto/webm-encryptor';
+export {
+	type HlsAes128Options,
+	encryptHlsAes128,
+	buildHlsAes128KeyTag,
+} from './crypto/hls-aes128';
+export {
+	type SampleAesOptions,
+	sampleAesEncryptAudioFrame,
+	sampleAesEncryptVideoNal,
+} from './crypto/sample-aes';
+export {
 	type ProtectionScheme,
 } from './crypto/subsample-generator';
 export {
@@ -565,6 +581,7 @@ export {
 	WIDEVINE_UUID,
 	FAIRPLAY_UUID,
 	CBCS_HLS_METHOD,
+	buildContentProtections,
 	buildCbcsContentProtections,
 	serializeContentProtection,
 	patchMpdContentProtection,
@@ -574,8 +591,11 @@ export {
 export {
 	WIDEVINE_SYSTEM_ID,
 	COMMON_SYSTEM_ID,
+	PLAYREADY_SYSTEM_ID,
 	buildWidevinePssh,
 	buildCommonPssh,
+	buildPlayReadyObject,
+	buildPlayReadyPssh,
 } from './crypto/pssh';
 
 // 🐡🦔

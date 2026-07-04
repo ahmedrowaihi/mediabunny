@@ -234,7 +234,91 @@ describe('encryptCmaf (real fragmented CMAF)', () => {
 			expect([...decryptSample(encAudio[i]!, sencAudio[i]!, 0)]).toEqual([...originalAudio[i]!]);
 		}
 	});
+
+	test('encrypts AV1 (bear-av1.mp4) → encv/av01 with tile subsamples, samples round-trip', async () => {
+		const av1File = path.join(
+			new URL('.', import.meta.url).pathname,
+			'../../../shaka-packager/packager/media/test/data/bear-av1.mp4',
+		);
+		const original = new Uint8Array(readFileSync(av1File));
+		const videoId = trackIdOf(findBox(parseBoxes(original, 0, original.length), 'moov')!, 'av01');
+		const originalVideo = extractRawSamples(original, videoId);
+		expect(originalVideo.length).toBeGreaterThan(0);
+
+		const encrypted = encryptCmaf(original, { key: KEY, kid: KID, iv: IV });
+
+		// The fork's demuxer opens the encrypted AV1.
+		using input = new Input({ source: new BufferSource(encrypted), formats: ALL_FORMATS });
+		expect(await input.getPrimaryVideoTrack()).not.toBeNull();
+
+		const boxes = parseBoxes(encrypted, 0, encrypted.length);
+		expect(findBox(boxes, 'encv')).not.toBeNull();
+		// frma restores the original av01 sample entry format.
+		expect(String.fromCharCode(...findBox(boxes, 'frma')!.data!.subarray(0, 4))).toBe('av01');
+		// AV1 is subsample-encrypted (only tile data), so senc sets the subsample flag — not full-sample.
+		expect(findBox(boxes, 'senc')!.data![3]! & 0x2).toBe(0x2);
+
+		// Decrypting recovers the originals exactly (video pattern, skip 9).
+		const encVideo = extractRawSamples(encrypted, videoId);
+		const sencVideo = extractSenc(encrypted, videoId);
+		expect(encVideo.length).toBe(originalVideo.length);
+		for (let i = 0; i < originalVideo.length; i++) {
+			expect([...decryptSample(encVideo[i]!, sencVideo[i]!, 9)]).toEqual([...originalVideo[i]!]);
+		}
+	});
+
+	test('AV1 through the split init/segment (JIT) API round-trips per segment', async () => {
+		const av1File = path.join(
+			new URL('.', import.meta.url).pathname,
+			'../../../shaka-packager/packager/media/test/data/bear-av1.mp4',
+		);
+		const original = new Uint8Array(readFileSync(av1File));
+		const { init, segment } = splitInitAndSegment(original);
+		const videoId = trackIdOf(findBox(parseBoxes(init, 0, init.length), 'moov')!, 'av01');
+		const originalVideo = extractRawSamples(original, videoId);
+
+		// Encrypt the init once and the media segment separately — the JIT delivery shape.
+		const encInit = encryptCmafInit(init, { key: KEY, kid: KID, iv: IV });
+		const encSegment = encryptCmafSegment(init, segment, { key: KEY, kid: KID, iv: IV });
+		expect(findBox(parseBoxes(encInit, 0, encInit.length), 'encv')).not.toBeNull();
+
+		// Reassemble init + segment; the samples still decrypt back byte-exact.
+		const reassembled = new Uint8Array(encInit.length + encSegment.length);
+		reassembled.set(encInit, 0);
+		reassembled.set(encSegment, encInit.length);
+
+		const encVideo = extractRawSamples(reassembled, videoId);
+		const sencVideo = extractSenc(reassembled, videoId);
+		expect(encVideo.length).toBe(originalVideo.length);
+		expect(encVideo.length).toBeGreaterThan(0);
+		for (let i = 0; i < originalVideo.length; i++) {
+			expect([...decryptSample(encVideo[i]!, sencVideo[i]!, 9)]).toEqual([...originalVideo[i]!]);
+		}
+	});
 });
+
+// Split a single-fragment CMAF file into its init (ftyp…moov) and first media segment (moof + mdat).
+const splitInitAndSegment = (bytes: Uint8Array): { init: Uint8Array; segment: Uint8Array } => {
+	const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+	let pos = 0;
+	let moofStart = -1;
+	let segmentEnd = bytes.length;
+	while (pos + 8 <= bytes.length) {
+		const size = dv.getUint32(pos);
+		const type = String.fromCharCode(bytes[pos + 4]!, bytes[pos + 5]!, bytes[pos + 6]!, bytes[pos + 7]!);
+		if (type === 'moof' && moofStart < 0) {
+			moofStart = pos;
+		} else if (moofStart >= 0 && type !== 'moof' && type !== 'mdat') {
+			segmentEnd = pos; // stop before trailing boxes (mfra) so the segment is just moof + mdat
+			break;
+		}
+		if (size < 8) {
+			break;
+		}
+		pos += size;
+	}
+	return { init: bytes.subarray(0, moofStart), segment: bytes.subarray(moofStart, segmentEnd) };
+};
 
 const CENC_IV = new Uint8Array(8).fill(0x11);
 
@@ -360,6 +444,59 @@ describe.each<{ scheme: ProtectionScheme; skip: number }>([
 		for (let i = 0; i < originalAudio.length; i++) {
 			const dec = decryptCtrSample(encAudio[i]!, audioEntries[i]!.iv, audioEntries[i]!.subsamples, scheme, 0);
 			expect([...dec]).toEqual([...originalAudio[i]!]);
+		}
+	});
+});
+
+// Decrypt a cbc1 sample: AES-CBC, per-sample IV, chained across cipher regions within the sample.
+const decryptCbc1Sample = (data: Uint8Array, iv: Uint8Array, subsamples: SubsampleEntry[]): Uint8Array => {
+	const cbc = new AesCbcDecryptor();
+	cbc.initializeWithIv(KEY, iv);
+	const out = new Uint8Array(data);
+	if (subsamples.length === 0) {
+		cbc.crypt(out);
+		return out;
+	}
+	let offset = 0;
+	for (const { clearBytes, cipherBytes } of subsamples) {
+		offset += clearBytes;
+		if (cipherBytes > 0) {
+			cbc.crypt(out.subarray(offset, offset + cipherBytes));
+			offset += cipherBytes;
+		}
+	}
+	return out;
+};
+
+describe('encryptCmaf cbc1 (AES-CBC, per-sample IV)', () => {
+	test('cbc1: video + audio round-trip; demuxer opens; tenc has per-sample IV', async () => {
+		const original = new Uint8Array(readFileSync(FILE));
+		const videoId = trackIdOf(findBox(parseBoxes(original, 0, original.length), 'moov')!, 'avc1');
+		const audioId = trackIdOf(findBox(parseBoxes(original, 0, original.length), 'moov')!, 'mp4a');
+		const originalVideo = extractRawSamples(original, videoId);
+		const originalAudio = extractRawSamples(original, audioId);
+
+		const iv = new Uint8Array(16).fill(0x11); // cbc1: 16-byte per-sample IV
+		const encrypted = encryptCmaf(original, { key: KEY, kid: KID, iv, scheme: 'cbc1' });
+
+		using input = new Input({ source: new BufferSource(encrypted), formats: ALL_FORMATS });
+		expect(await input.getPrimaryVideoTrack()).not.toBeNull();
+		const boxes = parseBoxes(encrypted, 0, encrypted.length);
+		expect(findBox(boxes, 'tenc')!.data![7]).toBe(16); // default_per_sample_iv_size
+
+		const encVideo = extractRawSamples(encrypted, videoId);
+		const videoEntries = extractSencEntries(encrypted, videoId, 16);
+		expect(encVideo.length).toBe(originalVideo.length);
+		for (let i = 0; i < originalVideo.length; i++) {
+			expect([...decryptCbc1Sample(encVideo[i]!, videoEntries[i]!.iv, videoEntries[i]!.subsamples)])
+				.toEqual([...originalVideo[i]!]);
+		}
+
+		const encAudio = extractRawSamples(encrypted, audioId);
+		const audioEntries = extractSencEntries(encrypted, audioId, 16);
+		for (let i = 0; i < originalAudio.length; i++) {
+			expect([...decryptCbc1Sample(encAudio[i]!, audioEntries[i]!.iv, audioEntries[i]!.subsamples)])
+				.toEqual([...originalAudio[i]!]);
 		}
 	});
 });

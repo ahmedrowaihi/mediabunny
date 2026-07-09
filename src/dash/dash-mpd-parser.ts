@@ -65,6 +65,19 @@ export type MpdPeriod = {
 	adaptationSets: MpdAdaptationSet[];
 };
 
+/**
+ * A generic MPD descriptor (`<SupplementalProperty>`, `<EssentialProperty>`, …): a `@schemeIdUri`
+ * with an optional `@value`.
+ *
+ * @group DASH @public
+ */
+export type DashDescriptor = {
+	/** `@schemeIdUri`. */
+	schemeIdUri: string;
+	/** `@value`, or `null` when the descriptor carries no value. */
+	value: string | null;
+};
+
 /** A `<AdaptationSet>` from a parsed MPD. @group DASH @public */
 export type MpdAdaptationSet = {
 	/** AdaptationSet `@id`. */
@@ -99,6 +112,17 @@ export type MpdAdaptationSet = {
 		/** Label text content. */
 		value: string;
 	}[];
+	/** `<AudioChannelConfiguration>` descriptors (channel count/layout signaling). */
+	audioChannelConfigurations: {
+		/** `@schemeIdUri` naming the channel-configuration scheme. */
+		schemeIdUri: string;
+		/** `@value` (decimal count, CICP index, or hex channel mask, per scheme). */
+		value: string;
+	}[];
+	/** `<SupplementalProperty>` descriptors (advisory signaling, e.g. CICP color info). */
+	supplementalProperties: DashDescriptor[];
+	/** `<EssentialProperty>` descriptors (must-understand signaling, e.g. CICP transfer function). */
+	essentialProperties: DashDescriptor[];
 	/** `<BaseURL>` text children. */
 	baseURLs: string[];
 	/** `<ContentProtection>` children. */
@@ -140,6 +164,17 @@ export type MpdRepresentation = {
 		/** Label text content. */
 		value: string;
 	}[];
+	/** `<AudioChannelConfiguration>` descriptors (channel count/layout signaling). */
+	audioChannelConfigurations: {
+		/** `@schemeIdUri` naming the channel-configuration scheme. */
+		schemeIdUri: string;
+		/** `@value` (decimal count, CICP index, or hex channel mask, per scheme). */
+		value: string;
+	}[];
+	/** `<SupplementalProperty>` descriptors (advisory signaling, e.g. CICP color info). */
+	supplementalProperties: DashDescriptor[];
+	/** `<EssentialProperty>` descriptors (must-understand signaling, e.g. CICP transfer function). */
+	essentialProperties: DashDescriptor[];
 	/** `<BaseURL>` text children. */
 	baseURLs: string[];
 	/** `<ContentProtection>` children. */
@@ -265,16 +300,29 @@ class MpdParseError extends Error {
 }
 
 /**
- * Parse an MPD XML string into a typed AST. Throws on malformed XML or missing
- * required attributes.
+ * Options for {@link parseMpd} / `parseManifest`.
  * @group DASH @public
  */
-export const parseMpd = (xml: string): Mpd => {
-	if (typeof DOMParser === 'undefined') {
-		throw new MpdParseError('DOMParser is not available in this environment');
+export type ParseMpdOptions = {
+	/**
+	 * A `DOMParser`-shaped constructor to use instead of the global one — supply linkedom's on
+	 * Node/Bun/Deno where there is no global `DOMParser`.
+	 */
+	domParser?: typeof DOMParser;
+};
+
+/**
+ * Parse an MPD XML string into a typed AST. Throws on malformed XML or missing
+ * required attributes. Needs a `DOMParser` — the global one, or `options.domParser`.
+ * @group DASH @public
+ */
+export const parseMpd = (xml: string, options?: ParseMpdOptions): Mpd => {
+	const ParserCtor = options?.domParser ?? (typeof DOMParser === 'undefined' ? null : DOMParser);
+	if (ParserCtor === null) {
+		throw new MpdParseError('DOMParser is not available in this environment; pass options.domParser');
 	}
 
-	const doc = new DOMParser().parseFromString(xml, 'application/xml');
+	const doc = new ParserCtor().parseFromString(xml, 'application/xml');
 	const parseError = doc.getElementsByTagName('parsererror')[0];
 	if (parseError) {
 		throw new MpdParseError(parseError.textContent ?? 'invalid XML');
@@ -351,6 +399,9 @@ const parseAdaptationSet = (el: Element): MpdAdaptationSet => {
 		frameRate: parseFrameRate(el.getAttribute('frameRate')),
 		roles: collectRoles(el),
 		labels: collectLabels(el),
+		audioChannelConfigurations: collectAudioChannelConfigurations(el),
+		supplementalProperties: collectProperties(el, 'SupplementalProperty'),
+		essentialProperties: collectProperties(el, 'EssentialProperty'),
 		baseURLs: collectBaseURLs(el),
 		contentProtections: collectContentProtections(el),
 		segmentTemplate: findFirst(el, 'SegmentTemplate', parseSegmentTemplate),
@@ -387,6 +438,9 @@ const parseRepresentation = (el: Element): MpdRepresentation => {
 		audioSamplingRate: numericAttr(el, 'audioSamplingRate'),
 		startWithSAP: numericAttr(el, 'startWithSAP'),
 		labels: collectLabels(el),
+		audioChannelConfigurations: collectAudioChannelConfigurations(el),
+		supplementalProperties: collectProperties(el, 'SupplementalProperty'),
+		essentialProperties: collectProperties(el, 'EssentialProperty'),
 		baseURLs: collectBaseURLs(el),
 		contentProtections: collectContentProtections(el),
 		segmentTemplate: findFirst(el, 'SegmentTemplate', parseSegmentTemplate),
@@ -498,6 +552,29 @@ const collectRoles = (parent: Element): { schemeIdUri: string; value: string }[]
 		const value = el.getAttribute('value');
 		if (schemeIdUri && value !== null) {
 			result.push({ schemeIdUri, value });
+		}
+	}
+	return result;
+};
+
+const collectAudioChannelConfigurations = (parent: Element): { schemeIdUri: string; value: string }[] => {
+	const result: { schemeIdUri: string; value: string }[] = [];
+	for (const el of childrenByLocalName(parent, 'AudioChannelConfiguration')) {
+		const schemeIdUri = el.getAttribute('schemeIdUri');
+		const value = el.getAttribute('value');
+		if (schemeIdUri && value !== null) {
+			result.push({ schemeIdUri, value });
+		}
+	}
+	return result;
+};
+
+const collectProperties = (parent: Element, localName: string): { schemeIdUri: string; value: string | null }[] => {
+	const result: { schemeIdUri: string; value: string | null }[] = [];
+	for (const el of childrenByLocalName(parent, localName)) {
+		const schemeIdUri = el.getAttribute('schemeIdUri');
+		if (schemeIdUri) {
+			result.push({ schemeIdUri, value: el.getAttribute('value') });
 		}
 	}
 	return result;

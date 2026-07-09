@@ -363,6 +363,9 @@ export {
 	type HlsKey,
 } from './hls/hls-playlist-parser';
 
+// HLS playlist serializer (the write half of the parse → serialize round-trip).
+export { serializeHls } from './hls/hls-serializer';
+
 // HLS playlist concatenation building blocks.
 export {
 	concatHlsMediaPlaylists,
@@ -424,6 +427,7 @@ export {
 } from './dash/dash-misc';
 export {
 	parseMpd,
+	type ParseMpdOptions,
 	type Mpd,
 	type MpdPeriod,
 	type MpdAdaptationSet,
@@ -434,6 +438,7 @@ export {
 	type SegmentBase,
 	type ByteRange as DashByteRange,
 	type ContentProtection,
+	type DashDescriptor,
 } from './dash/dash-mpd-parser';
 
 // DASH MPD concatenation building block (one `<Period>` per input).
@@ -451,6 +456,38 @@ export {
 export {
 	XmlNode,
 } from './dash/dash-xml-node';
+export { serializeMpd } from './dash/dash-mpd-serializer';
+export {
+	type Manifest,
+	type ManifestTransform,
+	parseManifest,
+	serializeManifest,
+	pipeManifest,
+} from './manifest';
+export {
+	type Rendition,
+	type RenditionPredicate,
+	type VideoRange,
+	type RangeFilter,
+	type ResolutionCap,
+	filterRenditions,
+	dropCodecs,
+	keepCodecs,
+	capResolution,
+	filterBitrate,
+	filterFramerate,
+	filterChannels,
+	dropByColorRange,
+	dropSubtitles,
+	rebaseManifest,
+	type DrmOptions,
+	drm,
+	type SegmentUrlKind,
+	type SegmentUrlMapper,
+	mapSegmentUrls,
+	type SegmentTemplateBuilder,
+	toSegmentTemplate,
+} from './manifest-transforms';
 export {
 	AdaptationSetXmlNode,
 	RepresentationBaseXmlNode,
@@ -572,6 +609,7 @@ export {
 	serializeContentProtection,
 	patchMpdContentProtection,
 	buildCbcsHlsKey,
+	buildHlsKeys,
 	patchMediaPlaylistKeys,
 } from './crypto/manifest-protection';
 export {

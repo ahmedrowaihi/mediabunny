@@ -608,7 +608,7 @@ export const DRM_UUIDS = {
  *
  * @internal
  */
-const parsePsshBoxData = (pssh: Uint8Array): Uint8Array | null => {
+export const parsePsshBoxData = (pssh: Uint8Array): Uint8Array | null => {
 	if (pssh.length < 4 + 4 + 4 + 16 + 4) {
 		return null;
 	}

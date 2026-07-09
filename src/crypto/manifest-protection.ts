@@ -7,8 +7,10 @@
  */
 
 import type { ContentProtectionElement, Element } from '../dash/dash-content-protection';
-import { ENCRYPTED_MP4_SCHEME, generateCencPsshElement, hexToUUID } from '../dash/dash-mpd-utils';
+import { ENCRYPTED_MP4_SCHEME, generateCencPsshElement, hexToUUID, parsePsshBoxData } from '../dash/dash-mpd-utils';
 import { EncryptionInfoEntry } from '../hls/hls-entries';
+import { bytesToBase64 } from '../misc';
+import { PLAYREADY_SYSTEM_ID } from './pssh';
 
 /**
  * Widevine system ID, absent from the fork's `DRM_UUIDS` (which omits it).
@@ -41,11 +43,59 @@ export type DrmSystem = {
 };
 
 /**
+ * One DASH `<ContentProtection>` descriptor in format-neutral form: what to signal, before it is
+ * rendered into a concrete element type. `defaultKid` is set only on the `mp4protection` base
+ * descriptor; `pssh` only on a per-system descriptor that carries one.
+ *
+ * @internal
+ */
+export type DrmContentProtectionSpec = {
+	schemeIdUri: string;
+	value: string | null;
+	defaultKid: Uint8Array | null;
+	pssh: Uint8Array | null;
+};
+
+/**
+ * The single source of truth for DASH content-protection signaling: the `mp4protection` base
+ * descriptor (protection scheme + default KID) followed by one per DRM system with its `pssh`.
+ * FairPlay is skipped (DASH cannot signal it). Both the AST-transform {@link drm} atom and the
+ * {@link buildContentProtections} generator render these specs into their own element types.
+ *
+ * @internal
+ */
+export const dashContentProtectionSpecs = (
+	opts: { scheme: string; defaultKid: Uint8Array; systems: DrmSystem[] },
+): DrmContentProtectionSpec[] => {
+	const specs: DrmContentProtectionSpec[] = [{
+		schemeIdUri: ENCRYPTED_MP4_SCHEME,
+		value: opts.scheme,
+		defaultKid: opts.defaultKid,
+		pssh: null,
+	}];
+	for (const system of opts.systems) {
+		if (system.uuid === FAIRPLAY_UUID) {
+			continue;
+		}
+		specs.push({
+			schemeIdUri: `urn:uuid:${system.uuid}`,
+			value: system.nameVersion ?? null,
+			defaultKid: null,
+			pssh: system.pssh ?? null,
+		});
+	}
+	return specs;
+};
+
+/**
  * Build the DASH `<ContentProtection>` descriptors for an encrypted stream: the base
  * `urn:mpeg:dash:mp4protection:2011` descriptor carrying the protection scheme (`value`) and
  * `cenc:default_KID`, followed by one per DRM system with a `<cenc:pssh>`. FairPlay is skipped (DASH
  * cannot signal it). Works for fMP4 (cbcs/cenc/cens/cbc1) and WebM (AES-CTR, signalled as `cenc`).
  * Mirrors shaka-packager's `AddContentProtectionElements`.
+ *
+ * This is the manifest-**generation** DRM path (build descriptors while assembling an MPD). To signal
+ * DRM by transforming an already-parsed manifest, use the {@link drm} atom instead.
  *
  * @group Encryption
  * @public
@@ -59,26 +109,19 @@ export const buildContentProtections = (opts: {
 	if (kidUuid === null) {
 		throw new Error('default KID must be 16 bytes.');
 	}
-
-	const elements: ContentProtectionElement[] = [{
-		value: opts.scheme,
-		schemeIdUri: ENCRYPTED_MP4_SCHEME,
-		additionalAttributes: new Map([['cenc:default_KID', kidUuid]]),
-		subelements: [],
-	}];
-
-	for (const drm of opts.drmSystems ?? []) {
-		if (drm.uuid === FAIRPLAY_UUID) {
-			continue;
-		}
-		elements.push({
-			value: drm.nameVersion ?? '',
-			schemeIdUri: `urn:uuid:${drm.uuid}`,
-			additionalAttributes: new Map(),
-			subelements: drm.pssh !== undefined ? [generateCencPsshElement(drm.pssh)] : [],
-		});
-	}
-	return elements;
+	const specs = dashContentProtectionSpecs({
+		scheme: opts.scheme,
+		defaultKid: opts.defaultKid,
+		systems: opts.drmSystems ?? [],
+	});
+	return specs.map((spec): ContentProtectionElement => ({
+		value: spec.value ?? '',
+		schemeIdUri: spec.schemeIdUri,
+		additionalAttributes: spec.defaultKid !== null
+			? new Map([['cenc:default_KID', kidUuid]])
+			: new Map<string, string>(),
+		subelements: spec.pssh !== null ? [generateCencPsshElement(spec.pssh)] : [],
+	}));
 };
 
 /**
@@ -129,6 +172,10 @@ export const serializeContentProtection = (cp: ContentProtectionElement): string
  * Inject `<ContentProtection>` descriptors as the first children of every `<AdaptationSet>` in an
  * existing MPD. Idempotent-unsafe: call once per manifest. Preserves the surrounding text verbatim.
  *
+ * This is the format-preserving DRM path — it patches the MPD **string** in place, keeping the
+ * origin's exact bytes and any elements the parser doesn't model. To parse, inject, and re-serialize
+ * instead, use the {@link drm} atom.
+ *
  * @group Encryption
  * @public
  */
@@ -167,8 +214,74 @@ export const buildCbcsHlsKey = (opts: {
 ).toString();
 
 /**
+ * One HLS `#EXT-X-KEY` in format-neutral form: the `URI` and `KEYFORMAT` to emit, before rendering
+ * into a concrete `HlsKey` (the {@link drm} atom) or `#EXT-X-KEY` line ({@link buildHlsKeys}).
+ *
+ * @internal
+ */
+export type HlsKeySpec = {
+	uri: string;
+	keyFormat: string;
+};
+
+/**
+ * The single source of truth for HLS multi-DRM key signaling (`cbcs` / SAMPLE-AES): one key per DRM
+ * system — Widevine as a `data:` pssh, PlayReady as a `data:` PlayReady Object, FairPlay as the
+ * `skd:` `fairplayKeyUri` (omitted if none given). A player ignores KEYFORMATs it doesn't know, so
+ * one set serves every OS. Both the {@link drm} atom and {@link buildHlsKeys} render these specs.
+ *
+ * @internal
+ */
+export const hlsKeySpecs = (opts: { systems: DrmSystem[]; fairplayKeyUri?: string }): HlsKeySpec[] => {
+	const specs: HlsKeySpec[] = [];
+	for (const system of opts.systems) {
+		if (system.uuid === FAIRPLAY_UUID) {
+			if (opts.fairplayKeyUri !== undefined) {
+				specs.push({ uri: opts.fairplayKeyUri, keyFormat: 'com.apple.streamingkeydelivery' });
+			}
+			continue;
+		}
+		if (system.pssh === undefined) {
+			continue;
+		}
+		if (system.uuid === PLAYREADY_SYSTEM_ID) {
+			// HLS carries the PlayReady Object (the pssh's data payload), not the full pssh box.
+			const pro = parsePsshBoxData(system.pssh);
+			if (pro !== null) {
+				specs.push({
+					uri: `data:text/plain;charset=UTF-16;base64,${bytesToBase64(pro)}`,
+					keyFormat: 'com.microsoft.playready',
+				});
+			}
+			continue;
+		}
+		specs.push({
+			uri: `data:text/plain;base64,${bytesToBase64(system.pssh)}`,
+			keyFormat: `urn:uuid:${system.uuid}`,
+		});
+	}
+	return specs;
+};
+
+/**
+ * Build the `#EXT-X-KEY` lines for a `cbcs` HLS media playlist carrying multi-DRM (one per DRM
+ * system). The generate/patch-path counterpart to the {@link drm} atom's HLS keys; pair with
+ * {@link patchMediaPlaylistKeys} to inject them into an existing playlist string.
+ *
+ * @group Encryption
+ * @public
+ */
+export const buildHlsKeys = (opts: { systems: DrmSystem[]; fairplayKeyUri?: string }): string[] =>
+	hlsKeySpecs(opts).map(spec =>
+		buildCbcsHlsKey({ uri: spec.uri, keyFormat: spec.keyFormat, keyFormatVersions: '1' }),
+	);
+
+/**
  * Insert `#EXT-X-KEY` lines into an existing HLS media playlist, after the `#EXT-X-MAP`
  * (fMP4 init) if present, otherwise before the first segment tag. Preserves other lines verbatim.
+ *
+ * The HLS format-preserving DRM path — patches the playlist **string** in place. To parse, inject,
+ * and re-serialize instead, use the {@link drm} atom.
  *
  * @group Encryption
  * @public

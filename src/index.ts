@@ -168,10 +168,13 @@ export {
 	getSidxIndexRange,
 	getSidxInitRange,
 	getSidxMaxSegmentDuration,
+	getSegmentDecodeTime,
 	getSidxPeakBitrate,
+	isInitializationSegment,
 	getSidxSegmentOffsets,
 	parsePsshBoxContents,
 	psshBoxesAreEqual,
+	rebaseSegmentDecodeTime,
 	type PsshBox,
 	type PsshBoxContents,
 	type SidxBox,
@@ -363,6 +366,15 @@ export {
 	type HlsKey,
 } from './hls/hls-playlist-parser';
 
+// HLS playlist builders (the construction counterpart to the parser).
+export {
+	hlsMasterPlaylist,
+	hlsMediaPlaylist,
+	hlsMediaRendition,
+	hlsSegment,
+	hlsVariant,
+} from './hls/hls-playlist-builder';
+
 // HLS playlist serializer (the write half of the parse → serialize round-trip).
 export { serializeHls } from './hls/hls-serializer';
 
@@ -440,6 +452,15 @@ export {
 	type ContentProtection,
 	type DashDescriptor,
 } from './dash/dash-mpd-parser';
+
+// DASH MPD AST factories (the construction counterpart to the parser).
+export {
+	mpd,
+	mpdAdaptationSet,
+	mpdPeriod,
+	mpdRepresentation,
+	mpdSegmentList,
+} from './dash/dash-mpd-factories';
 
 // DASH MPD concatenation building block (one `<Period>` per input).
 export {

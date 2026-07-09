@@ -29,6 +29,7 @@ type Sps = {
 	numLongTermRefPicsSps: number;
 	usedByCurrPicLtSpsFlag: boolean[];
 	temporalMvpEnabledFlag: boolean;
+	picSizeInCtbsY: number;
 };
 
 type Pps = {
@@ -48,7 +49,6 @@ type Pps = {
 	deblockingFilterOverrideEnabledFlag: boolean;
 	listsModificationPresentFlag: boolean;
 	sliceSegmentHeaderExtensionPresentFlag: boolean;
-	picWidthInCtbsY: number;
 };
 
 const ceilLog2 = (n: number): number => Math.ceil(Math.log2(n));
@@ -221,8 +221,8 @@ export class H265VideoSliceHeaderParser implements VideoSliceHeaderParser {
 			if (chromaFormatIdc === 3) {
 				separateColourPlaneFlag = bs.readBits(1) === 1;
 			}
-			readExpGolomb(bs); // pic_width_in_luma_samples
-			readExpGolomb(bs); // pic_height_in_luma_samples
+			const picWidthInLumaSamples = readExpGolomb(bs);
+			const picHeightInLumaSamples = readExpGolomb(bs);
 			if (bs.readBits(1) === 1) { // conformance_window_flag
 				readExpGolomb(bs);
 				readExpGolomb(bs);
@@ -238,8 +238,11 @@ export class H265VideoSliceHeaderParser implements VideoSliceHeaderParser {
 				readExpGolomb(bs); // sps_max_num_reorder_pics
 				readExpGolomb(bs); // sps_max_latency_increase_plus1
 			}
-			readExpGolomb(bs); // log2_min_luma_coding_block_size_minus3
-			readExpGolomb(bs); // log2_diff_max_min_luma_coding_block_size
+			const log2MinLumaCbSizeMinus3 = readExpGolomb(bs);
+			const log2DiffMaxMinLumaCbSize = readExpGolomb(bs);
+			// CtbSizeY = 1 << (MinCbLog2SizeY + log2_diff...); PicSizeInCtbsY sizes slice_segment_address.
+			const ctbSizeY = 1 << (log2MinLumaCbSizeMinus3 + 3 + log2DiffMaxMinLumaCbSize);
+			const picSizeInCtbsY = Math.ceil(picWidthInLumaSamples / ctbSizeY) * Math.ceil(picHeightInLumaSamples / ctbSizeY);
 			readExpGolomb(bs); // log2_min_luma_transform_block_size_minus2
 			readExpGolomb(bs); // log2_diff_max_min_luma_transform_block_size
 			readExpGolomb(bs); // max_transform_hierarchy_depth_inter
@@ -289,6 +292,7 @@ export class H265VideoSliceHeaderParser implements VideoSliceHeaderParser {
 				numLongTermRefPicsSps,
 				usedByCurrPicLtSpsFlag,
 				temporalMvpEnabledFlag,
+				picSizeInCtbsY,
 			});
 			return true;
 		} catch {
@@ -370,7 +374,6 @@ export class H265VideoSliceHeaderParser implements VideoSliceHeaderParser {
 				deblockingFilterOverrideEnabledFlag,
 				listsModificationPresentFlag,
 				sliceSegmentHeaderExtensionPresentFlag,
-				picWidthInCtbsY: 0,
 			});
 			return true;
 		} catch {
@@ -380,7 +383,7 @@ export class H265VideoSliceHeaderParser implements VideoSliceHeaderParser {
 
 	/** @internal */
 	private parseSliceHeader(bs: Bitstream, naluType: number): void {
-		bs.skipBits(1); // first_slice_segment_in_pic_flag
+		const firstSliceSegmentInPic = bs.readBits(1) === 1;
 		if (naluType >= H265_BLA_W_LP && naluType <= H265_RSV_IRAP_VCL23) {
 			bs.skipBits(1); // no_output_of_prior_pics_flag
 		}
@@ -394,7 +397,20 @@ export class H265VideoSliceHeaderParser implements VideoSliceHeaderParser {
 			throw new Error('Unknown SPS');
 		}
 
-		// This port targets non-dependent slices with first_slice_segment_in_pic (segment_address absent).
+		// A picture split into multiple slices: the 2nd+ segment carries a segment address (and, when
+		// enabled, a dependent-slice flag). A dependent segment inherits the rest of the header verbatim,
+		// so its slice header ends right after the address.
+		let dependentSliceSegment = false;
+		if (!firstSliceSegmentInPic) {
+			if (pps.dependentSliceSegmentsEnabledFlag) {
+				dependentSliceSegment = bs.readBits(1) === 1;
+			}
+			bs.skipBits(ceilLog2(sps.picSizeInCtbsY)); // slice_segment_address
+		}
+		if (dependentSliceSegment) {
+			return;
+		}
+
 		bs.skipBits(pps.numExtraSliceHeaderBits);
 		const sliceType = readExpGolomb(bs);
 		if (pps.outputFlagPresentFlag) {

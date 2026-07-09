@@ -21,7 +21,7 @@ import type {
 	VideoInfo,
 } from './dash-media-info';
 import type { SegmentInfo } from './dash-types';
-import { XmlNode } from './dash-xml-node';
+import { descriptorNode, XmlNode } from './dash-xml-node';
 
 /** @internal */
 const EC3_CODEC = 'ec-3';
@@ -189,16 +189,7 @@ export class RepresentationBaseXmlNode extends XmlNode {
 	 * Mirrors shaka's `RepresentationBaseXmlNode::AddDescriptor`.
 	 */
 	protected addDescriptor(descriptorName: string, schemeIdUri: string, value: string): boolean {
-		const descriptor = new XmlNode(descriptorName);
-		if (!descriptor.setStringAttribute('schemeIdUri', schemeIdUri)) {
-			return false;
-		}
-		if (value.length > 0) {
-			if (!descriptor.setStringAttribute('value', value)) {
-				return false;
-			}
-		}
-		return this.addChild(descriptor);
+		return this.addChild(descriptorNode(descriptorName, schemeIdUri, value.length > 0 ? value : null));
 	}
 }
 

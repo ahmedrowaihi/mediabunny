@@ -41,7 +41,8 @@ export interface HlsEntry {
 	toString(): string;
 }
 
-const formatExtInfDuration = (seconds: number) => seconds.toFixed(3);
+/** Formats an `#EXTINF` duration as seconds with 3 decimal places. @internal */
+export const formatExtInfDuration = (seconds: number) => seconds.toFixed(3);
 
 /**
  * Renders one `#EXTINF` line with optional `#EXT-X-BYTERANGE` and the segment URI.

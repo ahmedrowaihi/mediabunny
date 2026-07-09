@@ -5,6 +5,7 @@ import {
 	buildCbcsContentProtections,
 	buildCbcsHlsKey,
 	buildContentProtections,
+	buildHlsKeys,
 	patchMediaPlaylistKeys,
 	patchMpdContentProtection,
 	serializeContentProtection,
@@ -106,6 +107,24 @@ describe('HLS cbcs EXT-X-KEY', () => {
 			'#EXTINF:4.0,',
 			'seg0.m4s',
 		]);
+	});
+
+	test('buildHlsKeys emits one EXT-X-KEY per system — the string-path multi-DRM counterpart to drm()', () => {
+		const keys = buildHlsKeys({
+			systems: [
+				{ uuid: WIDEVINE_UUID, pssh: buildWidevinePssh(KID) },
+				{ uuid: PLAYREADY_SYSTEM_ID, pssh: buildPlayReadyPssh(KID) },
+				{ uuid: FAIRPLAY_UUID },
+			],
+			fairplayKeyUri: `skd://${KID_UUID}`,
+		});
+		expect(keys).toHaveLength(3);
+		expect(keys[0]).toContain(`KEYFORMAT="urn:uuid:${WIDEVINE_UUID}"`); // Widevine as data: pssh
+		expect(keys[0]).toContain('URI="data:text/plain;base64,');
+		expect(keys[1]).toContain('KEYFORMAT="com.microsoft.playready"'); // PlayReady as data: PRO (UTF-16)
+		expect(keys[1]).toContain('charset=UTF-16');
+		expect(keys[2]).toContain('KEYFORMAT="com.apple.streamingkeydelivery"'); // FairPlay skd:
+		expect(keys[2]).toContain(`URI="skd://${KID_UUID}"`);
 	});
 });
 

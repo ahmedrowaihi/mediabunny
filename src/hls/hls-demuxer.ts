@@ -29,6 +29,7 @@ import {
 	type HlsMasterPlaylist,
 	type HlsMediaRendition,
 	type HlsVariant,
+	parseChannelCount,
 	parseHlsPlaylist,
 } from './hls-playlist-parser';
 import { HlsSegmentedInput } from './hls-segmented-input';
@@ -55,6 +56,7 @@ const iFrameStreamAsVariant = (v: HlsIFrameStream): HlsVariant => ({
 	codecs: v.codecs,
 	resolution: v.resolution,
 	frameRate: null,
+	videoRange: null,
 	hdcpLevel: null,
 	audioGroup: null,
 	videoGroup: v.videoGroup,
@@ -844,14 +846,6 @@ class HlsInputAudioTrackBacking
 		return this.backingAudioTrack!.getDecoderConfig();
 	}
 }
-
-const parseChannelCount = (channels: string | null): number | null => {
-	if (channels === null) {
-		return null;
-	}
-	const parsed = Number(channels.split('/')[0]!);
-	return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
-};
 
 const preprocessLanguageCode = (code: string | null) => {
 	if (code === null) {

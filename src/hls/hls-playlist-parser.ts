@@ -44,6 +44,8 @@ export type HlsVariant = {
 	} | null;
 	/** `FRAME-RATE` in fps. */
 	frameRate: number | null;
+	/** `VIDEO-RANGE` (`SDR`, `PQ`, or `HLG`). */
+	videoRange: string | null;
 	/** `HDCP-LEVEL`. */
 	hdcpLevel: string | null;
 	/** `AUDIO` group ID reference. */
@@ -157,6 +159,8 @@ export type HlsKey = {
 	uri: string | null;
 	/** `IV` as a `0x`-prefixed hex string. */
 	iv: string | null;
+	/** `KEYID` as a `0x`-prefixed hex string (CENC default-KID hint). */
+	keyId: string | null;
 	/** `KEYFORMAT` (defaults to `identity`). */
 	keyFormat: string;
 	/** `KEYFORMATVERSIONS` parsed as integers. */
@@ -182,8 +186,8 @@ export type HlsSegment = {
 	programDateTime: number | null;
 	/** Currently-active `#EXT-X-MAP` (init segment). */
 	map: HlsMap | null;
-	/** Currently-active `#EXT-X-KEY` (encryption descriptor). */
-	key: HlsKey | null;
+	/** Active `#EXT-X-KEY` descriptors — one per KEYFORMAT, so multi-DRM is preserved. */
+	keys: HlsKey[];
 	/** True if a `#EXT-X-DISCONTINUITY` tag precedes this segment. */
 	discontinuityBefore: boolean;
 };
@@ -278,6 +282,7 @@ const parseMaster = (lines: string[]): HlsMasterPlaylist => {
 				codecs: stripQuotes(attrs.get('codecs')),
 				resolution: parseResolution(attrs.get('resolution')),
 				frameRate: attrs.getAsNumber('frame-rate'),
+				videoRange: stripQuotes(attrs.get('video-range')),
 				hdcpLevel: attrs.get('hdcp-level'),
 				audioGroup: stripQuotes(attrs.get('audio')),
 				videoGroup: stripQuotes(attrs.get('video')),
@@ -363,7 +368,7 @@ const parseMedia = (lines: string[]): HlsMediaPlaylistAst => {
 	let pendingProgramDateTime: number | null = null;
 	let pendingDiscontinuity = false;
 	let currentMap: HlsMap | null = null;
-	let currentKey: HlsKey | null = null;
+	let currentKeys: HlsKey[] = [];
 
 	for (const rawLine of lines) {
 		const line = rawLine;
@@ -422,13 +427,20 @@ const parseMedia = (lines: string[]): HlsMediaPlaylistAst => {
 			if (method === null) {
 				throw new Error('Invalid HLS media playlist: #EXT-X-KEY requires METHOD');
 			}
-			currentKey = {
-				method,
-				uri: stripQuotes(attrs.get('uri')),
-				iv: attrs.get('iv'),
-				keyFormat: stripQuotes(attrs.get('keyformat')) ?? 'identity',
-				keyFormatVersions: parseKeyFormatVersions(stripQuotes(attrs.get('keyformatversions'))),
-			};
+			if (method === 'NONE') {
+				currentKeys = [];
+			} else {
+				const key: HlsKey = {
+					method,
+					uri: stripQuotes(attrs.get('uri')),
+					iv: attrs.get('iv'),
+					keyId: attrs.get('keyid'),
+					keyFormat: stripQuotes(attrs.get('keyformat')) ?? 'identity',
+					keyFormatVersions: parseKeyFormatVersions(stripQuotes(attrs.get('keyformatversions'))),
+				};
+				// A new key supersedes the prior one of the same KEYFORMAT; different formats coexist (multi-DRM).
+				currentKeys = [...currentKeys.filter(k => k.keyFormat !== key.keyFormat), key];
+			}
 			continue;
 		}
 		if (line === TAG_DISCONTINUITY) {
@@ -472,7 +484,7 @@ const parseMedia = (lines: string[]): HlsMediaPlaylistAst => {
 			byteRange: pendingByteRange,
 			programDateTime: pendingProgramDateTime,
 			map: currentMap,
-			key: currentKey,
+			keys: currentKeys,
 			discontinuityBefore: pendingDiscontinuity,
 		});
 		pendingDuration = null;
@@ -504,6 +516,21 @@ const parseResolution = (value: string | null): { width: number; height: number 
 		return null;
 	}
 	return { width: Number(match[1]), height: Number(match[2]) };
+};
+
+/**
+ * Parse an HLS `CHANNELS` attribute to a channel count — the leading integer before any `/`
+ * parameter (e.g. `"6/JOC"` → 6). Returns `null` for absent or non-positive-integer values.
+ *
+ * @group HLS
+ * @public
+ */
+export const parseChannelCount = (channels: string | null): number | null => {
+	if (channels === null) {
+		return null;
+	}
+	const parsed = Number(channels.split('/')[0]!);
+	return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
 };
 
 const parseByteRangeAttr = (value: string | null): { length: number; offset: number | null } | null => {

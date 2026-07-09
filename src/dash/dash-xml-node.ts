@@ -363,3 +363,18 @@ export class XmlNode {
 		return this.attributes.get(name);
 	}
 }
+
+/**
+ * Build a `<Name schemeIdUri="..." value="..."/>` descriptor element (Role, SupplementalProperty,
+ * AudioChannelConfiguration, …). The `value` attribute is omitted when `null`.
+ *
+ * @internal
+ */
+export const descriptorNode = (name: string, schemeIdUri: string, value: string | null): XmlNode => {
+	const node = new XmlNode(name);
+	node.setStringAttribute('schemeIdUri', schemeIdUri);
+	if (value !== null) {
+		node.setStringAttribute('value', value);
+	}
+	return node;
+};

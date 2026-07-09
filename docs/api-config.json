@@ -23,6 +23,7 @@
     "HLS": "Generators for HLS master playlists and per-rendition `.m3u8` media playlists. Ported from shaka-packager.",
     "DASH": "Generators for DASH MPD documents. Ported from shaka-packager.",
     "Encryption": "CENC encryption for CMAF (cbcs, cenc, cens) and DASH/HLS content-protection signaling. Ported from shaka-packager.",
+    "Manifest": "Parse, transform, and serialize HLS and DASH manifests through one unified interface — composable, format-agnostic passes over the parsed ASTs.",
     "Miscellaneous": "Whatever's left.",
 
 	"@mediabunny/server": "Adds full video/audio decoder and encoder support to Mediabunny running in server-side environments such as Node, Bun, or Deno.",

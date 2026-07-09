@@ -7,6 +7,8 @@
  */
 
 import { bytesToHexString, toDataView, uint8ArraysAreEqual } from '../misc';
+import { FileSlice } from '../reader';
+import { MIN_BOX_HEADER_SIZE, readBoxHeader } from './isobmff-reader';
 
 export const buildIsobmffMimeType = (info: {
 	isQuickTime: boolean;
@@ -408,4 +410,105 @@ export const getSidxMaxSegmentDuration = (sidx: SidxBox): number => {
 		}
 	}
 	return max;
+};
+
+/**
+ * Returns `true` when `segment` is a CMAF / fragmented-MP4 **initialization** segment (a `moov` appears
+ * before any `moof`), `false` for a **media** segment (a `moof` appears first). Defaults to `false`
+ * when neither top-level box is present. Useful for routing an ingest stream where init and media
+ * objects arrive on the same channel.
+ *
+ * @group Miscellaneous
+ * @public
+ */
+export const isInitializationSegment = (segment: Uint8Array): boolean => {
+	const slice = FileSlice.tempFromBytes(segment);
+	while (slice.remainingLength >= MIN_BOX_HEADER_SIZE) {
+		const boxStart = slice.filePos;
+		const header = readBoxHeader(slice);
+		if (!header) {
+			break;
+		}
+		if (header.name === 'moov') {
+			return true;
+		}
+		if (header.name === 'moof') {
+			return false;
+		}
+		slice.filePos = boxStart + header.totalSize;
+	}
+	return false;
+};
+
+const TFDT_CONTAINERS = new Set(['moof', 'traf']);
+
+// Depth-first walk of moof → traf, invoking `visit` on each tfdt's content-start offset (on the slice's
+// own DataView, shared across subslices). `visit` returns `true` to stop the walk early.
+const walkTfdts = (slice: FileSlice, visit: (view: DataView, contentStart: number) => boolean): boolean => {
+	while (slice.remainingLength >= MIN_BOX_HEADER_SIZE) {
+		const boxStart = slice.filePos;
+		const header = readBoxHeader(slice);
+		if (!header) {
+			break;
+		}
+		const contentStart = slice.filePos;
+		if (header.name === 'tfdt') {
+			if (visit(slice.view, contentStart)) {
+				return true;
+			}
+		} else if (TFDT_CONTAINERS.has(header.name) && walkTfdts(slice.slice(contentStart, header.contentSize), visit)) {
+			return true;
+		}
+		slice.filePos = boxStart + header.totalSize;
+	}
+	return false;
+};
+
+// baseMediaDecodeTime sits after the tfdt version (1) + flags (3); it's u32 (v0) or u64 (v1).
+const readBaseMediaDecodeTime = (view: DataView, contentStart: number): number =>
+	view.getUint8(contentStart) === 1 ? Number(view.getBigUint64(contentStart + 4)) : view.getUint32(contentStart + 4);
+
+/**
+ * Read the `baseMediaDecodeTime` of a fragmented-MP4 (CMAF) segment's first `tfdt`, in that track's
+ * own timescale — i.e. where the segment sits on the media timeline. Returns `null` when there is no
+ * `tfdt` (an init segment or non-fragmented MP4). Pair with {@link rebaseSegmentDecodeTime} to splice
+ * segments onto a continuous timeline: `rebaseSegmentDecodeTime(seg, target - getSegmentDecodeTime(seg))`.
+ *
+ * @group Miscellaneous
+ * @public
+ */
+export const getSegmentDecodeTime = (segment: Uint8Array): number | null => {
+	let time: number | null = null;
+	walkTfdts(FileSlice.tempFromBytes(segment), (view, contentStart) => {
+		time = readBaseMediaDecodeTime(view, contentStart);
+		return true; // first tfdt only
+	});
+	return time;
+};
+
+/**
+ * Return a fresh copy of a fragmented-MP4 (CMAF) media segment with every `tfdt` `baseMediaDecodeTime`
+ * shifted by `deltaTicks`, expressed in that track's own timescale. Use it to re-time or splice segments
+ * onto a continuous timeline — e.g. concatenating segments into a monotonic live feed — without a full
+ * demux/remux; only the `tfdt` fields change, all other bytes are copied verbatim. Input with no `moof`
+ * (an init segment, or non-fragmented MP4) is copied through unchanged. The result is always a distinct
+ * buffer the caller owns.
+ *
+ * @group Miscellaneous
+ * @public
+ */
+export const rebaseSegmentDecodeTime = (segment: Uint8Array, deltaTicks: number): Uint8Array => {
+	const out = segment.slice(); // always a distinct, caller-owned buffer
+	if (deltaTicks !== 0) {
+		walkTfdts(FileSlice.tempFromBytes(out), (view, contentStart) => {
+			const fieldPos = contentStart + 4; // after version (1) + flags (3)
+			if (view.getUint8(contentStart) === 1) {
+				view.setBigUint64(fieldPos, view.getBigUint64(fieldPos) + BigInt(deltaTicks));
+			} else {
+				view.setUint32(fieldPos, (view.getUint32(fieldPos) + deltaTicks) >>> 0);
+			}
+			return false; // every tfdt
+		});
+	}
+	return out;
 };

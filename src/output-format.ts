@@ -1536,6 +1536,20 @@ const extractSharedPipelineOptions = (options: DashOutputFormatOptions): HlsOutp
 	return out;
 };
 
+const lowestNegativeTimestampSupport = (formats: OutputFormat[]) => {
+	if (formats.some(format => format.negativeTimestampSupport === 'none')) {
+		return 'none' as const;
+	}
+	if (formats.some(format => format.negativeTimestampSupport === 'prefer-non-negative')) {
+		return 'prefer-non-negative' as const;
+	}
+	if (formats.some(format => format.negativeTimestampSupport === 'full')) {
+		return 'full' as const;
+	}
+
+	return null;
+};
+
 /**
  * MPEG-DASH output format.
  *
@@ -1611,6 +1625,10 @@ export class DashOutputFormat extends OutputFormat {
 
 	get supportsTimestampedMediaData(): boolean {
 		return toArray(this._options.segmentFormat).some(format => format.supportsTimestampedMediaData);
+	}
+
+	get negativeTimestampSupport() {
+		return lowestNegativeTimestampSupport(toArray(this._options.segmentFormat));
 	}
 }
 
@@ -1728,6 +1746,10 @@ export class AdaptiveOutputFormat extends OutputFormat {
 
 	get supportsTimestampedMediaData(): boolean {
 		return this._hlsFormat.supportsTimestampedMediaData;
+	}
+
+	get negativeTimestampSupport() {
+		return this._hlsFormat.negativeTimestampSupport;
 	}
 
 	/** @internal */

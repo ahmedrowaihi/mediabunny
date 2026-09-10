@@ -170,6 +170,21 @@ export type IsobmffOutputFormatOptions = {
 	minimumFragmentDuration?: number;
 
 	/**
+	 * Reserves room after the `moov` box for a Segment Index (`sidx`) covering every fragment in the
+	 * file, written once the file is finalized. This is what DASH's `<SegmentBase @indexRange>` points
+	 * at, letting one on-demand MPD address the whole file without listing every subsegment.
+	 *
+	 * The value is the maximum number of fragments the index can hold; unused room is filled with a
+	 * `free` box, so over-estimating costs 12 bytes per unused entry. If the file ends up with more
+	 * fragments than this, no index is written.
+	 *
+	 * Only applies to `fastStart: 'fragmented'` outputs. A `sidx` records the distance to the
+	 * subsegments it indexes as an unsigned value, so it can never be appended after the media — hence
+	 * the reservation.
+	 */
+	sidxFragmentCapacity?: number;
+
+	/**
 	 * The metadata format to use for writing metadata tags.
 	 *
 	 * - `'auto'` (default): Behaves like `'mdir'` for MP4 and like `'udta'` for QuickTime, matching FFmpeg's default
@@ -365,7 +380,7 @@ export class Mp4OutputFormat extends IsobmffOutputFormat {
  * @group Output formats
  * @public
  */
-export type CmafOutputFormatOptions = Omit<IsobmffOutputFormatOptions, 'fastStart'> & {
+export type CmafOutputFormatOptions = Omit<IsobmffOutputFormatOptions, 'fastStart' | 'sidxFragmentCapacity'> & {
 	/**
 	 * Controls the minimum duration of each fragment, in seconds. New fragments will only be created when the current
 	 * fragment is longer than this value. Defaults to `Infinity`, meaning the file will contain only one fragment.

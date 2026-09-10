@@ -8,6 +8,7 @@
 
 import { MediaCodec, validateAudioChunkMetadata, validateVideoChunkMetadata } from '../codec';
 import { Logging } from '../logging';
+import type { ByteRange } from '../isobmff/isobmff-misc';
 import { EncodedAudioPacketSource, EncodedVideoPacketSource } from '../media-source';
 import {
 	arrayArgmax,
@@ -80,6 +81,7 @@ type Playlist = {
 	currentSegmentStartTimestampIsFixed: boolean;
 	nextSegmentId: number;
 	initSegment: PlaylistSegment | null;
+	indexRange: ByteRange | null;
 	writtenSegments: PlaylistSegment[];
 	peakBitrate: number | null;
 	averageBitrate: number | null;
@@ -531,6 +533,7 @@ export class HlsMuxer extends Muxer {
 				currentSegmentStartTimestampIsFixed: false,
 				nextSegmentId: 1,
 				initSegment: null,
+				indexRange: null,
 				writtenSegments: [],
 				peakBitrate: null,
 				averageBitrate: null,
@@ -1314,6 +1317,10 @@ export class HlsMuxer extends Muxer {
 		if (playlist.singleFile) {
 			if (playlist.singleFile.fragmentedIsobmffOutput) {
 				await playlist.singleFile.fragmentedIsobmffOutput.output.finalize();
+
+				// The index is only written during finalization, so it can't be read before this point.
+				const muxer = playlist.singleFile.fragmentedIsobmffOutput.output._muxer as IsobmffMuxer;
+				playlist.indexRange = muxer.sidxByteRange;
 			} else {
 				await playlist.singleFile.target._flush();
 				await playlist.singleFile.target._finalize();

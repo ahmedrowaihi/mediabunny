@@ -38,6 +38,7 @@ export class DashManifestEmitter implements ManifestEmitter {
 	private readonly options: DashOutputFormatOptions;
 	private mpd: MpdBuilder | null = null;
 	private period: Period | null = null;
+	private mpdOptions: ReturnType<typeof createDefaultMpdOptions> | null = null;
 	private representations: RegisteredRepresentation[] = [];
 
 	constructor(host: MediaPipelineHost, options: DashOutputFormatOptions) {
@@ -63,6 +64,7 @@ export class DashManifestEmitter implements ManifestEmitter {
 		opts.mpdType = this.options.mpdType ?? 'static';
 		opts.mpdParams.generateStaticLiveMpd = opts.dashProfile === 'live' && opts.mpdType === 'static';
 		opts.mpdParams.useSegmentList = isSingleFile;
+		this.mpdOptions = opts;
 		opts.mpdParams.targetSegmentDuration = this.host.targetSegmentDuration;
 		Object.assign(opts.mpdParams, this.options.mpdParams ?? {});
 
@@ -129,6 +131,15 @@ export class DashManifestEmitter implements ManifestEmitter {
 
 	async onFinalize(): Promise<void> {
 		assert(this.mpd);
+		// A top-level `sidx` describes every subsegment on its own, so the MPD can point at that one
+		// range instead of listing them.
+		assert(this.mpdOptions);
+		if (
+			this.options.mpdParams?.useSegmentList === undefined
+			&& this.host.playlists.every(p => p.indexRange !== null)
+		) {
+			this.mpdOptions.mpdParams.useSegmentList = false;
+		}
 		const mpdText = this.mpd.toString();
 		if (mpdText === null) {
 			return;
@@ -233,6 +244,7 @@ const buildSingleFileBase = (
 		mediaFileUrl: fileRelativeToMpd,
 		mediaFileName: fileRelativeToMpd,
 		initRange: { begin: 0, end: initEnd },
+		indexRange: playlist.indexRange ?? undefined,
 		subsegmentRanges: playlist.writtenSegments.map(s => ({
 			begin: s.byteOffset!,
 			end: s.byteOffset! + s.byteSize - 1,

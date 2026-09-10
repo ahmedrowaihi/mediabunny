@@ -10,29 +10,10 @@ import { ALL_FORMATS } from '../../src/input-format.js';
 import { Input } from '../../src/input.js';
 import { BufferSource, CustomSource } from '../../src/source.js';
 import { assert } from '../../src/misc.js';
+import { readTopLevelBoxes } from './_top-level-boxes.js';
 
 const __dirname = new URL('.', import.meta.url).pathname;
 const FIXTURE = path.join(__dirname, '../public/bear-640x360-av_frag.mp4');
-
-type TopLevelBox = { name: string; start: number; size: number };
-
-const readTopLevelBoxes = (bytes: Uint8Array): TopLevelBox[] => {
-	const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-	const boxes: TopLevelBox[] = [];
-
-	let pos = 0;
-	while (pos + 8 <= bytes.length) {
-		let size = view.getUint32(pos);
-		const name = String.fromCharCode(...bytes.subarray(pos + 4, pos + 8));
-		if (size === 1) size = Number(view.getBigUint64(pos + 8));
-		if (size <= 0) break;
-
-		boxes.push({ name, start: pos, size });
-		pos += size;
-	}
-
-	return boxes;
-};
 
 const buildSidx = (opts: {
 	referenceID: number;

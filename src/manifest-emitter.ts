@@ -6,6 +6,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
+import type { ByteRange } from './isobmff/isobmff-misc';
 import type { OutputTrack } from './output';
 import type { Target } from './target';
 import type { Writer } from './writer';
@@ -26,6 +27,8 @@ export type Playlist = {
 	tracks: OutputTrack[];
 	segmentFormat: { fileExtension: string; mimeType: string };
 	initSegment: Segment | null;
+	/** Byte range of a top-level `sidx` covering the whole single file, when one was written. */
+	indexRange: ByteRange | null;
 	writtenSegments: Segment[];
 	peakBitrate: number | null;
 	averageBitrate: number | null;

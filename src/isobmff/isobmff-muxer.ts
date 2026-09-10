@@ -16,6 +16,9 @@ import {
 	moof,
 	moov,
 	sidx,
+	measureMultiReferenceSidx,
+	multiReferenceSidx,
+	type SidxSubsegment,
 	styp,
 	vtta,
 	vttc,
@@ -50,7 +53,7 @@ import {
 	serializeAvcDecoderConfigurationRecord,
 	serializeHevcDecoderConfigurationRecord,
 } from '../codec-data';
-import { buildIsobmffMimeType } from './isobmff-misc';
+import { type ByteRange, buildIsobmffMimeType } from './isobmff-misc';
 import { MAX_BOX_HEADER_SIZE, MIN_BOX_HEADER_SIZE } from './isobmff-reader';
 
 export const GLOBAL_TIMESCALE = 57600; // LCM of a bunch of common frame rates (24, 25, 30, 60, 144, ...)
@@ -204,6 +207,9 @@ export class IsobmffMuxer extends Muxer {
 	maxWrittenEndTimestamp = -Infinity;
 	minimumFragmentDuration: number;
 	private segmentHeaderSize: number | null = null;
+	private sidxReservation: { position: number; size: number } | null = null;
+	/** Byte range of the top-level `sidx`, once written. Feeds DASH's `<SegmentBase @indexRange>`. */
+	sidxByteRange: ByteRange | null = null;
 
 	constructor(output: Output, format: IsobmffOutputFormat) {
 		super(output);
@@ -1228,6 +1234,96 @@ export class IsobmffMuxer extends Muxer {
 		}
 	}
 
+	// A `sidx` locates its subsegments by an unsigned forward distance, so it has to sit ahead of
+	// them, but the fragment count isn't known until the file is done. Reserve room for the declared
+	// capacity here and fill it in at finalization.
+	private reserveSidx() {
+		const capacity = this.formatOptions.sidxFragmentCapacity;
+		if (capacity === undefined || capacity <= 0) {
+			return;
+		}
+
+		assert(this.writer);
+
+		const size = measureMultiReferenceSidx(capacity);
+		this.sidxReservation = { position: this.writer.getPos(), size };
+		this.writer.seek(this.writer.getPos() + size);
+	}
+
+	private writeReservedSidx() {
+		const reservation = this.sidxReservation;
+		if (!reservation) {
+			return;
+		}
+		this.sidxReservation = null;
+
+		assert(this.writer);
+		assert(this.boxWriter);
+
+		const primaryTrack = this.trackDatas[0];
+		if (!primaryTrack) {
+			return;
+		}
+
+		const endOfMedia = this.writer.getPos();
+		const subsegments = this.collectSubsegments(endOfMedia, primaryTrack.timescale);
+		const indexSize = measureMultiReferenceSidx(subsegments.length);
+
+		if (subsegments.length === 0 || indexSize > reservation.size) {
+			// Writing a truncated index would misreport the file, so leave the slot as free space and
+			// let the manifest fall back to listing each subsegment.
+			this.writer.seek(reservation.position);
+			this.boxWriter.writeBox(free(reservation.size));
+			this.writer.seek(endOfMedia);
+			return;
+		}
+
+		// `firstOffset` is measured from the end of the box, so it has to clear the padding below.
+		const leftover = reservation.size - indexSize;
+
+		this.writer.seek(reservation.position);
+		this.boxWriter.writeBox(multiReferenceSidx({
+			referenceId: primaryTrack.track.id,
+			timescale: primaryTrack.timescale,
+			earliestPresentationTime: intoTimescale(
+				Math.max(0, this.minWrittenTimestamp),
+				primaryTrack.timescale,
+			),
+			firstOffset: leftover,
+			subsegments,
+		}));
+		this.sidxByteRange = { begin: reservation.position, end: reservation.position + indexSize - 1 };
+
+		if (leftover > 0) {
+			this.boxWriter.writeBox(free(leftover));
+		}
+
+		this.writer.seek(endOfMedia);
+	}
+
+	// Tracks sharing a fragment share its `moof`, and chunks are finalized in write order, so equal
+	// offsets arrive adjacent; each subsegment runs from its own `moof` to the next.
+	private collectSubsegments(endOfMedia: number, timescale: number): SidxSubsegment[] {
+		const fragments: { offset: number; timestamp: number }[] = [];
+		for (const chunk of this.finalizedChunks) {
+			if (chunk.moofOffset === null || last(fragments)?.offset === chunk.moofOffset) {
+				continue;
+			}
+			fragments.push({ offset: chunk.moofOffset, timestamp: chunk.samples[0]!.timestamp });
+		}
+
+		return fragments.map((fragment, i) => {
+			const next = fragments[i + 1];
+			return {
+				size: (next ? next.offset : endOfMedia) - fragment.offset,
+				duration: intoTimescale(
+					Math.max(0, (next ? next.timestamp : this.maxWrittenEndTimestamp) - fragment.timestamp),
+					timescale,
+				),
+			};
+		});
+	}
+
 	private async finalizeFragment(flushWriter = !this.isCmaf) {
 		assert(this.isFragmented);
 
@@ -1267,6 +1363,8 @@ export class IsobmffMuxer extends Muxer {
 				this.segmentHeaderSize = stypSize + sidxSize;
 
 				this.writer.seek(this.segmentHeaderSize); // Make room for the header to be written later
+			} else {
+				this.reserveSidx();
 			}
 		}
 
@@ -1637,6 +1735,8 @@ export class IsobmffMuxer extends Muxer {
 				this.boxWriter.writeBox(styp());
 				this.boxWriter.writeBox(sidx(this, contentSize));
 			} else {
+				this.writeReservedSidx();
+
 				// Append the mfra box to the end of the file for better random access
 				const startPos = this.writer.getPos();
 				const mfraBox = mfra(this.trackDatas);

@@ -505,7 +505,70 @@ export class IsobmffDemuxer extends Demuxer {
 					}
 				}
 			}
+
+			this.seedFragmentLookupTablesFromSidx();
 		})();
+	}
+
+	/**
+	 * A `sidx` indexes every subsegment by duration and byte size, which is exactly what a fragment
+	 * lookup table holds. Without this, a fragmented file that carries a `sidx` but no `mfra` (the
+	 * DASH on-demand / CMAF layout) has an empty lookup table, so every seek — including the
+	 * `getPacket(Infinity)` behind `computeDuration()` — walks the file `moof` by `moof` from byte 0.
+	 *
+	 * `tfra` wins where both are present: it addresses individual fragments rather than subsegments.
+	 */
+	private seedFragmentLookupTablesFromSidx() {
+		const entriesByTrackId = new Map<number, FragmentLookupTableEntry[]>();
+
+		for (const sidx of this.sidxBoxes) {
+			const track = this.tracks.find(x => x.id === sidx.referenceID);
+			if (!track) {
+				continue;
+			}
+
+			let entries = entriesByTrackId.get(track.id);
+			if (!entries) {
+				entries = [];
+				entriesByTrackId.set(track.id, entries);
+			}
+
+			// Durations are in the sidx's own timescale; the lookup table is in the track's.
+			const timeRatio = track.timescale / sidx.timescale;
+
+			let timeInSidxTimescale = sidx.earliestPresentationTime;
+			let moofOffset = sidx.boxStart + sidx.boxSize + sidx.firstOffset;
+
+			for (const reference of sidx.references) {
+				if (reference.referenceType === 1) {
+					// A nested `sidx` sits where a subsegment would. We don't recurse into it, and every offset
+					// after it would be a guess, so stop rather than emit entries that point at the wrong bytes.
+					break;
+				}
+
+				entries.push({
+					timestamp: Math.round(timeInSidxTimescale * timeRatio),
+					moofOffset,
+				});
+
+				timeInSidxTimescale += reference.subsegmentDuration;
+				moofOffset += reference.referencedSize;
+			}
+		}
+
+		for (const [trackId, entries] of entriesByTrackId) {
+			const track = this.tracks.find(x => x.id === trackId);
+			assert(track);
+
+			if (track.fragmentLookupTable.length > 0) {
+				// A `tfra` was read from the file's `mfra`; it addresses individual fragments rather than
+				// whole subsegments, so it's the better table and we leave it alone.
+				continue;
+			}
+
+			entries.sort((a, b) => a.timestamp - b.timestamp);
+			track.fragmentLookupTable = entries;
+		}
 	}
 
 	private async copyMetadataFromInitInput(initInput: Input) {

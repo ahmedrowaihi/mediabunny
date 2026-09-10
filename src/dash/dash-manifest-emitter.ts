@@ -45,6 +45,10 @@ export class DashManifestEmitter implements ManifestEmitter {
 		this.options = options;
 	}
 
+	private get isSingleFile(): boolean {
+		return this.options.singleFilePerPlaylist ?? false;
+	}
+
 	private resolveSegmentTemplate(playlist: Playlist): string {
 		if (this.options.segmentTemplate !== undefined) {
 			return this.options.segmentTemplate;
@@ -54,9 +58,7 @@ export class DashManifestEmitter implements ManifestEmitter {
 
 	onStart(): void {
 		const opts = createDefaultMpdOptions();
-		const isSingleFile = this.host.playlists.some(p =>
-			p.initSegment !== null && p.initSegment.byteOffset !== null,
-		);
+		const isSingleFile = this.isSingleFile;
 		opts.dashProfile = this.options.dashProfile ?? (isSingleFile ? 'onDemand' : 'live');
 		opts.mpdType = this.options.mpdType ?? 'static';
 		opts.mpdParams.generateStaticLiveMpd = opts.dashProfile === 'live' && opts.mpdType === 'static';
@@ -163,10 +165,7 @@ export class DashManifestEmitter implements ManifestEmitter {
 		const playlistDir = playlist.path.includes('/')
 			? playlist.path.split('/').slice(0, -1).join('/')
 			: '';
-		const isSingleFile = playlist.initSegment !== null
-			&& playlist.initSegment.byteOffset !== null;
-
-		const base: MediaInfo = isSingleFile
+		const base: MediaInfo = this.isSingleFile
 			? buildSingleFileBase(playlist, playlistDir)
 			: buildSegmentTemplateBase(playlist, playlistDir, this.options.initSegmentName, segmentTemplate);
 

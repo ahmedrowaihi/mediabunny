@@ -361,14 +361,14 @@ export type SidxSubsegment = {
 	duration: number;
 };
 
+/** Size in bytes of a {@link multiReferenceSidx} holding `subsegmentCount` references. */
+export const measureMultiReferenceSidx = (subsegmentCount: number) => 40 + 12 * subsegmentCount;
+
 /**
  * Segment Index Box indexing every subsegment of the file, as opposed to {@link sidx}, which
  * describes a single one. `firstOffset` is unsigned, so a box of this shape can only ever sit
  * ahead of the subsegments it references.
  */
-/** Size in bytes of a {@link multiReferenceSidx} holding `subsegmentCount` references. */
-export const measureMultiReferenceSidx = (subsegmentCount: number) => 40 + 12 * subsegmentCount;
-
 export const multiReferenceSidx = (options: {
 	referenceId: number;
 	timescale: number;

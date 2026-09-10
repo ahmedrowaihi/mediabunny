@@ -1,14 +1,12 @@
 /*!
- * Walks the top-level box structure of an ISOBMFF file. Shared by the tests that assert on the
- * shape of muxer output rather than on its decoded contents.
+ * Walks the top-level box structure of an ISOBMFF file. Shared by the tests that assert on the shape
+ * of muxer output rather than its decoded contents. `src/crypto/box-tree.ts` parses boxes too, but
+ * returns payload slices without the file offsets these tests splice and compare against.
  */
 
 export type TopLevelBox = {
-	/** Four-character box type, e.g. `moof`. */
 	name: string;
-	/** Byte offset of the box header within the file. */
 	start: number;
-	/** Total size of the box in bytes, header included. */
 	size: number;
 };
 

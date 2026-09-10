@@ -1260,16 +1260,12 @@ export class IsobmffMuxer extends Muxer {
 		assert(this.writer);
 		assert(this.boxWriter);
 
-		const primaryTrack = this.trackDatas[0];
-		if (!primaryTrack) {
-			return;
-		}
-
 		const endOfMedia = this.writer.getPos();
-		const subsegments = this.collectSubsegments(endOfMedia, primaryTrack.timescale);
+		const primaryTrack = this.trackDatas[0];
+		const subsegments = primaryTrack ? this.collectSubsegments(endOfMedia, primaryTrack.timescale) : [];
 		const indexSize = measureMultiReferenceSidx(subsegments.length);
 
-		if (subsegments.length === 0 || indexSize > reservation.size) {
+		if (!primaryTrack || subsegments.length === 0 || indexSize > reservation.size) {
 			// Writing a truncated index would misreport the file, so leave the slot as free space and
 			// let the manifest fall back to listing each subsegment.
 			this.writer.seek(reservation.position);

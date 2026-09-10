@@ -88,6 +88,7 @@ import {
 	psshBoxesAreEqual,
 	PsshBox,
 	SidxBox,
+	getSidxSegmentOffsets,
 	TrackEncryptionInfo,
 } from './isobmff-misc';
 import {
@@ -516,53 +517,50 @@ export class IsobmffDemuxer extends Demuxer {
 	 * `tfra` wins where both are present: it addresses individual fragments rather than subsegments.
 	 */
 	private seedFragmentLookupTablesFromSidx() {
-		const entriesByTrackId = new Map<number, FragmentLookupTableEntry[]>();
+		const entriesByTrack = new Map<InternalTrack, FragmentLookupTableEntry[]>();
 
 		for (const sidx of this.sidxBoxes) {
-			const track = this.tracks.find(x => x.id === sidx.referenceID);
-			if (!track) {
-				continue;
-			}
+			const offsets = getSidxSegmentOffsets(sidx);
 
-			let entries = entriesByTrackId.get(track.id);
-			if (!entries) {
-				entries = [];
-				entriesByTrackId.set(track.id, entries);
-			}
-
-			// Durations are in the sidx's own timescale; the lookup table is in the track's.
-			const timeRatio = track.timescale / sidx.timescale;
-
-			let timeInSidxTimescale = sidx.earliestPresentationTime;
-			let moofOffset = sidx.boxStart + sidx.boxSize + sidx.firstOffset;
-
-			for (const reference of sidx.references) {
-				if (reference.referenceType === 1) {
-					// A nested `sidx` sits where a subsegment would. We don't recurse into it, and every offset
-					// after it would be a guess, so stop rather than emit entries that point at the wrong bytes.
-					break;
+			// A subsegment boundary is a `moof` boundary, and every track in the fragment shares that
+			// `moof` — so an index naming one track locates the fragments of all of them.
+			for (const track of this.tracks) {
+				if (track.fragmentLookupTable.length > 0) {
+					// A `tfra` already filled this one in; it states each fragment's offset outright rather
+					// than accumulating sizes, so it's the better table.
+					continue;
 				}
 
-				entries.push({
-					timestamp: Math.round(timeInSidxTimescale * timeRatio),
-					moofOffset,
-				});
+				let entries = entriesByTrack.get(track);
+				if (!entries) {
+					entries = [];
+					entriesByTrack.set(track, entries);
+				}
 
-				timeInSidxTimescale += reference.subsegmentDuration;
-				moofOffset += reference.referencedSize;
+				// Durations are in the sidx's own timescale; the lookup table is in the track's.
+				const timeRatio = track.timescale / sidx.timescale;
+				let timeInSidxTimescale = sidx.earliestPresentationTime;
+
+				for (const [i, reference] of sidx.references.entries()) {
+					if (reference.referenceType === 1) {
+						// A nested `sidx` sits where a subsegment would. We don't recurse into it, and every
+						// offset after it would be a guess, so stop rather than point at the wrong bytes.
+						break;
+					}
+
+					entries.push({
+						timestamp: Math.round(timeInSidxTimescale * timeRatio),
+						moofOffset: offsets[i]!,
+					});
+
+					timeInSidxTimescale += reference.subsegmentDuration;
+				}
 			}
 		}
 
-		for (const [trackId, entries] of entriesByTrackId) {
-			const track = this.tracks.find(x => x.id === trackId);
-			assert(track);
-
-			if (track.fragmentLookupTable.length > 0) {
-				// A `tfra` was read from the file's `mfra`; it addresses individual fragments rather than
-				// whole subsegments, so it's the better table and we leave it alone.
-				continue;
-			}
-
+		for (const [track, entries] of entriesByTrack) {
+			// Chained sidx boxes need not be ordered by presentation time, and the table is
+			// binary-searched by timestamp.
 			entries.sort((a, b) => a.timestamp - b.timestamp);
 			track.fragmentLookupTable = entries;
 		}

@@ -28,8 +28,12 @@ import { OggMuxer } from './ogg/ogg-muxer';
 import { Output, OutputTrack, TrackType } from './output';
 import { MpegTsMuxer } from './mpeg-ts/mpeg-ts-muxer';
 import { WaveMuxer } from './wave/wave-muxer';
-import { HlsMuxer } from './hls/hls-muxer';
+import { DashManifestEmitter } from './dash/dash-manifest-emitter';
+import type { DashProfile, MpdParams, MpdType } from './dash/dash-types';
+import { HlsManifestEmitter } from './hls/hls-manifest-emitter';
+import { SegmentPipelineMuxer } from './segment-pipeline-muxer';
 import { HLS_MIME_TYPE } from './hls/hls-misc';
+import { WEBVTT_FILE_EXTENSION, WEBVTT_MIME_TYPE, WebvttMuxer } from './hls/hls-webvtt';
 import { MaybePromise, FilePath, isNumber, toArray } from './misc';
 import { Target } from './target';
 
@@ -126,6 +130,12 @@ export abstract class OutputFormat {
 	}
 
 	/** @internal */
+	// eslint-disable-next-line @typescript-eslint/no-unused-vars
+	_trackTypeUnsupportedHint(trackType: TrackType) {
+		return '';
+	}
+
+	/** @internal */
 	_isFragmentedIsobmff() {
 		return false;
 	}
@@ -167,10 +177,46 @@ export type IsobmffOutputFormatOptions = {
 	fastStart?: false | 'in-memory' | 'reserve' | 'fragmented';
 
 	/**
+	 * The creation and modification time written into `mvhd`, `tkhd` and `mdhd`. Defaults to the current wall clock.
+	 *
+	 * Set this to make output reproducible. Without it, muxing identical media twice produces files that differ in
+	 * these fields alone, which defeats content hashing, cache validators and byte-for-byte diffing — the same reason
+	 * build systems support `SOURCE_DATE_EPOCH`.
+	 */
+	creationTime?: Date;
+
+	/**
 	 * When using `fastStart: 'fragmented'`, this field controls the minimum duration of each fragment, in seconds.
 	 * New fragments will only be created when the current fragment is longer than this value. Defaults to 1 second.
 	 */
 	minimumFragmentDuration?: number;
+
+	/**
+	 * Writes a Segment Index (`sidx`) covering every fragment in the file. This is what DASH's
+	 * `<SegmentBase @indexRange>` points at, letting one on-demand MPD address the whole file without
+	 * listing every subsegment.
+	 *
+	 * The muxer sizes the index itself: it reserves room after the `moov` box for
+	 * {@link IsobmffOutputFormatOptions.sidxFragmentCapacity} fragments (8192 by default) and trims the
+	 * unused room to a `free` box once the file is finalized. Muxing a file with more fragments than
+	 * that throws rather than falling back to an unindexed layout.
+	 *
+	 * Only applies to `fastStart: 'fragmented'` outputs. A `sidx` records the distance to the
+	 * subsegments it indexes as an unsigned value, so it can never be appended after the media — hence
+	 * the reservation.
+	 */
+	segmentIndex?: boolean;
+
+	/**
+	 * The maximum number of fragments the index requested by
+	 * {@link IsobmffOutputFormatOptions.segmentIndex} can hold, and implies that request when given.
+	 * Unused room is filled with a `free` box, so over-estimating costs 12 bytes per unused fragment;
+	 * muxing a file with more fragments than this throws.
+	 *
+	 * Leave it unset unless you want to trade file size against the fragment ceiling: lower it to
+	 * shrink the reservation of a short file, raise it for a file with more than 8192 fragments.
+	 */
+	sidxFragmentCapacity?: number;
 
 	/**
 	 * The metadata format to use for writing metadata tags.
@@ -243,10 +289,19 @@ export abstract class IsobmffOutputFormat extends OutputFormat {
 			);
 		}
 		if (
+			options.creationTime !== undefined
+			&& (!(options.creationTime instanceof Date) || Number.isNaN(options.creationTime.getTime()))
+		) {
+			throw new TypeError('options.creationTime, when provided, must be a valid Date.');
+		}
+		if (
 			options.minimumFragmentDuration !== undefined
 			&& (!isNumber(options.minimumFragmentDuration) || options.minimumFragmentDuration < 0)
 		) {
 			throw new TypeError('options.minimumFragmentDuration, when provided, must be a non-negative number.');
+		}
+		if (options.segmentIndex !== undefined && typeof options.segmentIndex !== 'boolean') {
+			throw new TypeError('options.segmentIndex, when provided, must be a boolean.');
 		}
 		if (options.onFtyp !== undefined && typeof options.onFtyp !== 'function') {
 			throw new TypeError('options.onFtyp, when provided, must be a function.');
@@ -368,7 +423,10 @@ export class Mp4OutputFormat extends IsobmffOutputFormat {
  * @group Output formats
  * @public
  */
-export type CmafOutputFormatOptions = Omit<IsobmffOutputFormatOptions, 'fastStart'> & {
+export type CmafOutputFormatOptions = Omit<
+	IsobmffOutputFormatOptions,
+	'fastStart' | 'segmentIndex' | 'sidxFragmentCapacity'
+> & {
 	/**
 	 * Controls the minimum duration of each fragment, in seconds. New fragments will only be created when the current
 	 * fragment is longer than this value. Defaults to `Infinity`, meaning the file will contain only one fragment.
@@ -586,7 +644,9 @@ export class MkvOutputFormat extends OutputFormat {
 			...VIDEO_CODECS,
 			...NON_PCM_AUDIO_CODECS,
 			...PCM_AUDIO_CODECS.filter(codec => !['pcm-s8', 'pcm-f32be', 'pcm-f64be', 'ulaw', 'alaw'].includes(codec)),
-			...SUBTITLE_CODECS,
+
+			// Matroska defines no TTML codec ID
+			'webvtt',
 		];
 	}
 
@@ -630,7 +690,9 @@ export class WebMOutputFormat extends MkvOutputFormat {
 		return [
 			...VIDEO_CODECS.filter(codec => ['vp8', 'vp9', 'av1'].includes(codec)),
 			...AUDIO_CODECS.filter(codec => ['opus', 'vorbis'].includes(codec)),
-			...SUBTITLE_CODECS,
+
+			// Matroska defines no TTML codec ID
+			'webvtt',
 		];
 	}
 
@@ -1213,6 +1275,55 @@ export class MpegTsOutputFormat extends OutputFormat {
 	}
 }
 
+/** @internal */
+export class WebvttSegmentFormat extends OutputFormat {
+	/** @internal */
+	_createMuxer(output: Output): Muxer {
+		return new WebvttMuxer(output);
+	}
+
+	/** @internal */
+	get _name() {
+		return 'WebVTT';
+	}
+
+	get fileExtension() {
+		return WEBVTT_FILE_EXTENSION;
+	}
+
+	get mimeType() {
+		return WEBVTT_MIME_TYPE;
+	}
+
+	getSupportedCodecs(): MediaCodec[] {
+		return ['webvtt'];
+	}
+
+	getSupportedTrackCounts(): TrackCountLimits {
+		return {
+			video: { min: 0, max: 0 },
+			audio: { min: 0, max: 0 },
+			subtitle: { min: 1, max: 1 },
+			total: { min: 1, max: 1 },
+		};
+	}
+
+	get supportsVideoTransformationMetadata() {
+		return false;
+	}
+
+	get supportsTimestampedMediaData() {
+		return true;
+	}
+
+	get negativeTimestampSupport() {
+		return 'none' as const;
+	}
+}
+
+/** @internal */
+export const WEBVTT_SEGMENT_FORMAT = new WebvttSegmentFormat();
+
 /**
  * Info about an HLS media playlist.
  * @group Output formats
@@ -1225,6 +1336,23 @@ export type HlsOutputPlaylistInfo = {
 	tracks: OutputTrack[];
 	/** The format of the media segments in this playlist. */
 	segmentFormat: OutputFormat;
+};
+
+/**
+ * One part of a media segment: a `moof`/`mdat` fragment, listed as a Low-Latency HLS partial segment or sent as a
+ * Low-Latency DASH chunk.
+ * @group Output formats
+ * @public
+ */
+export type SegmentPart = {
+	/** Offset of the part in bytes from the start of its segment. */
+	offset: number;
+	/** Size of the part in bytes. */
+	size: number;
+	/** Duration of the part in seconds. */
+	duration: number;
+	/** Whether the part begins on a key frame, so playback can start at it. */
+	independent: boolean;
 };
 
 /**
@@ -1241,14 +1369,22 @@ export type HlsOutputSegmentInfo = {
 	format: OutputFormat;
 	/** The media playlist to which this segment belongs. */
 	playlist: HlsOutputPlaylistInfo;
+	/**
+	 * The segment's parts in order, whose bytes concatenate to the segment, when
+	 * {@link SegmentedOutputFormatOptions.partDuration} applies to it. `null` otherwise, and until the segment has been
+	 * written.
+	 */
+	parts: SegmentPart[] | null;
 };
 
 /**
- * HLS-specific output options.
+ * Options shaping the media that a segmented output writes, shared by every manifest format that
+ * describes it.
+ *
  * @group Output formats
  * @public
  */
-export type HlsOutputFormatOptions = {
+export type SegmentedOutputFormatOptions = {
 	/**
 	 * Specifies the file format of each media segment. Not all formats are supported by all players; prefer sticking
 	 * to the most commonly used ones: {@link MpegTsOutputFormat}, {@link CmafOutputFormat}, {@link AdtsOutputFormat},
@@ -1268,10 +1404,34 @@ export type HlsOutputFormatOptions = {
 	 */
 	targetDuration?: number;
 	/**
+	 * Splits each media segment into parts of about this many seconds, each its own `moof`/`mdat` fragment, for
+	 * Low-Latency HLS partial segments and Low-Latency DASH chunks.
+	 *
+	 * A part is cut at the first video sample at or after each multiple of this duration from the segment's start, or
+	 * at the first audio sample when the segment has no video, so parts run slightly longer than this duration and only
+	 * a segment's first part is sure to begin on a key frame. Each segment's parts are reported in
+	 * {@link HlsOutputSegmentInfo.parts}.
+	 *
+	 * Only applies to fragmented ISOBMFF segment formats, such as {@link CmafOutputFormat}; segments in other
+	 * formats are written whole.
+	 */
+	partDuration?: number;
+	/**
 	 * Whether to bundle all media segments for a playlist into a single file. Individual segments are then extracted
 	 * via range requests.
 	 */
 	singleFilePerPlaylist?: boolean;
+
+	/**
+	 * Whether paired tracks must be written as separate renditions rather than muxed together.
+	 *
+	 * By default, a lone video track paired with a lone audio track is collapsed into one variant stream carrying
+	 * both, since that is the cheapest correct output. Set this to `true` to keep them apart: the video becomes its
+	 * own variant and the audio an `#EXT-X-MEDIA` rendition group in HLS, and a separate `<AdaptationSet>` in DASH.
+	 *
+	 * Useful for exercising a player's audio track selection and switching, which a muxed rendition never exercises.
+	 */
+	separateRenditions?: boolean;
 	/**
 	 * If `true`, the muxer will be in "live mode", continuously emitting updated playlists as new segments are created.
 	 * The master playlist will be emitted as soon as all playlists have been emitted at least once, and will continue
@@ -1300,7 +1460,8 @@ export type HlsOutputFormatOptions = {
 	 * master playlist, `k` is the 1-based index of the segment in its playlist, and `ext` is the file extension of the
 	 * segment format (including the leading dot).
 	 *
-	 * If {@link HlsOutputFormatOptions.singleFilePerPlaylist} is true, it defaults to `'segments-{n}{ext}'` instead.
+	 * If {@link SegmentedOutputFormatOptions.singleFilePerPlaylist} is true, it defaults to
+	 * `'segments-{n}{ext}'` instead.
 	 */
 	getSegmentPath?: (info: HlsOutputSegmentInfo) => MaybePromise<FilePath>;
 	/**
@@ -1314,10 +1475,6 @@ export type HlsOutputFormatOptions = {
 	 */
 	getInitPath?: (info: HlsOutputPlaylistInfo) => MaybePromise<FilePath>;
 
-	/** Called whenever the master playlist is written. */
-	onMaster?: (content: string) => unknown;
-	/** Called whenever a media playlist is written. */
-	onPlaylist?: (content: string, info: HlsOutputPlaylistInfo) => unknown;
 	/**
 	 * Called whenever a media segment has been fully written. In single-file mode, this function will only be called
 	 * once when the playlist is finalized.
@@ -1330,10 +1487,41 @@ export type HlsOutputFormatOptions = {
 	onInit?: (target: Target, info: HlsOutputPlaylistInfo) => unknown;
 	/**
 	 * Called when a media segment is removed from the start of a media playlist due to
-	 * {@link HlsOutputFormatOptions.maxLiveSegmentCount}. Will not be called when
-	 * {@link HlsOutputFormatOptions.singleFilePerPlaylist} is `true`.
+	 * {@link SegmentedOutputFormatOptions.maxLiveSegmentCount}. Will not be called when
+	 * {@link SegmentedOutputFormatOptions.singleFilePerPlaylist} is `true`.
 	 */
 	onSegmentPopped?: (path: string, info: HlsOutputSegmentInfo) => unknown;
+};
+
+/**
+ * HLS-specific output options.
+ * @group Output formats
+ * @public
+ */
+export type HlsOutputFormatOptions = SegmentedOutputFormatOptions & {
+	/** Called whenever the master playlist is written. */
+	onMaster?: (content: string) => unknown;
+	/** Called whenever a media playlist is written. */
+	onPlaylist?: (content: string, info: HlsOutputPlaylistInfo) => unknown;
+	/**
+	 * `PART-HOLD-BACK`: how far back from the live edge a player should start, in seconds. Only written by a live
+	 * playlist that lists parts. Defaults to three times
+	 * {@link SegmentedOutputFormatOptions.partDuration}, the minimum RFC 8216bis §4.4.3.8 allows.
+	 */
+	partHoldBack?: number;
+	/**
+	 * Whether to advertise `CAN-BLOCK-RELOAD=YES`. This states that the *server* delivering these playlists holds a
+	 * request until the playlist advances (RFC 8216bis §6.2.5.2); writing the files does not provide that, so it
+	 * defaults to `false` and should only be turned on by an origin that implements blocking reload.
+	 */
+	canBlockReload?: boolean;
+	/**
+	 * Whether to write an `#EXT-X-PRELOAD-HINT` naming the part that comes next. Like
+	 * {@link HlsOutputFormatOptions.canBlockReload}, this names bytes that do not exist yet, which only a server
+	 * holding the request can answer (RFC 8216bis §6.2.5.2); served as plain files the hint yields a 404, so it
+	 * defaults to `false`.
+	 */
+	preloadHint?: boolean;
 };
 
 /**
@@ -1380,6 +1568,12 @@ export class HlsOutputFormat extends OutputFormat {
 		) {
 			throw new TypeError('options.targetDuration, when provided, must be a positive number.');
 		}
+		if (
+			options.partDuration !== undefined
+			&& (!Number.isFinite(options.partDuration) || options.partDuration <= 0)
+		) {
+			throw new TypeError('options.partDuration, when provided, must be a positive finite number.');
+		}
 		if (options.singleFilePerPlaylist !== undefined && typeof options.singleFilePerPlaylist !== 'boolean') {
 			throw new TypeError('options.singleFilePerPlaylist, when provided, must be a boolean.');
 		}
@@ -1425,7 +1619,9 @@ export class HlsOutputFormat extends OutputFormat {
 
 	/** @internal */
 	_createMuxer(output: Output): Muxer {
-		return new HlsMuxer(output, this);
+		return new SegmentPipelineMuxer(output, this._options, muxer => [
+			new HlsManifestEmitter(muxer, this._options),
+		]);
 	}
 
 	/** @internal */
@@ -1443,25 +1639,30 @@ export class HlsOutputFormat extends OutputFormat {
 
 	getSupportedCodecs(): MediaCodec[] {
 		const uniqueCodecs = new Set(toArray(this._options.segmentFormat).flatMap(x => x.getSupportedCodecs()));
+		if (this._options.singleFilePerPlaylist) {
+			uniqueCodecs.delete('webvtt');
+		} else {
+			// WebVTT rides in its own .vtt segments, independent of the configured segment formats.
+			uniqueCodecs.add('webvtt');
+		}
+
 		return [...uniqueCodecs];
 	}
 
 	getSupportedTrackCounts(): TrackCountLimits {
 		let supportsVideo = false;
 		let supportsAudio = false;
-		let supportsSubtitle = false;
 
 		for (const format of toArray(this._options.segmentFormat)) {
 			const trackCounts = format.getSupportedTrackCounts();
 			supportsVideo ||= trackCounts.video.max > 0;
 			supportsAudio ||= trackCounts.audio.max > 0;
-			supportsSubtitle ||= trackCounts.subtitle.max > 0;
 		}
 
 		return {
 			video: { min: 0, max: supportsVideo ? Infinity : 0 },
 			audio: { min: 0, max: supportsAudio ? Infinity : 0 },
-			subtitle: { min: 0, max: 0 }, // Currently disabled
+			subtitle: { min: 0, max: Infinity },
 			total: { min: 0, max: Infinity },
 		};
 	}
@@ -1492,8 +1693,289 @@ export class HlsOutputFormat extends OutputFormat {
 	}
 
 	/** @internal */
-	// eslint-disable-next-line @typescript-eslint/no-unused-vars
 	override _codecUnsupportedHint(codec: MediaCodec): string {
+		if (codec === 'webvtt' && this._options.singleFilePerPlaylist) {
+			return ' WebVTT segments are raw text and cannot be addressed via byte ranges, unlike the'
+				+ ' fragmented MP4 that carries \'ttml\' subtitle tracks. Use \'ttml\', or disable'
+				+ ' `singleFilePerPlaylist`.';
+		}
+
 		return ` Using different segment formats may grant support for this codec.`;
+	}
+}
+
+/**
+ * Options for {@link DashOutputFormat}. Same segment-pipeline surface as
+ * {@link HlsOutputFormatOptions} (minus HLS-only `onMaster` / `onPlaylist`)
+ * plus DASH-specific manifest fields.
+ *
+ * @group Output formats
+ * @public
+ */
+export type DashOutputFormatOptions = SegmentedOutputFormatOptions & {
+	/** Path of the rendered MPD relative to the {@link PathedTarget}'s root. */
+	mpdPath: string;
+	/** `<SegmentTemplate@media>` value with `$Number$` placeholder, relative to the playlist directory. */
+	segmentTemplate?: string;
+	/** `<SegmentTemplate@initialization>` filename, relative to the playlist directory. */
+	initSegmentName?: string;
+	/** DASH profile. Defaults to `'live'` (segments addressed by `SegmentTemplate`). */
+	dashProfile?: DashProfile;
+	/** MPD presentation type. `'static'` for VOD (default), `'dynamic'` for live. */
+	mpdType?: MpdType;
+	/** Override individual {@link MpdParams} fields; merged onto shaka defaults. */
+	mpdParams?: Partial<MpdParams>;
+	/** Called once with the MPD text after every track has been finalised. */
+	onMpd?: (content: string) => unknown;
+};
+
+/**
+ * Fields that describe the media rather than one manifest of it, so composed formats must state
+ * the same value for each. The per-format callbacks are deliberately absent: every format
+ * registers its own.
+ */
+const MUTUALLY_AGREED_FIELDS = [
+	'segmentFormat', 'targetDuration', 'partDuration', 'singleFilePerPlaylist', 'live',
+	'maxLiveSegmentCount', 'getPlaylistPath', 'getSegmentPath', 'getInitPath',
+	'separateRenditions',
+] as const satisfies readonly (keyof SegmentedOutputFormatOptions)[];
+
+const lowestNegativeTimestampSupport = (formats: OutputFormat[]) => {
+	if (formats.some(format => format.negativeTimestampSupport === 'none')) {
+		return 'none' as const;
+	}
+	if (formats.some(format => format.negativeTimestampSupport === 'prefer-non-negative')) {
+		return 'prefer-non-negative' as const;
+	}
+	if (formats.some(format => format.negativeTimestampSupport === 'full')) {
+		return 'full' as const;
+	}
+
+	return null;
+};
+
+/**
+ * MPEG-DASH output format.
+ *
+ * @group Output formats
+ * @public
+ */
+export class DashOutputFormat extends OutputFormat {
+	/** @internal */
+	_options: DashOutputFormatOptions;
+
+	/** Creates a new {@link DashOutputFormat} configured with the specified `options`. */
+	constructor(options: DashOutputFormatOptions) {
+		if (!options || typeof options !== 'object') {
+			throw new TypeError('options must be an object.');
+		}
+		if (typeof options.mpdPath !== 'string' || options.mpdPath.length === 0) {
+			throw new TypeError('options.mpdPath must be a non-empty string.');
+		}
+		if (options.onMpd !== undefined && typeof options.onMpd !== 'function') {
+			throw new TypeError('options.onMpd, when provided, must be a function.');
+		}
+
+		super();
+
+		this._options = options;
+	}
+
+	/** @internal */
+	_createMuxer(output: Output): Muxer {
+		return new SegmentPipelineMuxer(output, this._options, muxer => [
+			new DashManifestEmitter(muxer, this._options),
+		]);
+	}
+
+	/** @internal */
+	get _name() {
+		return 'MPEG-DASH';
+	}
+
+	get fileExtension() {
+		return '.mpd';
+	}
+
+	get mimeType() {
+		return 'application/dash+xml';
+	}
+
+	getSupportedCodecs(): MediaCodec[] {
+		const uniqueCodecs = new Set(toArray(this._options.segmentFormat).flatMap(x => x.getSupportedCodecs()));
+
+		if (this._options.singleFilePerPlaylist) {
+			uniqueCodecs.delete('webvtt');
+		} else {
+			uniqueCodecs.add('webvtt');
+		}
+
+		return [...uniqueCodecs];
+	}
+
+	/** @internal */
+	override _codecUnsupportedHint(codec: MediaCodec) {
+		if (codec === 'webvtt' && this._options.singleFilePerPlaylist) {
+			return ' WebVTT segments are raw text and cannot be addressed via byte ranges, unlike the'
+				+ ' fragmented MP4 that carries \'ttml\' subtitle tracks. Use \'ttml\', or disable'
+				+ ' `singleFilePerPlaylist`.';
+		}
+
+		return '';
+	}
+
+	getSupportedTrackCounts(): TrackCountLimits {
+		let supportsVideo = false;
+		let supportsAudio = false;
+		for (const format of toArray(this._options.segmentFormat)) {
+			const trackCounts = format.getSupportedTrackCounts();
+			supportsVideo ||= trackCounts.video.max > 0;
+			supportsAudio ||= trackCounts.audio.max > 0;
+		}
+		return {
+			video: { min: 0, max: supportsVideo ? Infinity : 0 },
+			audio: { min: 0, max: supportsAudio ? Infinity : 0 },
+			subtitle: { min: 0, max: Infinity },
+			total: { min: 1, max: Infinity },
+		};
+	}
+
+	get supportsVideoTransformationMetadata(): boolean {
+		return toArray(this._options.segmentFormat).some(format => format.supportsVideoTransformationMetadata);
+	}
+
+	get supportsTimestampedMediaData(): boolean {
+		return toArray(this._options.segmentFormat).some(format => format.supportsTimestampedMediaData);
+	}
+
+	get negativeTimestampSupport() {
+		return lowestNegativeTimestampSupport(toArray(this._options.segmentFormat));
+	}
+}
+
+/**
+ * Options for {@link AdaptiveOutputFormat}.
+ *
+ * @group Output formats
+ * @public
+ */
+export type AdaptiveOutputFormatOptions = {
+	/** One {@link HlsOutputFormat} plus zero or more {@link DashOutputFormat}s, sharing the same segment pipeline. */
+	formats: (HlsOutputFormat | DashOutputFormat)[];
+};
+
+/**
+ * Adaptive output format — one encoder pass, multiple manifests pointing at
+ * the same CMAF segments.
+ *
+ * @group Output formats
+ * @public
+ */
+export class AdaptiveOutputFormat extends OutputFormat {
+	/** @internal */
+	_options: AdaptiveOutputFormatOptions;
+	/** @internal */
+	_hlsFormat: HlsOutputFormat;
+	/** @internal */
+	_dashFormats: DashOutputFormat[];
+
+	/** Creates a new {@link AdaptiveOutputFormat} configured with the specified `options`. */
+	constructor(options: AdaptiveOutputFormatOptions) {
+		if (!options || typeof options !== 'object') {
+			throw new TypeError('options must be an object.');
+		}
+		if (!Array.isArray(options.formats) || options.formats.length === 0) {
+			throw new TypeError('options.formats must be a non-empty array.');
+		}
+
+		const hlsFormats = options.formats.filter(
+			(f): f is HlsOutputFormat => f instanceof HlsOutputFormat,
+		);
+		const dashFormats = options.formats.filter(
+			(f): f is DashOutputFormat => f instanceof DashOutputFormat,
+		);
+		if (hlsFormats.length !== 1) {
+			throw new TypeError(
+				'options.formats must contain exactly one HlsOutputFormat instance '
+				+ '(the underlying muxer uses the HLS master playlist as its root file).',
+			);
+		}
+		if (hlsFormats.length + dashFormats.length !== options.formats.length) {
+			throw new TypeError(
+				'options.formats may currently only contain HlsOutputFormat or DashOutputFormat instances.',
+			);
+		}
+
+		const hlsFormat = hlsFormats[0]!;
+		for (const dash of dashFormats) {
+			for (const field of MUTUALLY_AGREED_FIELDS) {
+				if (hlsFormat._options[field] !== dash._options[field]) {
+					throw new TypeError(
+						`options.formats: composed formats must agree on '${field}' — `
+						+ 'pass the same value (or instance) to every format.',
+					);
+				}
+			}
+		}
+
+		super();
+
+		this._options = options;
+		this._hlsFormat = hlsFormat;
+		this._dashFormats = dashFormats;
+	}
+
+	/** @internal */
+	_createMuxer(output: Output): Muxer {
+		return new SegmentPipelineMuxer(output, this._hlsFormat._options, muxer => [
+			new HlsManifestEmitter(muxer, this._hlsFormat._options),
+			...this._dashFormats.map(dash => new DashManifestEmitter(
+				muxer,
+				dash._options,
+			)),
+		]);
+	}
+
+	/** @internal */
+	get _name() {
+		return 'Adaptive Streaming (HLS + DASH)';
+	}
+
+	get fileExtension() {
+		return '.m3u8';
+	}
+
+	get mimeType() {
+		return this._hlsFormat.mimeType;
+	}
+
+	getSupportedCodecs(): MediaCodec[] {
+		return this._hlsFormat.getSupportedCodecs();
+	}
+
+	/** @internal */
+	override _trackTypeUnsupportedHint(trackType: TrackType) {
+		return this._hlsFormat._trackTypeUnsupportedHint(trackType);
+	}
+
+	getSupportedTrackCounts(): TrackCountLimits {
+		return this._hlsFormat.getSupportedTrackCounts();
+	}
+
+	get supportsVideoTransformationMetadata(): boolean {
+		return this._hlsFormat.supportsVideoTransformationMetadata;
+	}
+
+	get supportsTimestampedMediaData(): boolean {
+		return this._hlsFormat.supportsTimestampedMediaData;
+	}
+
+	get negativeTimestampSupport() {
+		return this._hlsFormat.negativeTimestampSupport;
+	}
+
+	/** @internal */
+	override _codecUnsupportedHint(codec: MediaCodec): string {
+		return this._hlsFormat._codecUnsupportedHint(codec);
 	}
 }

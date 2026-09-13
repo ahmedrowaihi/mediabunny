@@ -163,6 +163,28 @@ export const readId3V2Header = (slice: FileSlice): Id3V2Header | null => {
 	return { majorVersion, revision, flags, size };
 };
 
+const TRANSPORT_STREAM_TIMESTAMP_OWNER = new TextEncoder().encode('com.apple.streaming.transportStreamTimestamp\0');
+
+// RFC 8216 §3.4: HLS packed audio carries the 90 kHz MPEG-TS timestamp of its first sample in a PRIV frame
+export const readId3V2TransportStreamTimestamp = (slice: FileSlice, header: Id3V2Header): number | null => {
+	const tags: MetadataTags = {};
+	parseId3V2Tag(slice, header, tags);
+
+	const priv = tags.raw?.['PRIV'];
+	const owner = TRANSPORT_STREAM_TIMESTAMP_OWNER;
+	if (
+		!(priv instanceof Uint8Array)
+		|| priv.length < owner.length + 8
+		|| owner.some((byte, i) => priv[i] !== byte)
+	) {
+		return null;
+	}
+
+	const view = new DataView(priv.buffer, priv.byteOffset, priv.byteLength);
+	// Only the low 33 bits are the timestamp
+	return ((view.getUint8(owner.length + 3) & 1) * 2 ** 32 + view.getUint32(owner.length + 4)) / 90_000;
+};
+
 export const parseId3V2Tag = (slice: FileSlice, header: Id3V2Header, tags: MetadataTags) => {
 	// https://id3.org/id3v2.3.0
 

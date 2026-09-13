@@ -13,6 +13,7 @@ import {
 	ID3_V2_HEADER_SIZE,
 	parseId3V2Tag,
 	readId3V2Header,
+	readId3V2TransportStreamTimestamp,
 } from '../id3';
 import { Input } from '../input';
 import { InputAudioTrackBacking } from '../input-track';
@@ -58,11 +59,18 @@ export class AdtsDemuxer extends Demuxer {
 	lastSampleLoaded = false;
 	lastLoadedPos = 0;
 	nextTimestampInSamples = 0;
+	firstTimestamp = 0;
+	firstTimestampIsExplicit = false;
 
 	constructor(input: Input) {
 		super(input);
 
 		this.reader = input._reader;
+	}
+
+	override async hasExplicitStartTimestamp() {
+		await this.readMetadata();
+		return this.firstTimestampIsExplicit;
 	}
 
 	async readMetadata() {
@@ -95,6 +103,18 @@ export class AdtsDemuxer extends Demuxer {
 				const id3V2Header = readId3V2Header(slice);
 				if (!id3V2Header) {
 					break;
+				}
+
+				let tagSlice = this.reader.requestSlice(slice.filePos, id3V2Header.size);
+				if (isThenable(tagSlice)) {
+					tagSlice = await tagSlice;
+				}
+				if (tagSlice) {
+					const stated = readId3V2TransportStreamTimestamp(tagSlice, id3V2Header);
+					if (stated !== null) {
+						this.firstTimestamp = stated;
+						this.firstTimestampIsExplicit = true;
+					}
 				}
 
 				this.lastLoadedPos = slice.filePos + id3V2Header.size;
@@ -133,7 +153,7 @@ export class AdtsDemuxer extends Demuxer {
 		const sampleDuration = SAMPLES_PER_AAC_FRAME / sampleRate;
 
 		const sample: Sample = {
-			timestamp: this.nextTimestampInSamples / sampleRate,
+			timestamp: this.firstTimestamp + this.nextTimestampInSamples / sampleRate,
 			duration: sampleDuration,
 			dataStart: header.startPos,
 			dataSize: header.frameLength,
@@ -256,6 +276,10 @@ class AdtsAudioTrackBacking implements InputAudioTrackBacking {
 		assert(this.demuxer.firstFrameHeader);
 
 		return this.demuxer.firstFrameHeader.objectType;
+	}
+
+	getEncryptionInfo() {
+		return null;
 	}
 
 	getNumberOfChannels() {

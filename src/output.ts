@@ -25,6 +25,8 @@ import { Writer } from './writer';
 import { Logging } from './logging';
 import { EncodedPacket } from './packet';
 import { validateAudioChunkMetadata, validateVideoChunkMetadata } from './codec';
+import { type VideoDecoderConfigWithHdr } from './hdr-metadata';
+import { type ClosedCaptionsMetadata, validateClosedCaptionsMetadata } from './closed-captions';
 
 /**
  * List of all track types.
@@ -275,13 +277,36 @@ export type VideoTrackMetadata = BaseTrackMetadata & {
 	 * The decoder config for this video track, provided ahead of time. This is provided automatically when media data
 	 * added to the track, but by specifying it here, you give the muxer additional information that it can make use of.
 	 * Zero-packet tracks become possible to write when this field is set.
+	 *
+	 * It may also carry the track's HDR10 static metadata, which WebCodecs has no field of its own for.
 	 */
-	decoderConfig?: VideoDecoderConfig;
+	decoderConfig?: VideoDecoderConfigWithHdr;
 	/**
 	 * Can be provided in addition to {@link VideoTrackMetadata.decoderConfig} to provide additional track information
 	 * not included in the decoder config. This packet will not be added to the media data.
 	 */
 	primingPacket?: EncodedPacket;
+	/**
+	 * Where the AVC or HEVC parameter sets (SPS/PPS, plus VPS) are carried in this track's packets. Ignored by all
+	 * other codecs.
+	 *
+	 * - `'outOfBand'`: They are kept solely in the sample entry, signalled as `avc1`/`hvc1`.
+	 * - `'inBand'`: They are also repeated throughout the packets, signalled as `avc3`/`hev1`.
+	 *
+	 * Defaults to `'inBand'` for packets given in Annex B format, which keep theirs, and to `'outOfBand'` otherwise.
+	 * Set it when remuxing packets that repeat their parameter sets and come with a decoder config, as nothing in
+	 * such packets tells the two layouts apart.
+	 */
+	parameterSets?: 'inBand' | 'outOfBand';
+	/**
+	 * Declares that this track's packets carry closed captions in their video bitstream, and says whether the HLS
+	 * and DASH manifests announce them. Only AVC and HEVC tracks can carry them.
+	 *
+	 * The caption bytes themselves are supplied per packet, via the `closedCaptions` field of the metadata passed
+	 * to {@link EncodedVideoPacketSource.add}. Supplying them without this declaration is an error, as is closing
+	 * the track having declared them and never supplied any.
+	 */
+	closedCaptions?: ClosedCaptionsMetadata;
 };
 /**
  * Additional metadata for audio tracks.
@@ -662,6 +687,24 @@ export class Output<
 				throw new TypeError('metadata.primingPacket can only be provided alongside metadata.decoderConfig.');
 			}
 		}
+		if (
+			metadata.parameterSets !== undefined
+			&& !['inBand', 'outOfBand'].includes(metadata.parameterSets)
+		) {
+			throw new TypeError(
+				`Invalid parameter set placement: ${metadata.parameterSets}. Must be 'inBand' or 'outOfBand'.`,
+			);
+		}
+		if (metadata.closedCaptions !== undefined) {
+			validateClosedCaptionsMetadata(metadata.closedCaptions, 'metadata.closedCaptions');
+
+			if (source._codec !== 'avc' && source._codec !== 'hevc') {
+				throw new Error(
+					`metadata.closedCaptions was provided, but ${source._codec} has no bitstream that can carry`
+					+ ' them. Closed captions ride in AVC or HEVC SEI messages.',
+				);
+			}
+		}
 
 		const metadataCopy = { ...metadata };
 		metadataCopy.group ??= this.defaultTrackGroup;
@@ -747,7 +790,8 @@ export class Output<
 		if (presentTracksOfThisType === maxCount) {
 			throw new Error(
 				maxCount === 0
-					? `${this.format._name} does not support ${track.type} tracks.`
+					? (`${this.format._name} does not support ${track.type} tracks.`
+						+ this.format._trackTypeUnsupportedHint(track.type))
 					: (`${this.format._name} does not support more than ${maxCount} ${track.type} track`
 						+ `${maxCount === 1 ? '' : 's'}.`),
 			);

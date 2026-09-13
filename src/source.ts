@@ -103,6 +103,14 @@ export abstract class Source extends EventEmitter<SourceEvents> {
 	 */
 	_refFinalizationRegistry: FinalizationRegistry<Source> | null = null;
 
+	/**
+	 * Marked `true` by `DashInputFormat._canReadInput` when this source is
+	 * the root of a DASH manifest; sub-source disposal hygiene uses the same
+	 * mechanism as HLS.
+	 * @internal
+	 */
+	_usedForDash = false;
+
 	/** @internal */
 	private _sizePromise: Promise<number | null> | null = null;
 
@@ -325,6 +333,7 @@ export abstract class PathedSource extends Source {
 				: result;
 
 			ref.source._usedForHls ||= this._usedForHls;
+			ref.source._usedForDash ||= this._usedForDash;
 
 			return ref;
 		};
@@ -1054,7 +1063,7 @@ export class UrlSource extends PathedSource {
 					return;
 				}
 
-				let readResult: ReadableStreamReadResult<Uint8Array>;
+				let readResult: Awaited<ReturnType<typeof reader.read>>;
 
 				try {
 					readResult = await reader.read();
@@ -1964,6 +1973,16 @@ const PREFETCH_PROFILES = {
 
 				const extent = Math.min(b, a);
 				end = Math.max(end, worker.startPos + extent);
+			}
+
+			// A read ending just before a worker's region means the file is being walked backwards (such as when
+			// rewinding to a previous packet), so grow the start the same way instead of paying one request per
+			// padding step.
+			if (end <= worker.startPos && end > worker.startPos - paddingStart) {
+				const size = worker.targetPos - worker.startPos;
+				const extent = Math.min(2 ** Math.ceil(Math.log2(size + 1)), maxExtensionAmount);
+				const extendedStart = Math.floor((worker.startPos - extent) / paddingStart) * paddingStart;
+				start = Math.max(0, Math.min(start, extendedStart));
 			}
 		}
 

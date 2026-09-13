@@ -9,7 +9,7 @@ import { assert } from '../../src/misc.js';
 import { EncodedPacketSink } from '../../src/media-sink.js';
 import { EncodedPacket } from '../../src/packet.js';
 import { MpegTsDemuxer } from '../../src/mpeg-ts/mpeg-ts-demuxer.js';
-import { MpegTsStreamType } from '../../src/mpeg-ts/mpeg-ts-misc.js';
+import { MpegTsStreamType, TS_PACKET_SIZE } from '../../src/mpeg-ts/mpeg-ts-misc.js';
 
 const __dirname = new URL('.', import.meta.url).pathname;
 
@@ -897,4 +897,116 @@ test('MPEG-TS with AUD-less video packets', async () => {
 	expect(firstPacket.data.byteLength).toBe(331774);
 	expect(secondPacket.data.byteLength).toBe(1749);
 	expect(thirdPacket.data.byteLength).toBe(4273);
+});
+
+test('MPEG-TS duration computation reads only the end of the file', async () => {
+	const copyBytes = await fs.promises.readFile(path.join(__dirname, '../public/trim-buck-bunny-ffmpeg.ts'));
+
+	const nullPacket = new Uint8Array(TS_PACKET_SIZE).fill(0xff);
+	nullPacket.set([0x47, 0x1f, 0xff, 0x10]);
+
+	const reads: { start: number; end: number }[] = [];
+
+	// Trailing null packets push the last PES packet out of the first tail window
+	const openRepeated = (copies: number, nullPacketCount: number) => {
+		const contentSize = copyBytes.byteLength * copies;
+
+		return new Input({
+			source: new CustomSource({
+				getSize: () => contentSize + nullPacketCount * TS_PACKET_SIZE,
+				read: (start, end) => {
+					reads.push({ start, end });
+
+					const bytes = new Uint8Array(end - start);
+					for (let pos = start; pos < end;) {
+						const inContent = pos < contentSize;
+						const source = inContent ? copyBytes : nullPacket;
+						const offset = (inContent ? pos : pos - contentSize) % source.byteLength;
+						const length = Math.min(end - pos, source.byteLength - offset);
+						bytes.set(source.subarray(offset, offset + length), pos - start);
+						pos += length;
+					}
+
+					return bytes;
+				},
+				prefetchProfile: 'network',
+			}),
+			formats: ALL_FORMATS,
+		});
+	};
+
+	using single = openRepeated(1, 0);
+	const expectedDuration = await (await single.getPrimaryVideoTrack())!.computeDuration();
+
+	using input = openRepeated(20, 2000);
+	const videoTrack = await input.getPrimaryVideoTrack();
+	assert(videoTrack);
+	reads.length = 0;
+
+	expect(await videoTrack.computeDuration()).toBe(expectedDuration);
+	// Seeking through the file would touch earlier copies; a tail read doesn't
+	expect(reads.every(x => x.start >= copyBytes.byteLength * 19)).toBe(true);
+});
+
+test('MPEG-TS duration computation reads past the end of an early-ending track only once', async () => {
+	const copyBytes = await fs.promises.readFile(path.join(__dirname, '../public/trim-buck-bunny-ffmpeg.ts'));
+	const copies = 6;
+	const audioCopies = 2;
+
+	const reads: { start: number; end: number }[] = [];
+	const openBytes = (bytes: Uint8Array) => new Input({
+		source: new CustomSource({
+			getSize: () => bytes.byteLength,
+			read: (start, end) => {
+				reads.push({ start, end });
+				return bytes.slice(start, end);
+			},
+			// Not 'network': its read-ahead would make the byte count follow the prefetch heuristic, not the demuxer
+			prefetchProfile: 'fileSystem',
+		}),
+		formats: ALL_FORMATS,
+	});
+
+	using single = openBytes(copyBytes);
+	const singleAudioTrack = await single.getPrimaryAudioTrack();
+	const singleVideoTrack = await single.getPrimaryVideoTrack();
+	assert(singleAudioTrack && singleVideoTrack);
+	const expectedAudioEnd = await singleAudioTrack.computeDuration();
+	const expectedVideoEnd = await singleVideoTrack.computeDuration();
+
+	// Null the audio PID after the first copies, as when a track ends before the others
+	const bytes = new Uint8Array(copyBytes.byteLength * copies);
+	for (let i = 0; i < copies; i++) {
+		bytes.set(copyBytes, i * copyBytes.byteLength);
+	}
+	for (let pos = copyBytes.byteLength * audioCopies; pos < bytes.byteLength; pos += TS_PACKET_SIZE) {
+		if ((((bytes[pos + 1]! & 0x1f) << 8) | bytes[pos + 2]!) === singleAudioTrack.id) {
+			bytes[pos + 1] = (bytes[pos + 1]! & 0xe0) | 0x1f;
+			bytes[pos + 2] = 0xff;
+		}
+	}
+
+	using input = openBytes(bytes);
+	const audioTrack = await input.getPrimaryAudioTrack();
+	const videoTrack = await input.getPrimaryVideoTrack();
+	assert(audioTrack && videoTrack);
+	reads.length = 0;
+
+	expect(await audioTrack.computeDuration()).toBe(expectedAudioEnd);
+	// One pass over the gap proves it holds no audio; every re-read adds another
+	const gapSize = copyBytes.byteLength * (copies - audioCopies);
+	expect(reads.reduce((sum, x) => sum + x.end - x.start, 0)).toBeLessThan(1.5 * gapSize);
+
+	expect(await videoTrack.computeDuration()).toBe(expectedVideoEnd);
+});
+
+test('MPEG-TS H.264 video range is left unset when the stream does not signal it', async () => {
+	using input = new Input({
+		source: new FilePathSource(path.join(__dirname, '../public/avc-range-unsignalled.ts')),
+		formats: ALL_FORMATS,
+	});
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+
+	expect((await track.getColorSpace()).fullRange).toBeUndefined();
 });

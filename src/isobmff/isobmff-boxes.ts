@@ -6,6 +6,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
+import { IsobmffOutputFormat, type OutputFormat } from '../output-format';
 import {
 	toUint8Array,
 	assert,
@@ -31,7 +32,7 @@ import {
 	SubtitleCodec,
 	VideoCodec,
 } from '../codec';
-import { formatSubtitleTimestamp } from '../subtitles';
+import { formatSubtitleTimestamp, TTML_NAMESPACE } from '../subtitles';
 import { Writer } from '../writer';
 import {
 	getTrackMetadata,
@@ -53,6 +54,7 @@ import {
 } from '../codec-data';
 import { MetadataTags, RichImageData } from '../metadata';
 import { Bitstream } from '../../shared/bitstream';
+import { buildContentLightPayload, buildMasteringDisplayPayload } from '../hdr-metadata';
 
 export class IsobmffBoxWriter {
 	private helper = new Uint8Array(8);
@@ -354,6 +356,41 @@ export const styp = () => box('styp', [
 	ascii('cmfc'),
 	ascii('dash'),
 ]);
+
+export type SidxSubsegment = {
+	size: number;
+	duration: number;
+};
+
+/** Size in bytes of a {@link multiReferenceSidx} holding `subsegmentCount` references. */
+export const measureMultiReferenceSidx = (subsegmentCount: number) => 40 + 12 * subsegmentCount;
+
+/**
+ * Segment Index Box indexing every subsegment of the file, as opposed to {@link sidx}, which
+ * describes a single one. `firstOffset` is unsigned, so a box of this shape can only ever sit
+ * ahead of the subsegments it references.
+ */
+export const multiReferenceSidx = (options: {
+	referenceId: number;
+	timescale: number;
+	earliestPresentationTime: number;
+	firstOffset: number;
+	subsegments: SidxSubsegment[];
+}) => {
+	return fullBox('sidx', 1, 0, [
+		u32(options.referenceId),
+		u32(options.timescale),
+		u64(options.earliestPresentationTime),
+		u64(options.firstOffset),
+		u16(0), // Reserved
+		u16(options.subsegments.length),
+		options.subsegments.map(subsegment => [
+			u32(subsegment.size & 0x7fffffff), // Reference type (0, media) + referenced size
+			u32(subsegment.duration),
+			u32(0x90000000), // Starts with SAP, SAP type 1 — every fragment opens on a key frame
+		]),
+	]);
+};
 
 /** Segment Index Box */
 export const sidx = (muxer: IsobmffMuxer, referencedSize: number) => {
@@ -736,7 +773,11 @@ export const stsd = (trackData: IsobmffTrackData) => {
 
 	if (trackData.type === 'video') {
 		sampleDescription = videoSampleDescription(
-			videoCodecToBoxName(trackData.track.source._codec, trackData.info.decoderConfig.codec),
+			videoCodecToBoxName(
+				trackData.track.source._codec,
+				trackData.info.decoderConfig.codec,
+				trackData.info.inBandParameterSets,
+			),
 			trackData,
 		);
 	} else if (trackData.type === 'audio') {
@@ -797,7 +838,29 @@ export const videoSampleDescription = (
 	colorSpaceIsEmpty(trackData.info.decoderConfig.colorSpace)
 		? null
 		: colr(trackData),
+	mdcv(trackData),
+	clli(trackData),
 ]);
+
+/** Mastering Display Colour Volume Box: HDR10 mastering-display static metadata (SMPTE ST 2086). */
+export const mdcv = (trackData: IsobmffVideoTrackData) => {
+	const masteringDisplay = trackData.info.decoderConfig.hdrStaticMetadata?.masteringDisplay;
+	if (!masteringDisplay) {
+		return null;
+	}
+
+	return box('mdcv', [...buildMasteringDisplayPayload(masteringDisplay)]);
+};
+
+/** Content Light Level Box: HDR10 content-light static metadata (MaxCLL / MaxFALL, CTA-861.3). */
+export const clli = (trackData: IsobmffVideoTrackData) => {
+	const contentLight = trackData.info.decoderConfig.hdrStaticMetadata?.contentLight;
+	if (!contentLight) {
+		return null;
+	}
+
+	return box('clli', [...buildContentLightPayload(contentLight)]);
+};
 
 /** Pixel Aspect Ratio Box: Specifies pixel width:height spacing for non-square pixels. */
 export const pasp = (trackData: IsobmffVideoTrackData) => {
@@ -1217,9 +1280,14 @@ export const subtitleSampleDescription = (
 ) => box(compressionType, [
 	Array(6).fill(0), // Reserved
 	u16(1), // Data reference index
+	SUBTITLE_CODEC_TO_SAMPLE_ENTRY_FIELDS[trackData.track.source._codec](),
 ], [
 	SUBTITLE_CODEC_TO_CONFIGURATION_BOX[trackData.track.source._codec](trackData),
 ]);
+
+// XMLSubtitleSampleEntry (ISO/IEC 14496-12) states its three strings in the entry itself rather than in
+// a configuration box: namespace, schema location, auxiliary MIME types. The latter two are empty here.
+const stppSampleEntryFields = () => [...textEncoder.encode(TTML_NAMESPACE), 0, 0, 0];
 
 export const vttC = (trackData: IsobmffSubtitleTrackData) => box('vttC', [
 	...textEncoder.encode(trackData.info.config.description),
@@ -1881,15 +1949,54 @@ const dataStringBoxLong = (value: string) => {
 	]);
 };
 
-const videoCodecToBoxName = (codec: VideoCodec, fullCodecString: string) => {
+const videoCodecToBoxName = (codec: VideoCodec, fullCodecString: string, inBandParameterSets: boolean) => {
 	switch (codec) {
-		case 'avc': return fullCodecString.startsWith('avc3') ? 'avc3' : 'avc1';
-		case 'hevc': return 'hvc1';
+		// The name asserts where the parameter sets are (ISO/IEC 14496-15 §5.2). CMAF §9.3.2 permits
+		// both storages at once, which nothing in the bitstream distinguishes — only the caller's own
+		// string can. That is trustworthy for AVC, where nothing generates `avc3.`, but not for HEVC,
+		// where `hev1.` is generated for every stream (codec.ts).
+		case 'avc': return inBandParameterSets || fullCodecString.startsWith('avc3') ? 'avc3' : 'avc1';
+		case 'hevc': return inBandParameterSets ? 'hev1' : 'hvc1';
 		case 'vp8': return 'vp08';
 		case 'vp9': return 'vp09';
 		case 'av1': return 'av01';
 		case 'prores': return fullCodecString;
 	}
+};
+
+/**
+ * The codec string as the container describes it, rather than as the encoder reported it.
+ *
+ * The encoder's codec string says nothing about where the parameter sets ended up — mediabunny
+ * generates `hev1.` for every HEVC stream — so a manifest repeating it can advertise a codec the
+ * file is not. Players use `CODECS` for capability checks, and one supporting `hvc1` but not `hev1`
+ * refuses a stream it could have played. Derived from {@link videoCodecToBoxName} so the
+ * declaration cannot drift from the box.
+ *
+ * Distinct from `adjustHlsVideoCodec`, which is an unconditional Apple-compatibility policy applied
+ * to caller-supplied strings. This reports a fact about what was written.
+ *
+ * Only an ISOBMFF sample entry pins where parameter sets live; MPEG-TS carries them in the stream,
+ * so an in-band fourcc is the honest one there and the string passes through.
+ *
+ * @internal
+ */
+export const declaredVideoCodec = (
+	codec: VideoCodec,
+	codecString: string,
+	segmentFormat: OutputFormat,
+	inBandParameterSets: boolean,
+): string => {
+	if (!(segmentFormat instanceof IsobmffOutputFormat)) {
+		return codecString;
+	}
+
+	const fourcc = videoCodecToBoxName(codec, codecString, inBandParameterSets);
+	if (fourcc.length !== 4 || codecString.length < 4 || codecString.slice(0, 4) === fourcc) {
+		return codecString;
+	}
+
+	return fourcc + codecString.slice(4);
 };
 
 const VIDEO_CODEC_TO_CONFIGURATION_BOX: Record<
@@ -1994,6 +2101,7 @@ const audioCodecToConfigurationBox = (codec: AudioCodec, isQuickTime: boolean) =
 
 const SUBTITLE_CODEC_TO_BOX_NAME: Record<SubtitleCodec, string> = {
 	webvtt: 'wvtt',
+	ttml: 'stpp',
 };
 
 const SUBTITLE_CODEC_TO_CONFIGURATION_BOX: Record<
@@ -2001,6 +2109,12 @@ const SUBTITLE_CODEC_TO_CONFIGURATION_BOX: Record<
 	(trackData: IsobmffSubtitleTrackData) => Box | null
 > = {
 	webvtt: vttC,
+	ttml: () => null,
+};
+
+const SUBTITLE_CODEC_TO_SAMPLE_ENTRY_FIELDS: Record<SubtitleCodec, () => number[]> = {
+	webvtt: () => [],
+	ttml: stppSampleEntryFields,
 };
 
 const getLanguageCodeInt = (code: string) => {

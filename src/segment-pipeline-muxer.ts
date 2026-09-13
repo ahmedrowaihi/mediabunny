@@ -6,43 +6,51 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-import { MediaCodec, validateAudioChunkMetadata, validateVideoChunkMetadata } from '../codec';
-import { Logging } from '../logging';
-import { EncodedAudioPacketSource, EncodedVideoPacketSource } from '../media-source';
+import { MediaCodec, validateAudioChunkMetadata, validateVideoChunkMetadata } from './codec';
+import { Logging } from './logging';
+import type { ByteRange } from './isobmff/isobmff-misc';
+import { EncodedAudioPacketSource, EncodedVideoPacketSource, SubtitleCueSource } from './media-source';
 import {
 	arrayArgmax,
 	assert,
 	AsyncMutex,
 	findLastIndex,
 	joinPaths,
-	textEncoder,
 	toArray,
 	UNDETERMINED_LANGUAGE,
-} from '../misc';
-import { Muxer } from '../muxer';
+} from './misc';
+import { Muxer } from './muxer';
 import {
+	AudioTrackMetadata,
 	Output,
 	OutputAudioTrack,
 	OutputSubtitleTrack,
 	OutputTrack,
 	OutputVideoTrack,
 	TrackType,
-} from '../output';
+	VideoTrackMetadata,
+} from './output';
 import {
-	HlsOutputFormat,
 	HlsOutputFormatOptions,
 	HlsOutputPlaylistInfo,
 	HlsOutputSegmentInfo,
 	OutputFormat,
-} from '../output-format';
-import { Writer } from '../writer';
-import { EncodedPacket } from '../packet';
-import { SubtitleCue, SubtitleMetadata } from '../subtitles';
-import { NullTarget, PathedTarget, Target, TargetRequest } from '../target';
-import { HLS_MIME_TYPE } from './hls-misc';
-import type { IsobmffMuxer } from '../isobmff/isobmff-muxer';
+	SegmentedOutputFormatOptions,
+	SegmentPart,
+	WEBVTT_SEGMENT_FORMAT,
+	WebvttSegmentFormat,
+} from './output-format';
+import { ManifestEmitter } from './manifest-emitter';
+import type { HlsManifestEmitterHost } from './hls/hls-manifest-emitter';
+import { EncodedPacket } from './packet';
+import { cueOverlapsSegment, SubtitleConfig, SubtitleCue, SubtitleMetadata } from './subtitles';
+import { NullTarget, PathedTarget, Target, TargetRequest } from './target';
+import { HLS_MIME_TYPE } from './hls/hls-misc';
+import { WebvttMuxer } from './hls/hls-webvtt';
+import { IsobmffMuxer } from './isobmff/isobmff-muxer';
 
-type HlsTrackData = {
+/** @internal */
+export type PipelineTrackData = {
 	track: OutputTrack;
 	packets: EncodedPacket[];
 	playlist: Playlist;
@@ -51,26 +59,35 @@ type HlsTrackData = {
 	info: {
 		type: 'video';
 		decoderConfig: VideoDecoderConfig;
+		inBandParameterSets: boolean;
 		primingPacket: EncodedPacket | null;
 	} | {
 		type: 'audio';
 		decoderConfig: AudioDecoderConfig;
 		primingPacket: EncodedPacket | null;
+	} | {
+		type: 'subtitle';
+		cues: SubtitleCue[];
+		config: SubtitleConfig | null;
 	};
 };
-type HlsVideoTrackData = HlsTrackData & { info: { type: 'video' } };
-type HlsAudioTrackData = HlsTrackData & { info: { type: 'audio' } };
+type PipelineVideoTrackData = PipelineTrackData & { info: { type: 'video' } };
+type PipelineAudioTrackData = PipelineTrackData & { info: { type: 'audio' } };
+type PipelineSubtitleTrackData = PipelineTrackData & { info: { type: 'subtitle' } };
 
-type PlaylistSegment = {
+/** @internal */
+export type PipelineSegment = {
 	path: string;
 	duration: number;
 	timestamp: number;
 	byteSize: number;
 	byteOffset: number | null;
 	info: HlsOutputSegmentInfo | null;
+	parts: SegmentPart[] | null;
 };
 
-type Playlist = {
+/** @internal */
+export type Playlist = {
 	id: number;
 	path: string;
 	tracks: OutputTrack[];
@@ -79,12 +96,19 @@ type Playlist = {
 	currentSegmentStartTimestamp: number | null;
 	currentSegmentStartTimestampIsFixed: boolean;
 	nextSegmentId: number;
-	initSegment: PlaylistSegment | null;
-	writtenSegments: PlaylistSegment[];
+	initSegment: PipelineSegment | null;
+	indexRange: ByteRange | null;
+	writtenSegments: PipelineSegment[];
+	/** Summed duration of `writtenSegments`, maintained on append and eviction. */
+	windowDuration: number;
 	peakBitrate: number | null;
 	averageBitrate: number | null;
 	mediaSequence: number;
 	done: boolean;
+
+	// Subtitle playlists only: their segments are cut on exactly these media boundaries, so a player
+	// can switch renditions at any segment.
+	subtitleBoundaries: { timestamp: number; duration: number }[] | null;
 
 	singleFile: {
 		target: Target;
@@ -96,6 +120,14 @@ type Playlist = {
 		 * segments file which is also a perfectly valid standalone fMP4 valid.
 		 */
 		fragmentedIsobmffOutput: FragmentedIsobmffOutput | null;
+	} | null;
+
+	bitrateCache: {
+		processedCount: number;
+		cachedGtd: number;
+		totalBytes: number;
+		totalDuration: number;
+		peakBitrate: number;
 	} | null;
 
 	// For HLS, having a single mutex is too coarse. Every playlist is basically independent and therefore we can have
@@ -111,23 +143,99 @@ type PlaylistDeclaration = {
 	references: PlaylistDeclaration[];
 };
 
+const SUBTITLE_GROUP_ID = 'subtitles';
+
 type FragmentedIsobmffOutput = {
 	output: Output;
 	videoSource: EncodedVideoPacketSource | null;
 	audioSource: EncodedAudioPacketSource | null;
+	subtitleSource: SubtitleCueSource | null;
 	firstMoofPosition: number | null;
 	currentFileSize: number;
 };
 
-export class HlsMuxer extends Muxer {
-	format: HlsOutputFormat;
+const segmentVideoMetadata = (videoTrack: PipelineVideoTrackData): VideoTrackMetadata => ({
+	...videoTrack.track.metadata,
+	// A segment output re-muxes packets whose SEI is already spliced in, so it must not inherit the
+	// track-wide caption declaration: a segment may legitimately hold none.
+	closedCaptions: undefined,
+	decoderConfig: videoTrack.info.decoderConfig,
+	primingPacket: videoTrack.info.primingPacket ?? undefined,
+});
+
+const segmentAudioMetadata = (audioTrack: PipelineAudioTrackData): AudioTrackMetadata => ({
+	...audioTrack.track.metadata,
+	decoderConfig: audioTrack.info.decoderConfig,
+	primingPacket: audioTrack.info.primingPacket ?? undefined,
+});
+
+// One output for a playlist's whole single file, rather than one per segment. The caller adds the
+// tracks and starts it.
+const openFragmentedIsobmffOutput = (segmentFormat: OutputFormat, target: Target): FragmentedIsobmffOutput => {
+	const fragmentedIsobmffOutput: FragmentedIsobmffOutput = {
+		output: new Output({ format: segmentFormat, target }),
+		videoSource: null,
+		audioSource: null,
+		subtitleSource: null,
+		firstMoofPosition: null,
+		currentFileSize: 0,
+	};
+
+	target.on('write', ({ end }) => {
+		fragmentedIsobmffOutput.currentFileSize = Math.max(fragmentedIsobmffOutput.currentFileSize, end);
+	});
+
+	// Make sure it never auto-finalizes fragments for us; we take full control of fragment
+	// finalization to line it up perfectly with segments
+	const muxer = fragmentedIsobmffOutput.output._muxer as IsobmffMuxer;
+	muxer.minimumFragmentDuration = Infinity;
+
+	// Intercept the first moof to determine init segment size
+	const originalOnMoof = muxer.formatOptions.onMoof;
+	muxer.formatOptions.onMoof = (data, position, timestamp) => {
+		fragmentedIsobmffOutput.firstMoofPosition = position;
+		originalOnMoof?.(data, position, timestamp);
+		muxer.formatOptions.onMoof = originalOnMoof;
+	};
+
+	return fragmentedIsobmffOutput;
+};
+
+// Cuts one fragment and returns its size. Everything before the first `moof` is the init segment, so
+// its extent is only known once that fragment exists.
+const finalizeFragmentedIsobmffSegment = async (playlist: Playlist): Promise<number> => {
+	const singleFile = playlist.singleFile;
+	assert(singleFile?.fragmentedIsobmffOutput);
+
+	const muxer = singleFile.fragmentedIsobmffOutput.output._muxer as IsobmffMuxer;
+	await muxer.forceFragmentFinalization();
+
+	if (singleFile.fragmentedIsobmffOutput.firstMoofPosition !== null && !playlist.initSegment) {
+		playlist.initSegment = {
+			path: singleFile.path,
+			duration: 0,
+			timestamp: 0,
+			byteSize: singleFile.fragmentedIsobmffOutput.firstMoofPosition,
+			byteOffset: 0,
+			info: null,
+			parts: null,
+		};
+		singleFile.nextOffset = singleFile.fragmentedIsobmffOutput.firstMoofPosition;
+	}
+
+	return singleFile.fragmentedIsobmffOutput.currentFileSize - singleFile.nextOffset;
+};
+
+export class SegmentPipelineMuxer extends Muxer implements HlsManifestEmitterHost {
+	options: SegmentedOutputFormatOptions;
 	getPlaylistPath: NonNullable<HlsOutputFormatOptions['getPlaylistPath']>;
 	getSegmentPath: NonNullable<HlsOutputFormatOptions['getSegmentPath']>;
 	getInitPath: NonNullable<HlsOutputFormatOptions['getInitPath']>;
 
 	targetSegmentDuration: number;
-	trackDatas: HlsTrackData[] = [];
+	trackDatas: PipelineTrackData[] = [];
 	singleFilePerPlaylist: boolean;
+	separateRenditions: boolean;
 	isLive: boolean;
 	maxLiveSegmentCount: number;
 	isRelativeToUnixEpoch = false;
@@ -136,29 +244,78 @@ export class HlsMuxer extends Muxer {
 
 	playlists: Playlist[] = [];
 	playlistDeclarations: PlaylistDeclaration[] = [];
+	subtitlePlaylists: Playlist[] = [];
+	subtitleBoundarySource: Playlist | null = null;
 
-	constructor(output: Output, format: HlsOutputFormat) {
+	/**
+	 * Manifest emitters fed by the segment-cutting pipeline. The default
+	 * configuration always includes one {@link HlsManifestEmitter} so HLS
+	 * output stays byte-identical to the pre-extraction implementation.
+	 *
+	 * `AdaptiveOutputFormat` constructs the muxer with a different list
+	 * (HLS + DASH, optionally + I-frame trick-play, etc.) — same segment
+	 * pipeline, multiple manifest formats fed off the same lifecycle.
+	 */
+	private manifestEmitters: ManifestEmitter[];
+
+	constructor(
+		output: Output,
+		options: SegmentedOutputFormatOptions,
+		emitterFactory: (muxer: SegmentPipelineMuxer) => ManifestEmitter[],
+	) {
 		if (!(output._target instanceof PathedTarget)) {
 			throw new TypeError('HLS outputs require `OutputOptions.target` to be a PathedTarget.');
 		}
 
 		super(output);
 
-		this.format = format;
-		this.targetSegmentDuration = format._options.targetDuration ?? 2;
-		this.singleFilePerPlaylist = format._options.singleFilePerPlaylist ?? false;
-		this.isLive = format._options.live ?? false;
-		this.maxLiveSegmentCount = format._options.maxLiveSegmentCount ?? Infinity;
+		this.options = options;
+		this.targetSegmentDuration = options.targetDuration ?? 2;
+		this.singleFilePerPlaylist = options.singleFilePerPlaylist ?? false;
+		this.separateRenditions = options.separateRenditions ?? false;
+		this.isLive = options.live ?? false;
+		this.maxLiveSegmentCount = options.maxLiveSegmentCount ?? Infinity;
 		this.globalTargetDuration = this.targetSegmentDuration;
 
-		this.getPlaylistPath = format._options.getPlaylistPath
+		this.getPlaylistPath = options.getPlaylistPath
 			?? (({ n }) => `playlist-${n}.m3u8`);
-		this.getSegmentPath = format._options.getSegmentPath
+		this.getSegmentPath = options.getSegmentPath
 			?? (info => info.isSingleFile
 				? `segments-${info.playlist.n}${info.format.fileExtension}`
 				: `segment-${info.playlist.n}-${info.n}${info.format.fileExtension}`);
-		this.getInitPath = format._options.getInitPath
+		this.getInitPath = options.getInitPath
 			?? (playlist => `init-${playlist.n}${playlist.segmentFormat.fileExtension}`);
+
+		this.manifestEmitters = emitterFactory(this);
+	}
+
+	/**
+	 * Fan an event out to every registered manifest emitter, awaiting each
+	 * in turn so that emitters that read shared state see prior emitters'
+	 * mutations (e.g. `peakBitrate` populated by HLS before DASH reads it).
+	 */
+	private async broadcast<E extends keyof ManifestEmitter>(
+		event: E,
+		...args: Parameters<NonNullable<ManifestEmitter[E]>>
+	): Promise<void> {
+		for (const emitter of this.manifestEmitters) {
+			const handler = emitter[event] as undefined | ((...a: unknown[]) => unknown);
+			if (handler) {
+				await handler.apply(emitter, args);
+			}
+		}
+	}
+
+	/** @internal Routed through the muxer so it stays the single owner of the
+	 * master-playlist write counter. */
+	noteMasterPlaylistWritten() {
+		this.numWrittenMasterPlaylists++;
+	}
+
+	/** @internal Exposes the muxer's master-playlist mutex to the manifest
+	 * emitter without leaking the underlying {@link AsyncMutex}. */
+	acquireMutex() {
+		return this.mutex.acquire();
 	}
 
 	async start(): Promise<void> {
@@ -201,10 +358,15 @@ export class HlsMuxer extends Muxer {
 				hasVideo = true;
 			}
 
+			// Subtitles are never muxed into a media segment, so they take no part in pairing.
+			if (track.isSubtitleTrack()) {
+				continue;
+			}
+
 			const pairableGroups = new Map<MediaCodec, OutputTrack[]>();
 
 			for (const otherTrack of this.output.tracks) {
-				if (track === otherTrack) {
+				if (track === otherTrack || otherTrack.isSubtitleTrack()) {
 					continue;
 				}
 
@@ -293,7 +455,7 @@ export class HlsMuxer extends Muxer {
 					const group = groups.find(x => x.key === key);
 					assert(group);
 
-					if (assignedGroupKeys.length === 1 && group.tracks.length === 1) {
+					if (!this.separateRenditions && assignedGroupKeys.length === 1 && group.tracks.length === 1) {
 						const otherGroupKeys = groupAssignment.get(group.tracks[0]!);
 						assert(otherGroupKeys !== undefined);
 
@@ -402,6 +564,7 @@ export class HlsMuxer extends Muxer {
 			const codecs: MediaCodec[] = [];
 			let videoCount = 0;
 			let audioCount = 0;
+			let subtitleCount = 0;
 			let requiresRotationMetadata = false;
 
 			let candidate: OutputFormat | null = null;
@@ -413,12 +576,16 @@ export class HlsMuxer extends Muxer {
 					requiresRotationMetadata ||= (track.metadata.rotation ?? 0) !== 0;
 				} else if (track.isAudioTrack()) {
 					audioCount++;
+				} else {
+					subtitleCount++;
 				}
 
 				codecs.push(track.source._codec);
 			}
 
-			for (const format of toArray(this.format._options.segmentFormat)) {
+			// WebVTT comes first so it wins the tie for a subtitle playlist against a configured format
+			// that also takes subtitle tracks; its zero media capacity keeps it out of every other playlist.
+			for (const format of [WEBVTT_SEGMENT_FORMAT, ...toArray(this.options.segmentFormat)]) {
 				const supportedCodecs = format.getSupportedCodecs();
 				const trackCounts = format.getSupportedTrackCounts();
 
@@ -431,6 +598,10 @@ export class HlsMuxer extends Muxer {
 				}
 
 				if (audioCount < trackCounts.audio.min || audioCount > trackCounts.audio.max) {
+					continue;
+				}
+
+				if (subtitleCount < trackCounts.subtitle.min || subtitleCount > trackCounts.subtitle.max) {
 					continue;
 				}
 
@@ -453,6 +624,7 @@ export class HlsMuxer extends Muxer {
 		};
 
 		const registerPlaylist = async (tracks: OutputTrack[]) => {
+			const isSubtitle = tracks[0]!.isSubtitleTrack();
 			if (tracks.some(track => this.playlists.some(playlist => playlist.tracks.includes(track)))) {
 				throw new Error('Internal error: track is already registered in a playlist.'); // Should be unreachable
 			}
@@ -476,15 +648,23 @@ export class HlsMuxer extends Muxer {
 				currentSegmentStartTimestampIsFixed: false,
 				nextSegmentId: 1,
 				initSegment: null,
+				indexRange: null,
 				writtenSegments: [],
+				windowDuration: 0,
 				peakBitrate: null,
 				averageBitrate: null,
 				mediaSequence: 0,
 				done: false,
+				subtitleBoundaries: isSubtitle ? [] : null,
 				singleFile: null,
 				mutex: new AsyncMutex(),
+				bitrateCache: null,
 			};
 			this.playlists.push(playlist);
+
+			if (isSubtitle) {
+				this.subtitlePlaylists.push(playlist);
+			}
 
 			return playlist;
 		};
@@ -511,6 +691,22 @@ export class HlsMuxer extends Muxer {
 			}
 		}
 
+		const subtitleTracks = this.output.tracks.filter(track => track.isSubtitleTrack());
+		const subtitleDeclarations: PlaylistDeclaration[] = [];
+
+		for (const track of subtitleTracks) {
+			const playlist = await registerPlaylist([track]);
+			const declaration: PlaylistDeclaration = {
+				playlist,
+				groupId: SUBTITLE_GROUP_ID,
+				noUri: false,
+				references: [],
+			};
+
+			subtitleDeclarations.push(declaration);
+			this.playlistDeclarations.push(declaration);
+		}
+
 		for (const variant of variantStreams) {
 			// Since tracks can only be assigned to one playlist, the first track's ID acts as a "playlist key"
 			let playlist = this.playlists.find(x => x.tracks[0]!.id === variant.tracks[0]!.id);
@@ -520,10 +716,28 @@ export class HlsMuxer extends Muxer {
 				playlist,
 				groupId: null,
 				noUri: false,
-				references: variant.linkedGroup
-					? this.playlistDeclarations.filter(x => x.groupId === variant.linkedGroup!.name)
-					: [],
+				references: [
+					...(variant.linkedGroup
+						? this.playlistDeclarations.filter(x => x.groupId === variant.linkedGroup!.name)
+						: []),
+					...subtitleDeclarations,
+				],
 			});
+		}
+
+		if (subtitleTracks.length > 0) {
+			const mediaPlaylists = this.playlists.filter(x => x.subtitleBoundaries === null);
+			const source = mediaPlaylists.find(x => x.tracks.some(track => track.isVideoTrack()))
+				?? mediaPlaylists[0];
+
+			if (!source) {
+				throw new Error(
+					'Subtitle tracks require at least one video or audio track, as subtitle segments are cut on the'
+					+ ' media segment boundaries. Add a video or audio track.',
+				);
+			}
+
+			this.subtitleBoundarySource = source;
 		}
 
 		for (const track of this.output.tracks) {
@@ -539,8 +753,14 @@ export class HlsMuxer extends Muxer {
 					track.metadata.primingPacket ?? null,
 					{ decoderConfig: track.metadata.decoderConfig },
 				);
+			} else if (track.isSubtitleTrack()) {
+				// Registered up front so a track that never produces a cue still yields an (empty) rendition
+				// instead of silently vanishing from the manifests.
+				this.getSubtitleTrackData(track);
 			}
 		}
+
+		await this.broadcast('onStart');
 
 		release();
 	}
@@ -559,7 +779,6 @@ export class HlsMuxer extends Muxer {
 		return true;
 	}
 
-	// eslint-disable-next-line @typescript-eslint/no-misused-promises
 	override async onTrackClose(track: OutputTrack) {
 		const trackData = this.trackDatas.find(x => x.track === track);
 		if (trackData) {
@@ -572,14 +791,18 @@ export class HlsMuxer extends Muxer {
 		const release = await playlist.mutex.acquire();
 
 		try {
-			await this.advancePlaylist(playlist);
+			if (playlist.subtitleBoundaries) {
+				await this.advanceSubtitlePlaylist(playlist);
+			} else {
+				await this.advancePlaylist(playlist);
+			}
 		} finally {
 			release();
 		}
 	}
 
 	getVideoTrackData(track: OutputVideoTrack, packet: EncodedPacket | null, meta?: EncodedVideoChunkMetadata) {
-		let trackData = this.trackDatas.find(x => x.track === track) as HlsVideoTrackData;
+		let trackData = this.trackDatas.find(x => x.track === track) as PipelineVideoTrackData;
 		if (trackData) {
 			return trackData;
 		}
@@ -600,6 +823,8 @@ export class HlsMuxer extends Muxer {
 			info: {
 				type: 'video',
 				decoderConfig: meta.decoderConfig,
+				inBandParameterSets: !meta.decoderConfig.description
+					|| track.metadata.parameterSets === 'inBand',
 				primingPacket: packet,
 			},
 		};
@@ -609,7 +834,7 @@ export class HlsMuxer extends Muxer {
 	}
 
 	getAudioTrackData(track: OutputAudioTrack, packet: EncodedPacket | null, meta?: EncodedAudioChunkMetadata) {
-		let trackData = this.trackDatas.find(x => x.track === track) as HlsAudioTrackData;
+		let trackData = this.trackDatas.find(x => x.track === track) as PipelineAudioTrackData;
 		if (trackData) {
 			return trackData;
 		}
@@ -696,15 +921,50 @@ export class HlsMuxer extends Muxer {
 		}
 	}
 
+	getSubtitleTrackData(track: OutputSubtitleTrack, meta?: SubtitleMetadata) {
+		let trackData = this.trackDatas.find(x => x.track === track) as PipelineSubtitleTrackData;
+		if (trackData) {
+			trackData.info.config ??= meta?.config ?? null;
+			return trackData;
+		}
+
+		const playlists = this.playlists.filter(x => x.tracks.includes(track));
+		assert(playlists.length === 1);
+
+		trackData = {
+			track,
+			packets: [],
+			playlist: playlists[0]!,
+			closed: false,
+			info: {
+				type: 'subtitle',
+				cues: [],
+				config: meta?.config ?? null,
+			},
+		};
+		this.trackDatas.push(trackData);
+
+		return trackData;
+	}
+
 	async addSubtitleCue(
-		// eslint-disable-next-line @typescript-eslint/no-unused-vars
 		track: OutputSubtitleTrack,
-		// eslint-disable-next-line @typescript-eslint/no-unused-vars
 		cue: SubtitleCue,
-		// eslint-disable-next-line @typescript-eslint/no-unused-vars
 		meta?: SubtitleMetadata,
 	) {
-		throw new Error('Unreachable.');
+		const trackData = this.getSubtitleTrackData(track, meta);
+		const playlist = trackData.playlist;
+
+		const release = await playlist.mutex.acquire();
+
+		try {
+			this.validateTimestamp(track, cue.timestamp, true);
+			trackData.info.cues.push(cue);
+
+			await this.advanceSubtitlePlaylist(playlist);
+		} finally {
+			release();
+		}
 	}
 
 	async advancePlaylist(playlist: Playlist) {
@@ -726,8 +986,8 @@ export class HlsMuxer extends Muxer {
 			return;
 		}
 
-		const videoTrack = trackDatas.find(x => x.info.type === 'video') as HlsVideoTrackData | undefined;
-		const audioTrack = trackDatas.find(x => x.info.type === 'audio') as HlsAudioTrackData | undefined;
+		const videoTrack = trackDatas.find(x => x.info.type === 'video') as PipelineVideoTrackData | undefined;
+		const audioTrack = trackDatas.find(x => x.info.type === 'audio') as PipelineAudioTrackData | undefined;
 
 		// Loop in case we can finalize multiple segments
 		while (true) {
@@ -880,6 +1140,7 @@ export class HlsMuxer extends Muxer {
 						format: playlist.segmentFormat,
 						isSingleFile: true,
 						playlist: toPlaylistInfo(playlist),
+						parts: null,
 					};
 
 					relativeSegmentPath = await this.getSegmentPath(segmentInfo);
@@ -903,36 +1164,7 @@ export class HlsMuxer extends Muxer {
 						// one single fMP4 file that holds all segment media data. The result is a segments file that is
 						// playable standalone!
 
-						fragmentedIsobmffOutput = {
-							output: new Output({
-								format: playlist.segmentFormat,
-								target,
-							}),
-							videoSource: null,
-							audioSource: null,
-							firstMoofPosition: null,
-							currentFileSize: 0,
-						};
-
-						target.on('write', ({ end }) => {
-							fragmentedIsobmffOutput!.currentFileSize = Math.max(
-								fragmentedIsobmffOutput!.currentFileSize,
-								end,
-							);
-						});
-
-						// Make sure it never auto-finalizes fragments for us; we take full control of fragment
-						// finalization to line it up perfectly with segments
-						const muxer = fragmentedIsobmffOutput.output._muxer as IsobmffMuxer;
-						muxer.minimumFragmentDuration = Infinity;
-
-						// Intercept the first moof to determine init segment size
-						const originalOnMoof = muxer.formatOptions.onMoof;
-						muxer.formatOptions.onMoof = (data, position, timestamp) => {
-							fragmentedIsobmffOutput!.firstMoofPosition = position;
-							originalOnMoof?.(data, position, timestamp);
-							muxer.formatOptions.onMoof = originalOnMoof;
-						};
+						fragmentedIsobmffOutput = openFragmentedIsobmffOutput(playlist.segmentFormat, target);
 
 						// Add video track
 						if (videoTrack) {
@@ -941,11 +1173,7 @@ export class HlsMuxer extends Muxer {
 							);
 							fragmentedIsobmffOutput.output.addVideoTrack(
 								fragmentedIsobmffOutput.videoSource,
-								{
-									...videoTrack.track.metadata,
-									decoderConfig: videoTrack.info.decoderConfig,
-									primingPacket: videoTrack.info.primingPacket ?? undefined,
-								},
+								segmentVideoMetadata(videoTrack),
 							);
 						}
 
@@ -956,11 +1184,7 @@ export class HlsMuxer extends Muxer {
 							);
 							fragmentedIsobmffOutput.output.addAudioTrack(
 								fragmentedIsobmffOutput.audioSource,
-								{
-									...audioTrack.track.metadata,
-									decoderConfig: audioTrack.info.decoderConfig,
-									primingPacket: audioTrack.info.primingPacket ?? undefined,
-								},
+								segmentAudioMetadata(audioTrack),
 							);
 						}
 
@@ -989,6 +1213,7 @@ export class HlsMuxer extends Muxer {
 					format: playlist.segmentFormat,
 					isSingleFile: false,
 					playlist: toPlaylistInfo(playlist),
+					parts: null,
 				};
 
 				relativeSegmentPath = await this.getSegmentPath(segmentInfo);
@@ -1001,6 +1226,9 @@ export class HlsMuxer extends Muxer {
 			let segmentSize = 0;
 			let outputTarget: Target | null = null;
 			let maxEndTimestamp = -Infinity;
+			const partStarts: { timestamp: number; independent: boolean }[] = [];
+			// Writer positions at the end of every part but the last, which ends with the segment
+			const partEnds: number[] = [];
 
 			let output: Output | null = null;
 			let videoSource: EncodedVideoPacketSource | null = null;
@@ -1041,64 +1269,7 @@ export class HlsMuxer extends Muxer {
 								return this.output._getTarget(proxiedRequest);
 							},
 						),
-						initTarget: async () => {
-							if (playlist.initSegment) {
-								// We already have an init segment from a previous segment
-								return new NullTarget();
-							}
-
-							if (playlist.singleFile) {
-								playlist.initSegment = {
-									path: playlist.singleFile.path,
-									duration: 0,
-									timestamp: 0,
-									byteSize: 0,
-									byteOffset: 0,
-									info: null,
-								};
-
-								const slice = playlist.singleFile.target.slice(playlist.singleFile.nextOffset);
-								slice.on('write', ({ end }) => {
-									playlist.initSegment!.byteSize = Math.max(playlist.initSegment!.byteSize, end);
-								});
-								slice.on('finalized', () => {
-									playlist.singleFile!.nextOffset = playlist.initSegment!.byteSize;
-								});
-
-								return slice;
-							} else {
-								const playlistInfo = toPlaylistInfo(playlist);
-								const initPath = await this.getInitPath(playlistInfo);
-								validateInitPath(initPath);
-
-								playlist.initSegment = {
-									path: initPath,
-									duration: 0,
-									timestamp: 0,
-									byteSize: 0,
-									byteOffset: null,
-									info: null,
-								};
-
-								const fullInitPath = joinPaths(
-									joinPaths(pathedTarget.rootPath, playlist.path),
-									initPath,
-								);
-								const target = await this.output._getTarget({
-									path: fullInitPath,
-									isRoot: false,
-									mimeType: playlist.segmentFormat.mimeType,
-								});
-								target.on('write', ({ end }) => {
-									playlist.initSegment!.byteSize = Math.max(playlist.initSegment!.byteSize, end);
-								});
-								target.on('finalized', () => {
-									this.format._options.onInit?.(target, playlistInfo);
-								});
-
-								return target;
-							}
-						},
+						initTarget: this.initTargetFor(playlist),
 					});
 
 					if (videoTrack) {
@@ -1106,11 +1277,7 @@ export class HlsMuxer extends Muxer {
 						videoSource = new EncodedVideoPacketSource(
 							(videoTrack.track as OutputVideoTrack).source._codec,
 						);
-						output.addVideoTrack(videoSource, {
-							...videoTrack.track.metadata,
-							decoderConfig: videoTrack.info.decoderConfig,
-							primingPacket: videoTrack.info.primingPacket ?? undefined,
-						});
+						output.addVideoTrack(videoSource, segmentVideoMetadata(videoTrack));
 					}
 
 					if (audioTrack) {
@@ -1118,11 +1285,7 @@ export class HlsMuxer extends Muxer {
 						audioSource = new EncodedAudioPacketSource(
 							(audioTrack.track as OutputAudioTrack).source._codec,
 						);
-						output.addAudioTrack(audioSource, {
-							...audioTrack.track.metadata,
-							decoderConfig: audioTrack.info.decoderConfig,
-							primingPacket: audioTrack.info.primingPacket ?? undefined,
-						});
+						output.addAudioTrack(audioSource, segmentAudioMetadata(audioTrack));
 					}
 
 					await output.start();
@@ -1130,62 +1293,94 @@ export class HlsMuxer extends Muxer {
 
 				// Add all of the packets
 
-				if (videoTrack) {
-					assert(videoSource);
-					const meta = { decoderConfig: videoTrack.info.decoderConfig };
+				const muxer = output._muxer;
+				const partDuration = muxer instanceof IsobmffMuxer && muxer.isFragmented
+					? this.options.partDuration
+					: undefined;
 
-					for (let i = 0; i < videoEndIndex; i++) {
-						const packet = videoTrack.packets[i]!;
+				if (partDuration === undefined) {
+					if (videoTrack) {
+						assert(videoSource);
+						const meta = { decoderConfig: videoTrack.info.decoderConfig };
 
-						await videoSource.add(packet, meta);
-						maxEndTimestamp = Math.max(maxEndTimestamp, packet.timestamp + packet.duration);
+						for (let i = 0; i < videoEndIndex; i++) {
+							const packet = videoTrack.packets[i]!;
+
+							await videoSource.add(packet, meta);
+							maxEndTimestamp = Math.max(maxEndTimestamp, packet.timestamp + packet.duration);
+						}
 					}
-				}
 
-				if (audioTrack) {
-					assert(audioSource);
-					const meta = { decoderConfig: audioTrack.info.decoderConfig };
+					if (audioTrack) {
+						assert(audioSource);
+						const meta = { decoderConfig: audioTrack.info.decoderConfig };
 
-					for (let i = 0; i < audioEndIndex; i++) {
-						const packet = audioTrack.packets[i]!;
+						for (let i = 0; i < audioEndIndex; i++) {
+							const packet = audioTrack.packets[i]!;
 
-						await audioSource.add(packet, meta);
+							await audioSource.add(packet, meta);
+							maxEndTimestamp = Math.max(maxEndTimestamp, packet.timestamp + packet.duration);
+						}
+					}
+				} else {
+					assert(playlist.currentSegmentStartTimestamp !== null);
+					assert(muxer instanceof IsobmffMuxer);
+					const videoMeta = videoTrack && { decoderConfig: videoTrack.info.decoderConfig };
+					const audioMeta = audioTrack && { decoderConfig: audioTrack.info.decoderConfig };
+					let videoIndex = 0;
+					let audioIndex = 0;
+
+					// Tracks go in by timestamp so that each fragment holds every track's samples for its span
+					while (videoIndex < videoEndIndex || audioIndex < audioEndIndex) {
+						const videoPacket = videoIndex < videoEndIndex ? videoTrack!.packets[videoIndex]! : null;
+						const audioPacket = audioIndex < audioEndIndex ? audioTrack!.packets[audioIndex]! : null;
+						const isVideo = videoPacket !== null
+							&& (audioPacket === null || videoPacket.timestamp <= audioPacket.timestamp);
+						const packet = isVideo ? videoPacket : audioPacket!;
+
+						// Cut before the sample that would carry a part past partDuration (RFC 8216bis §4.4.4.9)
+						const currentPart = partStarts.at(-1);
+						const cutsPart = currentPart !== undefined
+							&& (isVideo || !videoTrack)
+							&& packet.timestamp + packet.duration > currentPart.timestamp + partDuration + 1e-6;
+
+						if (currentPart === undefined || cutsPart) {
+							if (cutsPart) {
+								partEnds.push(await muxer.forceFragmentFinalization());
+							}
+
+							// A segment always begins on a key frame
+							partStarts.push({
+								timestamp: packet.timestamp,
+								independent: partStarts.length === 0 || !videoTrack || packet.type === 'key',
+							});
+						} else {
+							const partStart = partStarts[partStarts.length - 1]!;
+							// Presentation order differs from decode order with B-frames
+							partStart.timestamp = Math.min(partStart.timestamp, packet.timestamp);
+						}
+
+						if (isVideo) {
+							assert(videoSource && videoMeta);
+							await videoSource.add(packet, videoMeta);
+							videoIndex++;
+						} else {
+							assert(audioSource && audioMeta);
+							await audioSource.add(packet, audioMeta);
+							audioIndex++;
+						}
 						maxEndTimestamp = Math.max(maxEndTimestamp, packet.timestamp + packet.duration);
 					}
 				}
 
 				if (playlist.singleFile?.fragmentedIsobmffOutput) {
-					const muxer = playlist.singleFile.fragmentedIsobmffOutput.output._muxer as IsobmffMuxer;
-					await muxer.forceFragmentFinalization();
-
-					if (
-						playlist.singleFile.fragmentedIsobmffOutput.firstMoofPosition !== null
-						&& !playlist.initSegment
-					) {
-						playlist.initSegment = {
-							path: playlist.singleFile.path,
-							duration: 0,
-							timestamp: 0,
-							byteSize: playlist.singleFile.fragmentedIsobmffOutput.firstMoofPosition,
-							byteOffset: 0,
-							info: null,
-						};
-						playlist.singleFile.nextOffset = playlist.singleFile.fragmentedIsobmffOutput.firstMoofPosition;
-					}
-
-					segmentSize
-						= playlist.singleFile.fragmentedIsobmffOutput.currentFileSize - playlist.singleFile.nextOffset;
+					segmentSize = await finalizeFragmentedIsobmffSegment(playlist);
 				} else {
 					await output.finalize();
 				}
 			} catch (e) {
 				await output?.cancel();
 				throw e;
-			}
-
-			if (segmentInfo) {
-				assert(outputTarget);
-				this.format._options.onSegment?.(outputTarget, segmentInfo);
 			}
 
 			if (videoEndIndex > 0) {
@@ -1213,6 +1408,31 @@ export class HlsMuxer extends Muxer {
 			const segmentDuration = nextSegmentStartTimestamp - playlist.currentSegmentStartTimestamp;
 			assert(segmentDuration >= 0);
 
+			let parts: SegmentPart[] | null = null;
+			if (partStarts.length > 0) {
+				// Only the shared single-file fMP4 output writes absolute positions; a per-segment output starts at 0
+				const segmentStartPos = playlist.singleFile?.fragmentedIsobmffOutput
+					? playlist.singleFile.nextOffset
+					: 0;
+				const partOffsets = [0, ...partEnds.map(end => end - segmentStartPos), segmentSize];
+				const segmentStartTimestamp = playlist.currentSegmentStartTimestamp;
+
+				parts = partStarts.map((partStart, i) => ({
+					offset: partOffsets[i]!,
+					size: partOffsets[i + 1]! - partOffsets[i]!,
+					duration: (partStarts[i + 1]?.timestamp ?? nextSegmentStartTimestamp)
+						- (i === 0 ? segmentStartTimestamp : partStart.timestamp),
+					independent: partStart.independent,
+				}));
+			}
+
+			if (segmentInfo) {
+				assert(outputTarget);
+				segmentInfo.parts = parts;
+				this.options.onSegment?.(outputTarget, segmentInfo);
+			}
+
+			playlist.windowDuration += segmentDuration;
 			playlist.writtenSegments.push({
 				path: relativeSegmentPath,
 				duration: segmentDuration,
@@ -1222,9 +1442,27 @@ export class HlsMuxer extends Muxer {
 					? playlist.singleFile.nextOffset
 					: null,
 				info: segmentInfo ?? null,
+				parts,
 			});
 
 			this.globalTargetDuration = Math.max(this.globalTargetDuration, segmentDuration);
+
+			if (playlist === this.subtitleBoundarySource) {
+				const boundary = { timestamp: playlist.currentSegmentStartTimestamp, duration: segmentDuration };
+
+				// Lock order: a media playlist's mutex is held here, so subtitle work must never take one back.
+				for (const subtitlePlaylist of this.subtitlePlaylists) {
+					subtitlePlaylist.subtitleBoundaries!.push(boundary);
+
+					const release = await subtitlePlaylist.mutex.acquire();
+
+					try {
+						await this.advanceSubtitlePlaylist(subtitlePlaylist);
+					} finally {
+						release();
+					}
+				}
+			}
 
 			playlist.currentSegmentStartTimestamp = nextSegmentStartTimestamp;
 			playlist.currentSegmentStartTimestampIsFixed = true; // After the first segment, the timestamp is now fixed
@@ -1233,21 +1471,320 @@ export class HlsMuxer extends Muxer {
 				playlist.singleFile.nextOffset += segmentSize;
 			}
 
-			if (this.isLive) {
-				while (playlist.writtenSegments.length > this.maxLiveSegmentCount) {
-					const popped = playlist.writtenSegments.shift()!;
-					playlist.mediaSequence++;
+			await this.evictLiveSegments(playlist);
+		}
+	}
 
-					if (!this.singleFilePerPlaylist) {
-						assert(popped.info);
-						this.format._options.onSegmentPopped?.(popped.path, popped.info);
-					}
-				}
+	/** The `initTarget` of a playlist's segment outputs: the first segment writes it, the rest reuse it. */
+	private initTargetFor(playlist: Playlist) {
+		return async (): Promise<Target> => {
+			assert(this.output._target instanceof PathedTarget);
+			const pathedTarget = this.output._target;
 
-				await this.writePlaylist(playlist);
-				await this.tryWriteMasterPlaylist();
+			if (playlist.initSegment) {
+				// We already have an init segment from a previous segment
+				return new NullTarget();
+			}
+
+			if (playlist.singleFile) {
+				playlist.initSegment = {
+					path: playlist.singleFile.path,
+					duration: 0,
+					timestamp: 0,
+					byteSize: 0,
+					byteOffset: 0,
+					info: null,
+					parts: null,
+				};
+
+				const slice = playlist.singleFile.target.slice(playlist.singleFile.nextOffset);
+				slice.on('write', ({ end }) => {
+					playlist.initSegment!.byteSize = Math.max(playlist.initSegment!.byteSize, end);
+				});
+				slice.on('finalized', () => {
+					playlist.singleFile!.nextOffset = playlist.initSegment!.byteSize;
+				});
+
+				return slice;
+			} else {
+				const playlistInfo = toPlaylistInfo(playlist);
+				const initPath = await this.getInitPath(playlistInfo);
+				validateInitPath(initPath);
+
+				playlist.initSegment = {
+					path: initPath,
+					duration: 0,
+					timestamp: 0,
+					byteSize: 0,
+					byteOffset: null,
+					info: null,
+					parts: null,
+				};
+
+				const fullInitPath = joinPaths(
+					joinPaths(pathedTarget.rootPath, playlist.path),
+					initPath,
+				);
+				const target = await this.output._getTarget({
+					path: fullInitPath,
+					isRoot: false,
+					mimeType: playlist.segmentFormat.mimeType,
+				});
+				target.on('write', ({ end }) => {
+					playlist.initSegment!.byteSize = Math.max(playlist.initSegment!.byteSize, end);
+				});
+				target.on('finalized', () => {
+					this.options.onInit?.(target, playlistInfo);
+				});
+
+				return target;
+			}
+		};
+	}
+
+	private async evictLiveSegments(playlist: Playlist) {
+		if (!this.isLive) {
+			return;
+		}
+
+		while (playlist.writtenSegments.length > this.maxLiveSegmentCount) {
+			const popped = playlist.writtenSegments.shift()!;
+			playlist.windowDuration -= popped.duration;
+			playlist.mediaSequence++;
+
+			if (!this.singleFilePerPlaylist) {
+				assert(popped.info);
+				this.options.onSegmentPopped?.(popped.path, popped.info);
 			}
 		}
+
+		await this.broadcast('onSegmentAppended', playlist);
+	}
+
+	private async advanceSubtitlePlaylist(playlist: Playlist) {
+		const boundaries = playlist.subtitleBoundaries;
+		assert(boundaries);
+
+		if (playlist.done) {
+			return;
+		}
+
+		const trackData = this.trackDatas.find(x => x.track === playlist.tracks[0]) as PipelineSubtitleTrackData;
+		assert(trackData);
+		const cues = trackData.info.cues;
+
+		while (boundaries.length > 0) {
+			const boundary = boundaries[0]!;
+			const segmentEnd = boundary.timestamp + boundary.duration;
+
+			// A cue starting at or after the boundary proves every cue of this segment has arrived. Writing
+			// before that point would drop cues that are still in flight.
+			if (!trackData.closed && !cues.some(cue => cue.timestamp >= segmentEnd)) {
+				return;
+			}
+
+			boundaries.shift();
+			await this.writeSubtitleSegment(playlist, trackData, boundary.timestamp, boundary.duration);
+		}
+
+		const moreBoundariesComing = this.subtitleBoundarySource !== null && !this.subtitleBoundarySource.done;
+		if (!trackData.closed || moreBoundariesComing) {
+			return;
+		}
+
+		if (cues.length > 0) {
+			// Cues may outlast the media; they get one trailing segment rather than being dropped.
+			const start = playlist.currentSegmentStartTimestamp ?? cues[0]!.timestamp;
+			const end = cues.reduce((max, cue) => Math.max(max, cue.timestamp + cue.duration), start);
+			await this.writeSubtitleSegment(playlist, trackData, start, end - start);
+		}
+
+		await this.onPlaylistDone(playlist);
+	}
+
+	// A segment format that writes its init to the output's `initTarget` (CMAF) concatenates into a valid
+	// single file segment by segment. One that writes `ftyp`/`moov` inline repeats the whole init per
+	// segment, so that playlist gets the same standalone-fMP4 treatment `advancePlaylist` gives media:
+	// one output for the whole file, one fragment per segment.
+	private async openSubtitleSingleFile(playlist: Playlist, trackData: PipelineSubtitleTrackData) {
+		assert(this.output._target instanceof PathedTarget);
+		const pathedTarget = this.output._target;
+
+		const segmentInfo: HlsOutputSegmentInfo = {
+			n: playlist.nextSegmentId,
+			format: playlist.segmentFormat,
+			isSingleFile: true,
+			playlist: toPlaylistInfo(playlist),
+			parts: null,
+		};
+
+		const relativeSegmentPath = await this.getSegmentPath(segmentInfo);
+		validateSegmentPath(relativeSegmentPath);
+
+		const target = await this.output._getTarget({
+			path: joinPaths(joinPaths(pathedTarget.rootPath, playlist.path), relativeSegmentPath),
+			isRoot: false,
+			mimeType: playlist.segmentFormat.mimeType,
+		});
+		let fragmentedIsobmffOutput: FragmentedIsobmffOutput | null = null;
+		if (playlist.segmentFormat._isFragmentedIsobmff()) {
+			fragmentedIsobmffOutput = openFragmentedIsobmffOutput(playlist.segmentFormat, target);
+			fragmentedIsobmffOutput.subtitleSource = new SubtitleCueSource(
+				(trackData.track as OutputSubtitleTrack).source._codec,
+			);
+			fragmentedIsobmffOutput.output.addSubtitleTrack(
+				fragmentedIsobmffOutput.subtitleSource,
+				trackData.track.metadata,
+			);
+			await fragmentedIsobmffOutput.output.start();
+		} else {
+			target._start();
+		}
+
+		playlist.singleFile = {
+			target,
+			path: relativeSegmentPath,
+			nextOffset: 0,
+			info: segmentInfo,
+			fragmentedIsobmffOutput,
+		};
+	}
+
+	private async writeSubtitleSegment(
+		playlist: Playlist,
+		trackData: PipelineSubtitleTrackData,
+		timestamp: number,
+		duration: number,
+	) {
+		assert(this.output._target instanceof PathedTarget);
+		const pathedTarget = this.output._target;
+
+		const segmentEnd = timestamp + duration;
+		// The first segment swallows anything starting before the media did, so early cues aren't lost.
+		const segmentStart = playlist.nextSegmentId === 1 ? -Infinity : timestamp;
+		const cues = trackData.info.cues.filter(cue => cueOverlapsSegment(cue, segmentStart, segmentEnd));
+
+		if (this.singleFilePerPlaylist && !playlist.singleFile) {
+			await this.openSubtitleSingleFile(playlist, trackData);
+		}
+
+		let segmentInfo: HlsOutputSegmentInfo | null = null;
+		let relativeSegmentPath: string;
+
+		if (playlist.singleFile) {
+			// In single-file mode, onSegment is called once in onPlaylistDone instead of per-segment.
+			relativeSegmentPath = playlist.singleFile.path;
+		} else {
+			segmentInfo = {
+				n: playlist.nextSegmentId,
+				format: playlist.segmentFormat,
+				isSingleFile: false,
+				playlist: toPlaylistInfo(playlist),
+				parts: null,
+			};
+
+			relativeSegmentPath = await this.getSegmentPath(segmentInfo);
+			validateSegmentPath(relativeSegmentPath);
+		}
+
+		const fullSegmentPath = joinPaths(joinPaths(pathedTarget.rootPath, playlist.path), relativeSegmentPath);
+		playlist.nextSegmentId++;
+
+		let segmentSize = 0;
+		let outputTarget: Target | null = null;
+
+		const persistent = playlist.singleFile?.fragmentedIsobmffOutput ?? null;
+		const output = persistent?.output ?? new Output({
+			format: playlist.segmentFormat,
+			target: new PathedTarget(
+				fullSegmentPath,
+				async (request: TargetRequest) => {
+					if (request.isRoot && playlist.singleFile) {
+						const slice = playlist.singleFile.target.slice(playlist.singleFile.nextOffset);
+						slice.on('write', ({ end }) => segmentSize = Math.max(segmentSize, end));
+
+						return slice;
+					}
+
+					const target = await this.output._getTarget({ ...request, isRoot: false });
+
+					if (request.isRoot) {
+						outputTarget = target;
+						target.on('write', ({ end }) => segmentSize = Math.max(segmentSize, end));
+					}
+
+					return target;
+				},
+			),
+			initTarget: this.initTargetFor(playlist),
+		});
+
+		let source: SubtitleCueSource;
+		if (persistent) {
+			assert(persistent.subtitleSource);
+			source = persistent.subtitleSource;
+		} else {
+			source = new SubtitleCueSource((trackData.track as OutputSubtitleTrack).source._codec);
+			output.addSubtitleTrack(source, trackData.track.metadata);
+		}
+
+		// Where in the media timeline this segment sits is known to the playlist, not to any track,
+		// so it reaches the muxer directly rather than through a source.
+		if (playlist.segmentFormat instanceof WebvttSegmentFormat) {
+			const webvttMuxer = output._muxer as WebvttMuxer;
+			webvttMuxer.segmentStartTimestamp = timestamp;
+			webvttMuxer.preamble = trackData.info.config?.description ?? null;
+		} else {
+			(output._muxer as IsobmffMuxer).subtitleSegmentWindow = { start: timestamp, duration };
+		}
+
+		try {
+			if (!persistent) {
+				await output.start();
+			}
+
+			for (const cue of cues) {
+				await source.add(cue);
+			}
+
+			if (persistent) {
+				segmentSize = await finalizeFragmentedIsobmffSegment(playlist);
+			} else {
+				await output.finalize();
+			}
+		} catch (e) {
+			await output.cancel();
+			throw e;
+		}
+
+		if (segmentInfo) {
+			assert(outputTarget);
+			this.options.onSegment?.(outputTarget, segmentInfo);
+		}
+
+		// Retain every cue that can still overlap a later segment; they must be repeated there. Dropping
+		// only a prefix would let one long cue pin every cue behind it in the buffer for its whole span.
+		trackData.info.cues = trackData.info.cues.filter(cue => cueOverlapsSegment(cue, segmentEnd, Infinity));
+
+		playlist.windowDuration += duration;
+		playlist.writtenSegments.push({
+			path: relativeSegmentPath,
+			duration,
+			timestamp,
+			byteSize: segmentSize,
+			byteOffset: playlist.singleFile ? playlist.singleFile.nextOffset : null,
+			info: segmentInfo,
+			parts: null,
+		});
+
+		if (playlist.singleFile) {
+			playlist.singleFile.nextOffset += segmentSize;
+		}
+
+		this.globalTargetDuration = Math.max(this.globalTargetDuration, duration);
+		playlist.currentSegmentStartTimestamp = segmentEnd;
+
+		await this.evictLiveSegments(playlist);
 	}
 
 	private async onPlaylistDone(playlist: Playlist) {
@@ -1257,373 +1794,19 @@ export class HlsMuxer extends Muxer {
 		if (playlist.singleFile) {
 			if (playlist.singleFile.fragmentedIsobmffOutput) {
 				await playlist.singleFile.fragmentedIsobmffOutput.output.finalize();
+
+				// The index is only written during finalization, so it can't be read before this point.
+				const muxer = playlist.singleFile.fragmentedIsobmffOutput.output._muxer as IsobmffMuxer;
+				playlist.indexRange = muxer.sidxByteRange;
 			} else {
 				await playlist.singleFile.target._flush();
 				await playlist.singleFile.target._finalize();
 			}
 
-			this.format._options.onSegment?.(playlist.singleFile.target, playlist.singleFile.info);
+			this.options.onSegment?.(playlist.singleFile.target, playlist.singleFile.info);
 		}
 
-		await this.writePlaylist(playlist);
-
-		if (this.isLive && playlist.writtenSegments.length === 0) {
-			await this.tryWriteMasterPlaylist();
-		}
-	}
-
-	private updatePlaylistBitrates(playlist: Playlist) {
-		const segments = playlist.writtenSegments;
-
-		let peakBitrate = 0;
-		let totalBits = 0;
-		let totalDuration = 0;
-
-		// Per spec, peak bitrate is the largest bit rate of any contiguous set of segments whose total duration is
-		// between 0.5 and 1.5 times the target duration
-		for (let i = 0; i < segments.length; i++) {
-			totalDuration += segments[i]!.duration;
-
-			let windowBytes = 0;
-			let windowDuration = 0;
-
-			for (let j = i; j < segments.length; j++) {
-				windowBytes += segments[j]!.byteSize;
-				windowDuration += segments[j]!.duration;
-
-				if (
-					windowDuration >= 0.5 * this.globalTargetDuration
-					&& windowDuration <= 1.5 * this.globalTargetDuration
-				) {
-					peakBitrate = Math.max(peakBitrate, 8 * windowBytes / windowDuration);
-				}
-
-				if (windowDuration > 1.5 * this.globalTargetDuration) {
-					break;
-				}
-			}
-		}
-
-		// Fallback: if no contiguous set falls within the range, use per-segment max
-		if (peakBitrate === 0) {
-			for (const segment of segments) {
-				const segmentDuration = segment.duration || 1; // To catch 0-duration segments which can happen
-				peakBitrate = Math.max(peakBitrate, 8 * segment.byteSize / segmentDuration);
-			}
-		}
-
-		for (const segment of segments) {
-			totalBits += 8 * segment.byteSize;
-		}
-
-		playlist.peakBitrate = peakBitrate;
-		playlist.averageBitrate = totalBits / (totalDuration || 1);
-	}
-
-	private async writePlaylist(playlist: Playlist) {
-		assert(this.output._target instanceof PathedTarget);
-		const pathedTarget = this.output._target;
-
-		this.updatePlaylistBitrates(playlist);
-
-		let hasByteOffsets = false;
-		for (const segment of playlist.writtenSegments) {
-			hasByteOffsets ||= segment.byteOffset !== null;
-		}
-
-		const isKeyPacketsOnly = playlist.tracks[0]!.isVideoTrack()
-			&& playlist.tracks[0].metadata.hasOnlyKeyPackets;
-
-		let version = 3;
-		if (isKeyPacketsOnly || hasByteOffsets) {
-			version = 4;
-		}
-		if (playlist.initSegment) {
-			version = 5;
-		}
-		if (playlist.initSegment && !isKeyPacketsOnly) {
-			// "if it contains the EXT-X-MAP tag in a Media Playlist that does not contain EXT-X-I-FRAMES-ONLY"
-			version = 6;
-		}
-
-		// In live mode, target duration is not allowed to change, so we use the nominal value
-		const targetDuration = this.isLive ? this.targetSegmentDuration : this.globalTargetDuration;
-
-		const playlistPath = joinPaths(pathedTarget.rootPath, playlist.path);
-		const playlistText = '#EXTM3U\n'
-			+ `#EXT-X-VERSION:${version}\n`
-			+ (!this.isLive ? '#EXT-X-PLAYLIST-TYPE:VOD\n' : '')
-			+ `#EXT-X-TARGETDURATION:${Math.ceil(targetDuration)}\n` // Must be a "decimal-integer"
-			+ (Number.isFinite(this.maxLiveSegmentCount) ? `#EXT-X-MEDIA-SEQUENCE:${playlist.mediaSequence}\n` : '')
-			+ '#EXT-X-INDEPENDENT-SEGMENTS\n'
-			+ (isKeyPacketsOnly ? '#EXT-X-I-FRAMES-ONLY\n' : '')
-			+ (playlist.initSegment
-				? (`#EXT-X-MAP:URI="${playlist.initSegment.path}"`
-					+ (playlist.initSegment.byteOffset !== null
-						? `,BYTERANGE="${playlist.initSegment.byteSize}@${playlist.initSegment.byteOffset}"`
-						: '')
-					+ '\n')
-				: '')
-			+ '\n'
-			+ (playlist.writtenSegments
-				.map(segment => (
-					`#EXTINF:${+segment.duration.toFixed(12)},\n` // Trailing comma mandated by spec
-					+ (this.isRelativeToUnixEpoch
-						? `#EXT-X-PROGRAM-DATE-TIME:${new Date(1000 * segment.timestamp).toISOString()}\n`
-						: '')
-					+ (segment.byteOffset !== null
-						? `#EXT-X-BYTERANGE:${segment.byteSize}@${segment.byteOffset}\n`
-						: '')
-					+ `${segment.path}\n`
-				))
-				.join(''))
-			+ (playlist.done
-				? (playlist.writtenSegments.length > 0 ? '\n' : '') + '#EXT-X-ENDLIST\n'
-				: '');
-
-		this.format._options.onPlaylist?.(playlistText, toPlaylistInfo(playlist));
-
-		const target = await this.output._getTarget({
-			path: playlistPath,
-			isRoot: false,
-			mimeType: HLS_MIME_TYPE,
-		});
-		const writer = new Writer(target, true);
-		writer.start();
-		writer.write(textEncoder.encode(playlistText));
-
-		await writer.flush();
-		await writer.finalize();
-	}
-
-	private async writeMasterPlaylist() {
-		assert(this.output._target instanceof PathedTarget);
-		const pathedTarget = this.output._target;
-
-		let masterPlaylistText = '#EXTM3U\n';
-		let firstVariantWritten = false;
-
-		let lastGroupId: string | null = null;
-		let groupIdTrackCount = 0;
-		let hasHadDefaultTrackInGroup = false;
-
-		for (const decl of this.playlistDeclarations) {
-			if (decl.groupId === null) {
-				const isKeyPacketsOnly = decl.playlist.tracks[0]!.isVideoTrack()
-					&& decl.playlist.tracks[0].metadata.hasOnlyKeyPackets;
-
-				const codecs: string[] = [];
-				for (const track of decl.playlist.tracks) {
-					const trackData = this.trackDatas.find(x => x.track === track);
-					const codecString = trackData?.info.decoderConfig.codec ?? track.source._codec;
-					codecs.push(codecString);
-				}
-
-				let peakDeclBitrate = 0;
-				let maxRefAverageBitrate = 0;
-
-				if (decl.references.length > 0) {
-					const firstRef = decl.references[0]!;
-					const firstTrack = firstRef.playlist.tracks[0]!;
-					const trackData = this.trackDatas.find(x => x.track === firstTrack);
-					const codecString = trackData?.info.decoderConfig.codec ?? firstTrack.source._codec;
-					codecs.push(codecString);
-
-					for (const ref of decl.references) {
-						assert(ref.playlist.peakBitrate !== null);
-						peakDeclBitrate = Math.max(peakDeclBitrate, ref.playlist.peakBitrate);
-						maxRefAverageBitrate = Math.max(maxRefAverageBitrate, ref.playlist.averageBitrate ?? 0);
-					}
-				}
-
-				assert(decl.playlist.peakBitrate !== null);
-				const totalPeakBitrate = decl.playlist.peakBitrate + peakDeclBitrate;
-				const totalAverageBitrate = (decl.playlist.averageBitrate ?? 0) + maxRefAverageBitrate;
-
-				if (!firstVariantWritten) {
-					masterPlaylistText += '\n';
-					firstVariantWritten = true;
-				}
-
-				if (isKeyPacketsOnly) {
-					masterPlaylistText += `#EXT-X-I-FRAME-STREAM-INF:`;
-				} else {
-					masterPlaylistText += `#EXT-X-STREAM-INF:`;
-				}
-
-				masterPlaylistText += `BANDWIDTH=${Math.ceil(totalPeakBitrate)}`;
-
-				if (totalAverageBitrate > 0) {
-					masterPlaylistText += `,AVERAGE-BANDWIDTH=${Math.ceil(totalAverageBitrate)}`;
-				}
-
-				masterPlaylistText += `,CODECS="${codecs.join(',')}"`;
-
-				const videoTrack = decl.playlist.tracks.find(x => x.isVideoTrack());
-				if (videoTrack?.isVideoTrack()) {
-					const trackData = this.trackDatas.find(x => x.track === videoTrack) as
-						HlsVideoTrackData | undefined;
-					const decoderConfig = trackData?.info.decoderConfig;
-					if (decoderConfig) {
-						let width = decoderConfig.displayAspectWidth ?? decoderConfig.codedWidth;
-						let height = decoderConfig.displayAspectHeight ?? decoderConfig.codedHeight;
-
-						if (width !== undefined && height !== undefined) {
-							if (
-								videoTrack.metadata.rotation !== undefined
-								&& videoTrack.metadata.rotation % 180 === 90
-							) {
-								[width, height] = [height, width];
-							}
-
-							masterPlaylistText += `,RESOLUTION=${width}x${height}`;
-						}
-					}
-
-					// FRAME-RATE is not defined for EXT-X-I-FRAME-STREAM-INF
-					if (!isKeyPacketsOnly && videoTrack.metadata.frameRate !== undefined) {
-						// Spec requires that frame rate be rounded to 3 decimal places
-						masterPlaylistText += `,FRAME-RATE=${+videoTrack.metadata.frameRate.toFixed(3)}`;
-					}
-				}
-
-				if (!isKeyPacketsOnly) {
-					const groupIdForType = new Map<string, string>();
-					for (const ref of decl.references) {
-						assert(ref.groupId !== null);
-						const type = ref.playlist.tracks[0]!.type;
-						groupIdForType.set(type, ref.groupId);
-					}
-
-					for (const [type, id] of groupIdForType) {
-						masterPlaylistText += `,${type.toUpperCase()}="${id}"`;
-					}
-				}
-
-				if (isKeyPacketsOnly) {
-					// EXT-X-I-FRAME-STREAM-INF is standalone with a URI attribute
-					masterPlaylistText += `,URI="${decl.playlist.path}"`;
-					masterPlaylistText += '\n';
-				} else {
-					masterPlaylistText += '\n';
-					masterPlaylistText += `${decl.playlist.path}\n`;
-				}
-			} else {
-				assert(decl.playlist.tracks.length === 1);
-
-				const track = decl.playlist.tracks[0]!;
-				const type = track.type;
-				let name = track.metadata.name ?? null;
-				const languageCode = track.metadata.languageCode;
-				const disposition = track.metadata.disposition;
-
-				if (lastGroupId === null || decl.groupId !== lastGroupId) {
-					groupIdTrackCount = 0;
-					masterPlaylistText += '\n';
-					hasHadDefaultTrackInGroup = false;
-				}
-				lastGroupId = decl.groupId;
-				groupIdTrackCount++;
-
-				masterPlaylistText += `#EXT-X-MEDIA:TYPE=${type.toUpperCase()},GROUP-ID="${decl.groupId}"`;
-
-				if (name !== null && /[\n\r"]/.test(name)) {
-					Logging._warn(
-						'Dropping track name since it includes a line feed, carriage return, or double quote'
-						+ ' character, which are not allowed in HLS playlist attributes.',
-					);
-					name = null;
-				}
-
-				// Name is required, so we have to set it to SOMETHING
-				name ??= `${languageCode ?? decl.groupId}-${groupIdTrackCount}`;
-
-				masterPlaylistText += `,NAME="${name}"`;
-
-				if (languageCode !== undefined) {
-					masterPlaylistText += `,LANGUAGE="${languageCode}"`;
-				}
-
-				const dispositionPrimary = disposition?.primary ?? false;
-				const dispositionDefault = disposition?.default ?? true;
-				const dispositionForced = disposition?.forced ?? false;
-
-				if (dispositionPrimary && !hasHadDefaultTrackInGroup) {
-					// HLS's "DEFAULT" behaves like our "primary"
-					masterPlaylistText += ',DEFAULT=YES';
-					hasHadDefaultTrackInGroup = true; // Only one DEFAULT label per group allowed
-				}
-
-				if (dispositionPrimary || dispositionDefault) {
-					masterPlaylistText += ',AUTOSELECT=YES';
-				}
-
-				if (dispositionForced) {
-					masterPlaylistText += ',FORCED=YES';
-				}
-
-				if (type === 'audio') {
-					const trackData = this.trackDatas.find(x => x.track === track) as
-						HlsAudioTrackData | undefined;
-					const decoderConfig = trackData?.info.decoderConfig;
-
-					if (decoderConfig) {
-						masterPlaylistText += `,CHANNELS="${decoderConfig.numberOfChannels}"`;
-					}
-				}
-
-				if (!decl.noUri) {
-					masterPlaylistText += `,URI="${decl.playlist.path}"`;
-				}
-
-				masterPlaylistText += '\n';
-			}
-		}
-
-		this.format._options.onMaster?.(masterPlaylistText);
-
-		const release = await this.mutex.acquire();
-
-		try {
-			let writer: Writer;
-			if (this.numWrittenMasterPlaylists === 0) {
-				// For the first master playlist write, we use the normal root writer getter, so that the target
-				// returned by Output.target emits valid write events.
-				writer = await this.output._getRootWriter(true);
-			} else {
-				// For subsequent master playlist writes, we *must* obtain a different target in order to overwrite
-				// the file.
-				const target = await this.output._getTarget({
-					path: pathedTarget.rootPath,
-					isRoot: true,
-					mimeType: HLS_MIME_TYPE,
-				});
-				writer = new Writer(target, true);
-				writer.start();
-			}
-
-			writer.write(textEncoder.encode(masterPlaylistText));
-
-			await writer.flush();
-			await writer.finalize();
-
-			this.numWrittenMasterPlaylists++;
-		} finally {
-			release();
-		}
-	}
-
-	private async tryWriteMasterPlaylist() {
-		assert(this.isLive);
-
-		// The master playlist is written once all playlists have either produced at least one segment or are done
-		for (const playlist of this.playlists) {
-			if (playlist.writtenSegments.length === 0 && !playlist.done) {
-				return;
-			}
-		}
-
-		await this.writeMasterPlaylist();
+		await this.broadcast('onPlaylistDone', playlist);
 	}
 
 	async finalize() {
@@ -1634,13 +1817,16 @@ export class HlsMuxer extends Muxer {
 			trackData.closed = true;
 		}
 
+		// Media playlists first: subtitles finish only once the boundary source is done.
 		await Promise.all(this.playlists.map(playlist => (
-			playlist.done ? Promise.resolve() : this.advancePlaylist(playlist)
+			playlist.done || playlist.subtitleBoundaries ? Promise.resolve() : this.advancePlaylist(playlist)
 		)));
 
-		if (!this.isLive) {
-			await this.writeMasterPlaylist();
-		}
+		await Promise.all(this.subtitlePlaylists.map(playlist => (
+			playlist.done ? Promise.resolve() : this.advanceSubtitlePlaylist(playlist)
+		)));
+
+		await this.broadcast('onFinalize');
 	}
 }
 

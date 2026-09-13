@@ -20,7 +20,6 @@ import {
 import * as NodeAv from 'node-av';
 import { assert, toUint8Array } from '../../../src/misc';
 import {
-	isRgbPixelFormat,
 	toPixelFormat,
 	unmapColorPrimaries,
 	unmapTransferCharacteristics,
@@ -84,18 +83,22 @@ export class AvFrameVideoSampleResource extends VideoSampleResource {
 		this._frame = frame;
 	}
 
+	/** WebCodecs pixel format mapped from the underlying AvFrame, or `null` if unsupported. */
 	getFormat(): VideoSamplePixelFormat | null {
 		return toPixelFormat(this.frame.format as NodeAv.AVPixelFormat);
 	}
 
+	/** Coded frame width in pixels (may differ from display width when SAR ≠ 1). */
 	getCodedWidth(): number {
 		return this.frame.width;
 	}
 
+	/** Coded frame height in pixels (may differ from display height when SAR ≠ 1). */
 	getCodedHeight(): number {
 		return this.frame.height;
 	}
 
+	/** Display width after applying the sample aspect ratio. */
 	getSquarePixelWidth(): number {
 		if (this.frame.sampleAspectRatio.num > this.frame.sampleAspectRatio.den) {
 			return Math.round(this.frame.width * this.frame.sampleAspectRatio.num / this.frame.sampleAspectRatio.den);
@@ -104,6 +107,7 @@ export class AvFrameVideoSampleResource extends VideoSampleResource {
 		}
 	}
 
+	/** Display height after applying the sample aspect ratio. */
 	getSquarePixelHeight(): number {
 		if (this.frame.sampleAspectRatio.num > this.frame.sampleAspectRatio.den) {
 			return this.frame.height;
@@ -112,6 +116,7 @@ export class AvFrameVideoSampleResource extends VideoSampleResource {
 		}
 	}
 
+	/** Color space (primaries / transfer / matrix / full-range) of the underlying frame. */
 	getColorSpace(): VideoSampleColorSpace {
 		return new VideoSampleColorSpace({
 			primaries: unmapColorPrimaries(this.frame.colorPrimaries) as VideoColorPrimaries | null,
@@ -126,11 +131,13 @@ export class AvFrameVideoSampleResource extends VideoSampleResource {
 		});
 	}
 
+	/** Release the underlying AvFrame; after this call the resource is unusable. */
 	close(): void {
 		this.frame.free();
 		this._frame = null;
 	}
 
+	/** Return one entry per plane (`data` + per-line `stride` in bytes). */
 	getDataPlanes(): MaybePromise<VideoDataPlane[]> {
 		assert(this.frame.data);
 
@@ -140,6 +147,7 @@ export class AvFrameVideoSampleResource extends VideoSampleResource {
 		}));
 	}
 
+	/** Convert the frame to a packed RGBA `VideoSample`. The `colorSpace` argument is currently unused. */
 	async toRgbSample(
 		init: SetRequired<VideoSampleInit, 'timestamp'>,
 		// Will respect it when somebody complains
@@ -149,66 +157,40 @@ export class AvFrameVideoSampleResource extends VideoSampleResource {
 		const width = this.frame.width;
 		const height = this.frame.height;
 
-		// A separate ref so we can fill in unspecified color properties without changing the original frame
-		const srcFrame = new NodeAv.Frame();
-		srcFrame.alloc();
-		srcFrame.ref(this.frame);
+		const scaler = new NodeAv.SoftwareScaleContext();
+		const srcFmt = this.frame.format as NodeAv.AVPixelFormat;
+		const dstFmt = fromPixelFormat('RGBA');
 
-		const srcIsRgb = isRgbPixelFormat(srcFrame.format as NodeAv.AVPixelFormat);
-		if (srcFrame.colorPrimaries === NodeAv.AVCOL_PRI_UNSPECIFIED) {
-			srcFrame.colorPrimaries = NodeAv.AVCOL_PRI_BT709;
-		}
-		if (srcFrame.colorTrc === NodeAv.AVCOL_TRC_UNSPECIFIED) {
-			srcFrame.colorTrc = srcIsRgb ? NodeAv.AVCOL_TRC_IEC61966_2_1 : NodeAv.AVCOL_TRC_BT709;
-		}
-		if (srcFrame.colorSpace === NodeAv.AVCOL_SPC_UNSPECIFIED) {
-			srcFrame.colorSpace = srcIsRgb ? NodeAv.AVCOL_SPC_RGB : NodeAv.AVCOL_SPC_BT709;
-		}
-		if (srcFrame.colorRange === NodeAv.AVCOL_RANGE_UNSPECIFIED) {
-			srcFrame.colorRange = srcIsRgb ? NodeAv.AVCOL_RANGE_JPEG : NodeAv.AVCOL_RANGE_MPEG;
-		}
+		scaler.getContext(
+			width, height, srcFmt,
+			width, height, dstFmt,
+			NodeAv.SWS_BILINEAR,
+		);
 
 		const dstFrame = new NodeAv.Frame();
-		dstFrame.alloc();
 		dstFrame.width = width;
 		dstFrame.height = height;
-		dstFrame.format = fromPixelFormat('RGBA');
+		dstFrame.format = dstFmt;
+		dstFrame.alloc();
 		dstFrame.allocBuffer();
 
-		dstFrame.colorPrimaries = srcFrame.colorPrimaries;
-		dstFrame.colorTrc = srcFrame.colorTrc;
-		dstFrame.colorSpace = NodeAv.AVCOL_SPC_RGB;
-		dstFrame.colorRange = NodeAv.AVCOL_RANGE_JPEG;
-
-		// Left unconfigured on purpose: getContext/initContext ignore the frames' color properties and use BT.601
-		const scaler = new NodeAv.SoftwareScaleContext();
-		scaler.allocContext();
-		scaler.setOption('sws_flags', 'bilinear');
+		const srcFrame = this.frame;
 
 		try {
-			const ret = await scaler.scaleFrame(dstFrame, srcFrame);
-			NodeAv.FFmpegError.throwIfError(ret, 'Scale frame');
+			await scaler.scaleFrame(dstFrame, srcFrame);
 		} finally {
 			scaler.freeContext();
-			srcFrame.free();
 		}
 
-		dstFrame.sampleAspectRatio = this.frame.sampleAspectRatio;
+		dstFrame.sampleAspectRatio = srcFrame.sampleAspectRatio;
 
 		return new VideoSample(new AvFrameVideoSampleResource(dstFrame), init);
 	}
 }
 
-export const copyVideoSampleToAvFrame = async (sample: VideoSample, frame: NodeAv.Frame, lastBuffer: Buffer | null) => {
-	assert(sample.format !== null);
-
-	frame.format = fromPixelFormat(sample.format);
-	frame.width = sample.codedWidth;
-	frame.height = sample.codedHeight;
-	frame.sampleAspectRatio = new NodeAv.Rational(
-		sample.pixelAspectRatio.num,
-		sample.pixelAspectRatio.den,
-	);
+// Also applied to reffed frames: one taken straight from a filter graph would otherwise keep the color of the
+// source it no longer resembles
+export const applySampleColorToFrame = (sample: VideoSample, frame: NodeAv.Frame) => {
 	frame.colorPrimaries = mapColorPrimaries(sample.colorSpace.primaries ?? 'unknown')
 		?? NodeAv.AVCOL_PRI_UNSPECIFIED;
 	frame.colorSpace = mapMatrixCoefficients(sample.colorSpace.matrix ?? 'unknown')
@@ -220,6 +202,19 @@ export const copyVideoSampleToAvFrame = async (sample: VideoSample, frame: NodeA
 		: sample.colorSpace.fullRange === true
 			? NodeAv.AVCOL_RANGE_JPEG
 			: NodeAv.AVCOL_RANGE_UNSPECIFIED;
+};
+
+export const copyVideoSampleToAvFrame = async (sample: VideoSample, frame: NodeAv.Frame, lastBuffer: Buffer | null) => {
+	assert(sample.format !== null);
+
+	frame.format = fromPixelFormat(sample.format);
+	frame.width = sample.codedWidth;
+	frame.height = sample.codedHeight;
+	frame.sampleAspectRatio = new NodeAv.Rational(
+		sample.pixelAspectRatio.num,
+		sample.pixelAspectRatio.den,
+	);
+	applySampleColorToFrame(sample, frame);
 
 	const size = sample.allocationSize();
 	if (!lastBuffer || lastBuffer.byteLength !== size) {
@@ -292,10 +287,16 @@ export const transformVideoSample = async (
 	graph.alloc();
 
 	try {
+		// Matrix and range are libavfilter *link* properties: buffersink stamps them onto every output frame from
+		// the link, so a buffer source that doesn't state them unstates them on the way out. Primaries and transfer
+		// have no link property and ride along on the frame, which is why only these two were being lost. Read them
+		// off srcFrame here - buffersrcAddFrame below unrefs it, wiping all four.
 		const srcArgs = `video_size=${srcFrame.width}x${srcFrame.height}`
 			+ `:pix_fmt=${srcFrame.format}`
 			+ `:time_base=1/1000000`
-			+ `:pixel_aspect=${sample.pixelAspectRatio.num}/${sample.pixelAspectRatio.den}`;
+			+ `:pixel_aspect=${sample.pixelAspectRatio.num}/${sample.pixelAspectRatio.den}`
+			+ `:colorspace=${srcFrame.colorSpace}`
+			+ `:range=${srcFrame.colorRange}`;
 
 		const bufferSrc = graph.createFilter(NodeAv.Filter.getByName('buffer')!, 'src', srcArgs);
 		const bufferSink = graph.createFilter(NodeAv.Filter.getByName('buffersink')!, 'sink');

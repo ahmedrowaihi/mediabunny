@@ -8,7 +8,7 @@
 
 import type { FileHandle } from 'node:fs/promises';
 import * as nodeAlias from './node';
-import { assert, EventEmitter, FilePath, isWebKit, MaybePromise } from './misc';
+import { assert, EventEmitter, FilePath, isBun, isWebKit, MaybePromise } from './misc';
 
 const node = typeof nodeAlias !== 'undefined'
 	? nodeAlias // Aliasing it prevents some bundler warnings
@@ -147,7 +147,13 @@ export class BufferTarget extends Target {
 
 		this._options = options;
 
-		this._supportsResize = 'resize' in new ArrayBuffer(0);
+		// Bun (JSC) never returns the memory backing a resizable ArrayBuffer: 3000 allocations of
+		// `new ArrayBuffer(2 ** 16, { maxByteLength: 2 ** 32 })`, each resized once and dropped, grow
+		// `phys_footprint` by 39MB and never release it — ~13KB apiece. Plain ArrayBuffers on Bun, and
+		// the same test on V8, are flat. One BufferTarget exists per HLS segment, so this surfaced as
+		// ~940KB leaked per conversion at 1s segments, unbounded across conversions. The copy-grow path
+		// below is flat on Bun. Recheck when Bun changes its ArrayBuffer implementation.
+		this._supportsResize = !isBun() && 'resize' in new ArrayBuffer(0);
 		if (this._supportsResize) {
 			try {
 				// @ts-expect-error Don't want to bump "lib" in tsconfig

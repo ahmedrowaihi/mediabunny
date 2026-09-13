@@ -597,3 +597,33 @@ const findBtrtBoxes = (bytes: Uint8Array) => {
 
 	return boxes;
 };
+
+const muxWithCreationTime = async (creationTime: Date) => {
+	using input = new Input({
+		source: new FilePathSource(path.join(__dirname, '../public/video.mp4')),
+		formats: ALL_FORMATS,
+	});
+
+	const output = new Output({
+		format: new Mp4OutputFormat({ creationTime }),
+		target: new BufferTarget(),
+	});
+	await (await Conversion.init({ input, output })).execute();
+	return new Uint8Array(output.target.buffer!);
+};
+
+// Three full conversions; the default 5s budget is not enough under a loaded suite.
+test('creationTime is written into the container and makes muxing reproducible', { timeout: 30_000 }, async () => {
+	const early = new Date('2020-01-01T00:00:00Z');
+	const [first, second] = [await muxWithCreationTime(early), await muxWithCreationTime(early)];
+	const late = await muxWithCreationTime(new Date('2021-06-15T12:00:00Z'));
+
+	// Equality alone would also hold if the option were ignored and both runs landed in the same
+	// wall-clock second, so a second date is what proves the value reaches the file.
+	expect(second).toEqual(first);
+	expect(late).not.toEqual(first);
+});
+
+test('creationTime rejects a value that would write a garbage timestamp', () => {
+	expect(() => new Mp4OutputFormat({ creationTime: new Date('nope') })).toThrow(/valid Date/);
+});

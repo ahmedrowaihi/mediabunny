@@ -24,7 +24,8 @@ import {
 } from './codec-data';
 import { CustomVideoDecoder, customVideoDecoders, CustomAudioDecoder, customAudioDecoders } from './custom-coder';
 import { InputDisposedError } from './input';
-import { InputAudioTrack, InputTrack, InputVideoTrack } from './input-track';
+import { InputAudioTrack, InputSubtitleTrack, InputTrack, InputVideoTrack } from './input-track';
+import { SubtitleCue } from './subtitles';
 import {
 	AnyIterable,
 	assert,
@@ -425,13 +426,9 @@ export class EncodedPacketSink {
 	}
 }
 
-const MAX_QUEUE_SIZE = 4;
-
 abstract class DecoderWrapper<
 	MediaSample extends VideoSample | AudioSample,
 > {
-	onDequeue: (() => unknown) | null = null;
-
 	constructor(
 		public onSample: (sample: MediaSample) => unknown,
 		public onError: (error: unknown) => unknown,
@@ -537,7 +534,6 @@ export abstract class BaseMediaSampleSink<
 					onQueueNotEmpty();
 				}
 			});
-			decoder.onDequeue = () => onQueueDequeue();
 
 			const packetSink = this._createPacketSink();
 			const keyPacket = await packetSink.getKeyPacket(startTimestamp, packetRetrievalOptions)
@@ -557,7 +553,8 @@ export abstract class BaseMediaSampleSink<
 			await packets.next(); // Skip the start packet as we already have it
 
 			while (currentPacket && !ended && !this._track.input._disposed) {
-				if (sampleQueue.length + decoder.getDecodeQueueSize() >= MAX_QUEUE_SIZE) {
+				const maxQueueSize = computeMaxQueueSize(sampleQueue.length);
+				if (sampleQueue.length + decoder.getDecodeQueueSize() > maxQueueSize) {
 					({ promise: queueDequeue, resolve: onQueueDequeue } = promiseWithResolvers());
 					await queueDequeue;
 					continue;
@@ -719,7 +716,6 @@ export abstract class BaseMediaSampleSink<
 					onQueueNotEmpty();
 				}
 			});
-			decoder.onDequeue = () => onQueueDequeue();
 
 			const packetSink = this._createPacketSink();
 			let lastPacket: EncodedPacket | null = null;
@@ -738,7 +734,8 @@ export abstract class BaseMediaSampleSink<
 				decoder.decode(currentPacket);
 
 				while (currentPacket.sequenceNumber < maxSequenceNumber) {
-					while (sampleQueue.length + decoder.getDecodeQueueSize() >= MAX_QUEUE_SIZE && !terminated) {
+					const maxQueueSize = computeMaxQueueSize(sampleQueue.length);
+					while (sampleQueue.length + decoder.getDecodeQueueSize() > maxQueueSize && !terminated) {
 						({ promise: queueDequeue, resolve: onQueueDequeue } = promiseWithResolvers());
 						await queueDequeue;
 					}
@@ -883,6 +880,13 @@ export abstract class BaseMediaSampleSink<
 	}
 }
 
+const computeMaxQueueSize = (decodedSampleQueueSize: number) => {
+	// If we have decoded samples lying around, limit the total queue size to a small value (decoded samples can use up
+	// a lot of memory). If not, we're fine with a much bigger queue of encoded packets waiting to be decoded. In fact,
+	// some decoders only start flushing out decoded chunks when the packet queue is large enough.
+	return decodedSampleQueueSize === 0 ? 40 : 8;
+};
+
 class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 	decoder: VideoDecoder | null = null;
 
@@ -1023,9 +1027,6 @@ class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 					this.onError(error);
 				},
 			});
-			this.decoder.addEventListener('dequeue', () => {
-				this.onDequeue?.();
-			});
 			this.decoder.configure(this.decoderConfig);
 		}
 	}
@@ -1057,10 +1058,7 @@ class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 			void this.customDecoderCallSerializer
 				.call(() => this.customDecoder!.decode(packet))
 				.catch(error => this.onError(error))
-				.finally(() => {
-					this.customDecoderQueueSize--;
-					this.onDequeue?.();
-				});
+				.finally(() => this.customDecoderQueueSize--);
 		} else {
 			assert(this.decoder);
 
@@ -1189,9 +1187,6 @@ class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 					error.stack = stack; // Provide a more useful stack trace, the default one sucks
 					this.onError(error);
 				},
-			});
-			this.alphaDecoder.addEventListener('dequeue', () => {
-				this.onDequeue?.();
 			});
 			this.alphaDecoder.configure({
 				...this.decoderConfig,
@@ -2284,9 +2279,6 @@ class AudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 					this.onError(error);
 				},
 			});
-			this.decoder.addEventListener('dequeue', () => {
-				this.onDequeue?.();
-			});
 			this.decoder.configure(decoderConfig);
 		}
 	}
@@ -2306,10 +2298,7 @@ class AudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 			void this.customDecoderCallSerializer
 				.call(() => this.customDecoder!.decode(packet))
 				.catch(error => this.onError(error))
-				.finally(() => {
-					this.customDecoderQueueSize--;
-					this.onDequeue?.();
-				});
+				.finally(() => this.customDecoderQueueSize--);
 		} else {
 			assert(this.decoder);
 
@@ -2717,5 +2706,81 @@ export class AudioBufferSink {
 			this._audioSampleSink.samplesAtTimestamps(timestamps, options),
 			data => data && this._audioSampleToWrappedArrayBuffer(data),
 		);
+	}
+}
+
+/**
+ * Sink for reading the cues of a subtitle track.
+ *
+ * A cue that outlives one packet is written into every packet it overlaps - split into parts by the ISOBMFF
+ * WebVTT rules, or repeated whole by a self-timed TTML document. This sink rejoins those parts, so a cue that
+ * spans a segment boundary is yielded once, with the timing and text it was written with.
+ *
+ * @group Media sinks
+ * @public
+ */
+export class SubtitleCueSink {
+	/** @internal */
+	_track: InputSubtitleTrack;
+
+	/** Creates a new {@link SubtitleCueSink} for the given {@link InputSubtitleTrack}. */
+	constructor(subtitleTrack: InputSubtitleTrack) {
+		if (!(subtitleTrack instanceof InputSubtitleTrack)) {
+			throw new TypeError('subtitleTrack must be an InputSubtitleTrack.');
+		}
+
+		this._track = subtitleTrack;
+	}
+
+	/**
+	 * Creates an async iterator that yields the track's cues in ascending order of their start timestamp.
+	 *
+	 * @param startTimestamp - The timestamp in seconds at which to start yielding cues (inclusive).
+	 * @param endTimestamp - The timestamp in seconds at which to stop yielding cues (exclusive).
+	 * @param options - Options used for the underlying packet retrieval.
+	 */
+	async* cues(
+		startTimestamp = -Infinity,
+		endTimestamp = Infinity,
+		options: PacketRetrievalOptions = {},
+	): AsyncGenerator<SubtitleCue, void, unknown> {
+		validateTimestamp(startTimestamp);
+		validateTimestamp(endTimestamp);
+
+		const packetSink = new EncodedPacketSink(this._track);
+		// The parts of a cue live in the packet bodies, so cues can never be recovered from metadata alone.
+		const packetOptions: PacketRetrievalOptions = { ...options, metadataOnly: false };
+
+		// The whole track is read before anything is yielded: a cue's last part can be arbitrarily far from
+		// its first, and only once every part is in can the cues be ordered by start timestamp.
+		const cuesByKey = new Map<string, SubtitleCue>();
+
+		for await (const packet of packetSink.packets(undefined, undefined, packetOptions)) {
+			for (const decoded of this._track._backing.decodeCues(packet)) {
+				const key = decoded.continuationId !== null
+					? `id:${decoded.continuationId}`
+					: `cue:${decoded.cue.timestamp}:${decoded.cue.identifier ?? ''}:${decoded.cue.text}`;
+
+				const openCue = cuesByKey.get(key);
+				if (!openCue) {
+					cuesByKey.set(key, decoded.cue);
+					continue;
+				}
+
+				const end = Math.max(
+					openCue.timestamp + openCue.duration,
+					decoded.cue.timestamp + decoded.cue.duration,
+				);
+				openCue.duration = end - openCue.timestamp;
+			}
+		}
+
+		const cues = [...cuesByKey.values()].sort((a, b) => a.timestamp - b.timestamp);
+
+		for (const cue of cues) {
+			if (cue.timestamp + cue.duration > startTimestamp && cue.timestamp < endTimestamp) {
+				yield cue;
+			}
+		}
 	}
 }

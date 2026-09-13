@@ -59,7 +59,6 @@ import {
 	OPUS_SAMPLE_RATE,
 	PCM_AUDIO_CODECS,
 	PcmAudioCodec,
-	SubtitleCodec,
 	generateAv1CodecConfigurationFromCodecString,
 	generateVp9CodecConfigurationFromCodecString,
 	parsePcmCodec,
@@ -787,10 +786,10 @@ export class MatroskaMuxer extends Muxer {
 			} else if (trackData.type === 'audio') {
 				return trackData.info.decoderConfig.codec;
 			} else {
-				const map: Record<SubtitleCodec, string> = {
-					webvtt: 'wvtt',
-				};
-				return map[trackData.track.source._codec];
+				// Matroska defines no TTML codec ID, so the format declares no support and the track is
+				// refused long before it can reach here.
+				assert(trackData.track.source._codec === 'webvtt');
+				return 'wvtt';
 			}
 		});
 
@@ -1386,23 +1385,24 @@ export class MatroskaMuxer extends Muxer {
 		}
 	}
 
-	// eslint-disable-next-line @typescript-eslint/no-misused-promises
 	override async onTrackClose(track: OutputTrack) {
 		const release = await this.mutex.acquire();
 
-		const trackData = this.trackDatas.find(x => x.track === track);
-		if (trackData) {
-			trackData.closed = true;
+		try {
+			const trackData = this.trackDatas.find(x => x.track === track);
+			if (trackData) {
+				trackData.closed = true;
+			}
+
+			if (this.allTracksAreKnown()) {
+				this.allTracksKnown.resolve();
+			}
+
+			// Since a track is now closed, we may be able to write out chunks that were previously waiting
+			await this.interleaveChunks();
+		} finally {
+			release();
 		}
-
-		if (this.allTracksAreKnown()) {
-			this.allTracksKnown.resolve();
-		}
-
-		// Since a track is now closed, we may be able to write out chunks that were previously waiting
-		await this.interleaveChunks();
-
-		release();
 	}
 
 	/** Finalizes the file, making it ready for use. Must be called after all media chunks have been added. */

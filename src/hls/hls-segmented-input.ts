@@ -29,6 +29,7 @@ import {
 	TAG_DISCONTINUITY,
 	TAG_ENDLIST,
 	TAG_EXTINF,
+	TAG_I_FRAMES_ONLY,
 	TAG_KEY,
 	TAG_MAP,
 	TAG_MEDIA_SEQUENCE,
@@ -76,6 +77,7 @@ export class HlsSegmentedInput extends SegmentedInput {
 	streamHasEnded = false;
 	lastSegmentUpdateTime = -Infinity;
 	refreshInterval = 5; // Reasonable default in case the playlist doesn't specify it
+	implicitInitSegments = new WeakSet<HlsSegment>();
 
 	constructor(
 		demuxer: HlsDemuxer,
@@ -155,6 +157,8 @@ export class HlsSegmentedInput extends SegmentedInput {
 		let nextByteRange: { offset: number; length: number } | null = null;
 		let lastProgramDateTimeSeconds: number | null = null;
 		let targetDuration: number | null = null;
+		let playlistType: string | null = null;
+		let iFramesOnly = false;
 		let segmentSeen = false;
 
 		// Used for repeated parses where our job it is to only add the new segments
@@ -239,6 +243,29 @@ export class HlsSegmentedInput extends SegmentedInput {
 						length: nextByteRange?.length ?? null,
 					};
 
+					if (
+						iFramesOnly
+						&& currentFirstSegment === null
+						&& currentInitSegment === null
+						&& location.offset > 0
+						&& !(currentKey?.method === 'AES-128' && !currentKey.iv)
+					) {
+						// RFC 8216 §4.3.2.5: without #EXT-X-MAP, the bytes before the first I-frame are its init
+						const initSegment: HlsSegment = {
+							timestamp: accumulatedTime,
+							unixEpochTimestamp: accumulatedUnixTime,
+							firstSegment: null,
+							sequenceNumber: null,
+							location: { path: fullPath, offset: 0, length: location.offset },
+							duration: 0,
+							encryption: currentKey,
+							initSegment: null,
+							lastProgramDateTimeSeconds,
+						};
+						this.implicitInitSegments.add(initSegment);
+						currentInitSegment = initSegment;
+					}
+
 					const segment: HlsSegment = {
 						timestamp: accumulatedTime,
 						unixEpochTimestamp: accumulatedUnixTime,
@@ -280,8 +307,13 @@ export class HlsSegmentedInput extends SegmentedInput {
 				}
 
 				if (!segmentSeen) {
-					if (lastProgramDateTimeSeconds === null && nextSequenceNumber > 0 && targetDuration !== null) {
-						// Offset the first segment's start timestamp by the following:
+					// VOD and EVENT playlists never drop segments (RFC 8216 §4.3.3.5)
+					if (
+						playlistType === null
+						&& lastProgramDateTimeSeconds === null
+						&& nextSequenceNumber > 0
+						&& targetDuration !== null
+					) {
 						accumulatedTime = nextSequenceNumber * targetDuration;
 					}
 
@@ -423,7 +455,10 @@ export class HlsSegmentedInput extends SegmentedInput {
 							&& bytes[7] === 0x68
 						) {
 							const size = toDataView(bytes).getUint32(0);
-							psshBox = parsePsshBoxContents(bytes.subarray(8, Math.min(size, bytes.length)));
+							psshBox = {
+								...parsePsshBoxContents(bytes.subarray(8, Math.min(size, bytes.length))),
+								bytes,
+							};
 						}
 					}
 
@@ -503,8 +538,12 @@ export class HlsSegmentedInput extends SegmentedInput {
 				}
 			} else if (line === TAG_DISCONTINUITY) {
 				currentFirstSegment = null;
-				// Note: the init segment is not reset; the #EXT-X-MAP statement simply lasts until the next
-				// #EXT-X-MAP statement.
+				// An #EXT-X-MAP lasts until the next one; an implicit I-frame init ends here
+				if (currentInitSegment && this.implicitInitSegments.has(currentInitSegment)) {
+					currentInitSegment = null;
+				}
+			} else if (line === TAG_I_FRAMES_ONLY) {
+				iFramesOnly = true;
 			} else if (line.startsWith(TAG_TARGETDURATION)) {
 				const value = line.slice(TAG_TARGETDURATION.length);
 				const duration = Number(value);
@@ -520,6 +559,7 @@ export class HlsSegmentedInput extends SegmentedInput {
 				break; // No need to keep reading after this
 			} else if (line.startsWith(TAG_PLAYLIST_TYPE)) {
 				const type = line.slice(TAG_PLAYLIST_TYPE.length);
+				playlistType = type;
 				if (type.toLowerCase() === 'vod') {
 					// A VOD playlist cannot be updated per spec so we can be sure the stream has ended
 					this.streamHasEnded = true;
@@ -530,6 +570,22 @@ export class HlsSegmentedInput extends SegmentedInput {
 		if (!headerRead) {
 			throw new Error('Invalid M3U8 file; no #EXTM3U header.');
 		}
+	}
+
+	override getPairedSegmentedInputs() {
+		const tracks = this.demuxer.internalTracks ?? [];
+		const ownTracks = tracks.filter(x => x.fullPath === this.path);
+		const pairingMask = ownTracks.reduce((mask, x) => mask | x.pairingMask, 0n);
+		const isOpen = (path: string) => this.demuxer.segmentedInputs.some(x => x.path === path && x.firstSegment);
+		// Renditions of a type this one already has are alternatives to it, not played alongside it
+		const paired = tracks
+			.filter(x => (x.pairingMask & pairingMask) !== 0n && !ownTracks.some(y => y.info.type === x.info.type))
+			.sort((a, b) => Number(isOpen(b.fullPath)) - Number(isOpen(a.fullPath)));
+
+		// Variants of one type share timestamps (RFC 8216 §6.2.4); an open one costs no requests
+		return paired
+			.filter((x, i) => paired.findIndex(y => y.info.type === x.info.type) === i)
+			.map(x => this.demuxer.getSegmentedInputForPath(x.fullPath));
 	}
 
 	async getFirstSegment() {

@@ -103,6 +103,14 @@ export abstract class Source extends EventEmitter<SourceEvents> {
 	 */
 	_refFinalizationRegistry: FinalizationRegistry<Source> | null = null;
 
+	/**
+	 * Marked `true` by `DashInputFormat._canReadInput` when this source is
+	 * the root of a DASH manifest; sub-source disposal hygiene uses the same
+	 * mechanism as HLS.
+	 * @internal
+	 */
+	_usedForDash = false;
+
 	/** @internal */
 	private _sizePromise: Promise<number | null> | null = null;
 
@@ -111,6 +119,17 @@ export abstract class Source extends EventEmitter<SourceEvents> {
 
 		if (typeof FinalizationRegistry !== 'undefined') {
 			this._refFinalizationRegistry = new FinalizationRegistry((source) => {
+				// Reaching here means .free() was never called; free() unregisters. HLS and DASH reading
+				// evict cached segment inputs without disposing them — an evicted one may still be being
+				// read — and leave the refs to the registry by design, so the warning would be noise there.
+				if (!source._usedForHls && !source._usedForDash) {
+					Logging._warn(
+						'A SourceRef was garbage-collected without being freed. Hold on to the ref and call .free()'
+						+ ' when done, otherwise the source can dispose itself at an arbitrary later point and'
+						+ ' unrelated reads will fail with InputDisposedError.',
+					);
+				}
+
 				source._decrementRefCount();
 			});
 		}
@@ -124,7 +143,7 @@ export abstract class Source extends EventEmitter<SourceEvents> {
 	 */
 	async getSizeOrNull() {
 		if (this._disposed) {
-			throw new InputDisposedError();
+			throw new InputDisposedError('Cannot get the source size; the source has been disposed.');
 		}
 
 		return this._sizePromise ??= (async () => {
@@ -149,7 +168,7 @@ export abstract class Source extends EventEmitter<SourceEvents> {
 	 */
 	async getSize() {
 		if (this._disposed) {
-			throw new InputDisposedError();
+			throw new InputDisposedError('Cannot get the source size; the source has been disposed.');
 		}
 
 		const result = await this.getSizeOrNull();
@@ -158,6 +177,50 @@ export abstract class Source extends EventEmitter<SourceEvents> {
 		}
 
 		return result;
+	}
+
+	/**
+	 * Resolves with the bytes in the range `[start, end)`, or with null if that range lies outside the source's data.
+	 *
+	 * The returned bytes are a copy owned by the caller. Throws if the source provides fewer bytes than the range
+	 * asks for, rather than returning a short result that reads as the whole range.
+	 */
+	async readRange(start: number, end: number) {
+		if (this._disposed) {
+			throw new InputDisposedError(`Cannot read bytes [${start}, ${end}); the source has been disposed.`);
+		}
+		if (!isNumber(start) || !Number.isInteger(start) || start < 0) {
+			throw new TypeError('start must be a non-negative integer.');
+		}
+		if (!isNumber(end) || !Number.isInteger(end) || end < start) {
+			throw new TypeError('end must be an integer greater than or equal to start.');
+		}
+
+		if (start === end) {
+			return new Uint8Array(0);
+		}
+
+		const fileSize = this._getFileSize();
+		if (typeof fileSize === 'number' && end > fileSize) {
+			return null;
+		}
+
+		const result = await this._read(start, end, DEFAULT_MIN_READ_POSITION, DEFAULT_MAX_READ_POSITION);
+		if (!result) {
+			return null;
+		}
+
+		const bufferStart = start - result.offset;
+		const bytes = result.bytes.slice(bufferStart, bufferStart + (end - start));
+		// Serving fewer bytes as if they were the whole range is worse than failing
+		if (bytes.length !== end - start) {
+			throw new Error(
+				`Short read: asked for bytes [${start}, ${end}) but the source provided ${bytes.length} of`
+				+ ` ${end - start}.`,
+			);
+		}
+
+		return bytes;
 	}
 
 	/**
@@ -325,6 +388,7 @@ export abstract class PathedSource extends Source {
 				: result;
 
 			ref.source._usedForHls ||= this._usedForHls;
+			ref.source._usedForDash ||= this._usedForDash;
 
 			return ref;
 		};
@@ -971,10 +1035,11 @@ export class UrlSource extends PathedSource {
 			outer:
 			if (
 				this._orchestrator.fileSize === null
-				// Content-Range/Length fields are meaningless if Content-Encoding is present. Content-Encoding is
-				// basically never used for range responses (since the encoding runs *before* the slicing), so we're set
-				// in that case.
-				&& (response.status === 206 || (response.type === 'basic' && !response.headers.has('Content-Encoding')))
+				// Content-Range/Length fields are meaningless if Content-Encoding is present: they count encoded
+				// bytes, while the reader addresses decoded ones. This holds for 206s too — some CDNs (Apple's
+				// among them) do answer range requests with a content coding, stating the compressed total.
+				&& !response.headers.has('Content-Encoding')
+				&& (response.status === 206 || response.type === 'basic')
 			) {
 				// See if we can deduce the file size from the response
 
@@ -1054,7 +1119,7 @@ export class UrlSource extends PathedSource {
 					return;
 				}
 
-				let readResult: ReadableStreamReadResult<Uint8Array>;
+				let readResult: Awaited<ReturnType<typeof reader.read>>;
 
 				try {
 					readResult = await reader.read();
@@ -1925,7 +1990,9 @@ export class ReadableStreamSource extends Source {
 	/** @internal */
 	_dispose() {
 		for (const pendingSlice of this._pendingSlices) {
-			pendingSlice.reject(new InputDisposedError());
+			pendingSlice.reject(new InputDisposedError(
+				`Cannot read bytes [${pendingSlice.start}, ${pendingSlice.end}); the source has been disposed.`,
+			));
 		}
 
 		this._pendingSlices.length = 0;
@@ -1985,6 +2052,16 @@ const PREFETCH_PROFILES = {
 
 				const extent = Math.min(b, a);
 				end = Math.max(end, worker.startPos + extent);
+			}
+
+			// A read ending just before a worker's region means the file is being walked backwards (such as when
+			// rewinding to a previous packet), so grow the start the same way instead of paying one request per
+			// padding step.
+			if (end <= worker.startPos && end > worker.startPos - paddingStart) {
+				const size = worker.targetPos - worker.startPos;
+				const extent = Math.min(2 ** Math.ceil(Math.log2(size + 1)), maxExtensionAmount);
+				const extendedStart = Math.floor((worker.startPos - extent) / paddingStart) * paddingStart;
+				start = Math.max(0, Math.min(start, extendedStart));
 			}
 		}
 
@@ -2692,7 +2769,10 @@ class ReadOrchestrator {
 	dispose() {
 		for (const worker of this.workers) {
 			for (const slice of worker.pendingSlices) {
-				slice.reject(new InputDisposedError());
+				slice.reject(new InputDisposedError(
+					`Cannot read bytes [${slice.start}, ${slice.start + slice.bytes.length});`
+					+ ` the source has been disposed.`,
+				));
 			}
 
 			worker.pendingSlices.length = 0;
@@ -2706,7 +2786,10 @@ class ReadOrchestrator {
 
 		for (const queuedRead of this.queuedReads) {
 			for (const slice of queuedRead.pendingSlices) {
-				slice.reject(new InputDisposedError());
+				slice.reject(new InputDisposedError(
+					`Cannot read bytes [${slice.start}, ${slice.start + slice.bytes.length});`
+					+ ` the source has been disposed.`,
+				));
 			}
 		}
 

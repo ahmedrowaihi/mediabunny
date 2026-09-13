@@ -262,6 +262,83 @@ test('UrlSource reads the full decoded body of a compressed response', async () 
 	}
 });
 
+test('UrlSource reads the full decoded body of a compressed 206 response', async () => {
+	// A 206 carrying Content-Encoding states its Content-Range in COMPRESSED bytes, so trusting that total
+	// truncates the decoded document. Apple's CDN answers range requests this way intermittently.
+	const text = 'Some playlist text\n'.repeat(256);
+	const content = Buffer.from(text);
+	const compressed = brotliCompressSync(content);
+	const server = http.createServer((req, res) => {
+		res.writeHead(206, {
+			'Content-Type': 'text/plain',
+			'Content-Encoding': 'br',
+			'Content-Range': `bytes 0-${compressed.byteLength - 1}/${compressed.byteLength}`,
+			'Content-Length': compressed.byteLength,
+			'Accept-Ranges': 'bytes',
+		});
+		res.end(compressed);
+	});
+
+	await new Promise<void>(resolve => server.listen(0, resolve));
+
+	try {
+		const address = server.address();
+		assert(address && typeof address !== 'string');
+		const source = new UrlSource(`http://localhost:${address.port}/playlist.m3u8`);
+		using ref = source.ref();
+		const reader = new Reader(ref.source);
+
+		const slice = await reader.requestEntireFile();
+		expect(slice).not.toBeNull();
+		expect(compressed.byteLength).toBeLessThan(content.byteLength);
+		expect(slice!.length).toBe(content.byteLength);
+		expect(Buffer.from(readBytes(slice!, slice!.length)).toString()).toBe(text);
+	} finally {
+		server.closeAllConnections();
+		server.close();
+	}
+});
+
+test('UrlSource prefetches growing blocks when a file is read back to front', async () => {
+	const fileSize = 16 * 2 ** 20;
+	let requestCount = 0;
+
+	const server = http.createServer((req, res) => {
+		requestCount++;
+
+		const match = /bytes=(\d+)-(\d*)/.exec(req.headers.range ?? '');
+		assert(match);
+		const start = Number(match[1]);
+		const end = match[2] ? Math.min(Number(match[2]) + 1, fileSize) : fileSize;
+
+		res.on('error', () => {}); // The client may abort the connection at any time
+		res.writeHead(206, {
+			'Content-Length': end - start,
+			'Content-Range': `bytes ${start}-${end - 1}/${fileSize}`,
+		});
+		res.end(Buffer.alloc(end - start));
+	});
+	await new Promise<void>(resolve => server.listen(0, resolve));
+
+	try {
+		const address = server.address();
+		assert(address && typeof address !== 'string');
+		const source = new UrlSource(`http://localhost:${address.port}/file`);
+		using ref = source.ref();
+		const reader = new Reader(ref.source);
+
+		// Like a demuxer rewinding packet by packet, 8 MiB back from the end
+		for (let pos = fileSize - 188; pos >= fileSize - 8 * 2 ** 20; pos -= 188) {
+			await reader.requestSlice(pos, 4);
+		}
+
+		expect(requestCount).toBeLessThanOrEqual(20);
+	} finally {
+		server.closeAllConnections();
+		server.close();
+	}
+});
+
 const startRangelessServer = async (
 	options: { responseByteLimits?: number[]; trailingPaddingSize?: number } = {},
 ) => {

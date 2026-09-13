@@ -75,6 +75,8 @@ export abstract class SegmentedInput {
 	firstSegment: Segment | null = null;
 	firstSegmentFirstTimestamps = new WeakMap<Segment, number>();
 
+	timelineCorrectionPromise: Promise<number> | null = null;
+
 	constructor(input: Input, path: string, trackDeclarations: SegmentedInputTrackDeclaration[] | null) {
 		this.input = input;
 		this.path = path;
@@ -88,6 +90,11 @@ export abstract class SegmentedInput {
 	abstract getInputForSegment(segment: Segment): Input;
 
 	abstract getLiveRefreshInterval(): Promise<number | null>;
+
+	// Renditions playable alongside this one, at most one per track type
+	getPairedSegmentedInputs(): SegmentedInput[] {
+		return [];
+	}
 
 	async getDurationFromMetadata(options: DurationMetadataRequestOptions) {
 		const lastSegment = await this.getSegmentAt(Infinity, {
@@ -169,16 +176,28 @@ export abstract class SegmentedInput {
 		})();
 	}
 
+	// The segments' timestamps are assumed to lie on one shared timeline (until the next discontinuity), which we
+	// align to the playlist using the first segment
 	async getMediaOffset(segment: Segment, input: Input) {
 		const format = await input.getFormat();
-		if (!format.supportsTimestampedMediaData) {
+		const firstSegment = segment.firstSegment ?? segment;
+
+		// An untimestamped format starts at zero unless the file states a start outright (RFC 8216 §3.4).
+		// A tag stating zero is not no tag, so this asks whether one was read, not whether it was non-zero.
+		// Decided before reading any first timestamp, so this path costs nothing it did upstream.
+		if (
+			!format.supportsTimestampedMediaData
+			&& !await this.getInputForSegment(firstSegment)._hasExplicitStartTimestamp()
+		) {
 			return segment.timestamp;
 		}
 
-		// The segments' timestamps are assumed to lie on one shared timeline (until the next discontinuity), which we
-		// align to the playlist using the first segment
-		const firstSegment = segment.firstSegment ?? segment;
+		return firstSegment.timestamp
+			- await this.getFirstSegmentFirstTimestamp(firstSegment)
+			+ await this.getTimelineCorrection();
+	}
 
+	private async getFirstSegmentFirstTimestamp(firstSegment: Segment) {
 		let firstSegmentFirstTimestamp = this.firstSegmentFirstTimestamps.get(firstSegment);
 		if (firstSegmentFirstTimestamp === undefined) {
 			const firstInput = this.getInputForSegment(firstSegment);
@@ -186,7 +205,37 @@ export abstract class SegmentedInput {
 			this.firstSegmentFirstTimestamps.set(firstSegment, firstSegmentFirstTimestamp);
 		}
 
-		return firstSegment.timestamp - firstSegmentFirstTimestamp;
+		return firstSegmentFirstTimestamp;
+	}
+
+	async getFirstSegmentMediaOffset() {
+		const firstSegment = await this.getFirstSegment({});
+		if (!firstSegment) {
+			return null;
+		}
+
+		return firstSegment.timestamp - await this.getFirstSegmentFirstTimestamp(firstSegment);
+	}
+
+	// Renditions share one media timeline (RFC 8216 §6.2.4), so a later-starting one keeps its lag
+	getTimelineCorrection() {
+		return this.timelineCorrectionPromise ??= (async () => {
+			const ownOffset = await this.getFirstSegmentMediaOffset();
+			if (ownOffset === null) {
+				return 0;
+			}
+
+			let correction = 0;
+			for (const other of this.getPairedSegmentedInputs()) {
+				const otherOffset = await other.getFirstSegmentMediaOffset().catch(() => null);
+				// Renditions more than 0.5 s apart are treated as separate timelines, not as one with a lag
+				if (otherOffset !== null && Math.abs(otherOffset - ownOffset) <= 0.5) {
+					correction = Math.max(correction, otherOffset - ownOffset);
+				}
+			}
+
+			return correction;
+		})();
 	}
 
 	dispose() {
@@ -291,6 +340,10 @@ class SegmentedInputInputTrackBacking implements InputTrackBacking {
 
 	getInternalCodecId() {
 		return this.delegate(() => this.firstInputTrack!._backing.getInternalCodecId());
+	}
+
+	getEncryptionInfo() {
+		return this.delegate(() => this.firstInputTrack!._backing.getEncryptionInfo());
 	}
 
 	getDisposition() {

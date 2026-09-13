@@ -1,9 +1,18 @@
 /* eslint-disable @stylistic/max-len */
-import { ALL_FORMATS, BufferSource, EncodedPacketSink, Input, InputAudioTrack, InputVideoTrack, UrlSource } from 'mediabunny';
+import { ALL_FORMATS } from '../../src/input-format.js';
+import { EncodedPacketSink } from '../../src/media-sink.js';
+import { Input } from '../../src/input.js';
+import { InputAudioTrack, InputVideoTrack } from '../../src/input-track.js';
+import { BufferSource, UrlSource } from '../../src/source.js';
 import { expect, test, vi } from 'vitest';
 import { HLS, HLS_FORMATS, HlsInputFormat, MP4 } from '../../src/input-format.js';
 import { assert, hexStringToBytes, rejectAfter } from '../../src/misc.js';
 import { CustomPathedSource } from '../../src/source.js';
+import { Output } from '../../src/output.js';
+import { CmafOutputFormat, HlsOutputFormat } from '../../src/output-format.js';
+import { BufferTarget, PathedTarget } from '../../src/target.js';
+import { EncodedVideoPacketSource } from '../../src/media-source.js';
+import { EncodedPacket } from '../../src/packet.js';
 
 // A lot of test cases taken from:
 // https://github.com/video-dev/hls.js/blob/master/tests/test-streams.js
@@ -390,9 +399,9 @@ test.concurrent('Out-of-band audio track via ADTS', { timeout: 15_000 }, async (
 		lastTimestamp = packet.timestamp;
 	}
 
-	// This way we test that the two are synced up
-	expect(await videoTrack.getFirstTimestamp()).toBe(await audioTrack.getFirstTimestamp());
-	expect(await videoTrack.computeDuration()).toBeCloseTo(await audioTrack.computeDuration(), 1);
+	// Video starts 1/9 s after audio
+	expect(await videoTrack.getFirstTimestamp() - await audioTrack.getFirstTimestamp()).toBeCloseTo(1 / 9, 6);
+	expect(await videoTrack.computeDuration()).toBeCloseTo(await audioTrack.computeDuration() + 1 / 9, 1);
 });
 
 test.concurrent('MP3 audio only', { timeout: 15_000 }, async () => {
@@ -426,8 +435,9 @@ test.concurrent('fMP4', { timeout: 15_000 }, async () => {
 	expect(await audioTrack.getNumberOfChannels()).toBe(2);
 	expect(await audioTrack.getSampleRate()).toBe(48000);
 
-	expect(await videoTrack.getFirstTimestamp()).toBe(0);
-	expect(await videoTrack.computeDuration()).toBe(60);
+	// The audio rendition begins one AAC frame of priming before the video
+	expect(await videoTrack.getFirstTimestamp()).toBeCloseTo(1024 / 48000, 4);
+	expect(await videoTrack.computeDuration()).toBeCloseTo(60 + 1024 / 48000, 4);
 
 	expect(await audioTrack.getFirstTimestamp()).toBe(0);
 	expect(await audioTrack.computeDuration()).toBeCloseTo(60.021333);
@@ -512,10 +522,12 @@ test.concurrent('fMP4 Bitmovin', { timeout: 15_000 }, async () => {
 	const videoTrack = (await input.getVideoTracks())[0];
 	assert(videoTrack);
 
-	expect(await videoTrack.getFirstTimestamp()).toBe(4);
-	expect(await videoTrack.computeDuration()).toBe(214.28);
+	// Video starts 80 ms after audio
+	expect(await videoTrack.getFirstTimestamp()).toBeCloseTo(0.08, 6);
+	expect(await videoTrack.computeDuration()).toBeCloseTo(210.36, 6);
 
-	expect(sourceCount).toBe(5);
+	// Placing the video fetches the audio rendition's playlist, init and first segment
+	expect(sourceCount).toBe(8);
 });
 
 test.concurrent('Single-value PDT', { timeout: 15_000 }, async () => {
@@ -983,7 +995,8 @@ test.concurrent('Widevine encryption (SAMPLE-AES-CTR) succeeds with string keys'
 	const sink = new EncodedPacketSink(videoTrack);
 	const lastPacket = await sink.getPacket(Infinity);
 	assert(lastPacket);
-	expect(lastPacket.timestamp + lastPacket.duration).toBe(60);
+	// The audio rendition begins one AAC frame of priming before the video
+	expect(lastPacket.timestamp + lastPacket.duration).toBeCloseTo(60 + 1024 / 48000, 4);
 });
 
 test.concurrent('Widevine encryption (SAMPLE-AES-CTR) succeeds with buffer keys', async () => {
@@ -1016,7 +1029,8 @@ test.concurrent('Widevine encryption (SAMPLE-AES-CTR) succeeds with buffer keys'
 	const sink = new EncodedPacketSink(videoTrack);
 	const lastPacket = await sink.getPacket(Infinity);
 	assert(lastPacket);
-	expect(lastPacket.timestamp + lastPacket.duration).toBe(60);
+	// The audio rendition begins one AAC frame of priming before the video
+	expect(lastPacket.timestamp + lastPacket.duration).toBeCloseTo(60 + 1024 / 48000, 4);
 });
 
 test.concurrent('Widevine HLS passes #EXT-X-KEY PSSH boxes to key resolver', async () => {
@@ -1060,7 +1074,8 @@ test.concurrent('Widevine HLS passes #EXT-X-KEY PSSH boxes to key resolver', asy
 	const sink = new EncodedPacketSink(videoTrack);
 	const lastPacket = await sink.getPacket(Infinity);
 	assert(lastPacket);
-	expect(lastPacket.timestamp + lastPacket.duration).toBe(60);
+	// The audio rendition begins one AAC frame of priming before the video
+	expect(lastPacket.timestamp + lastPacket.duration).toBeCloseTo(60 + 1024 / 48000, 4);
 });
 
 test.concurrent('SourceRequest.isRoot', async () => {
@@ -1082,4 +1097,259 @@ test.concurrent('SourceRequest.isRoot', async () => {
 	assert(videoTrack);
 
 	await videoTrack.computeDuration();
+});
+
+const ADTS_FRAME_DURATION = 1024 / 44100;
+
+// AAC-LC, 44.1 kHz, stereo, no CRC; the payload is never decoded
+const adtsFrame = () => {
+	const frame = new Uint8Array(24);
+	frame.set([0xff, 0xf1, 0x50, 0x80, frame.length >> 3, ((frame.length & 7) << 5) | 0x1f, 0xfc]);
+	return frame;
+};
+
+const synchsafe = (value: number) => [value >> 21, value >> 14, value >> 7, value].map(x => x & 0x7f);
+
+// RFC 8216 §3.4: an ID3 PRIV frame carrying the 33-bit 90 kHz timestamp of the segment's first sample
+const transportStreamTimestampTag = (seconds: number) => {
+	const owner = new TextEncoder().encode('com.apple.streaming.transportStreamTimestamp\0');
+	const body = new Uint8Array(owner.length + 8);
+	body.set(owner);
+	new DataView(body.buffer).setBigUint64(owner.length, BigInt(Math.round(seconds * 90_000)));
+
+	return new Uint8Array([
+		...new TextEncoder().encode('ID3'), 4, 0, 0, ...synchsafe(10 + body.length),
+		...new TextEncoder().encode('PRIV'), ...synchsafe(body.length), 0, 0,
+		...body,
+	]);
+};
+
+const packedAudioFiles = (segmentCount: number, timestampTags: boolean) => {
+	const files = new Map<string, Uint8Array>();
+	const lines = ['#EXTM3U', '#EXT-X-TARGETDURATION:6', '#EXT-X-PLAYLIST-TYPE:VOD'];
+	const segmentStarts: number[] = [];
+	const extinfSums: number[] = [];
+
+	let frameCount = 0;
+	let extinfSum = 0;
+	for (let i = 0; i < segmentCount; i++) {
+		// 259 and 258 frames last 6.0140 s and 5.9907 s, which the playlist rounds up to 6.016 and 5.995
+		const frames = i % 2 === 0 ? 259 : 258;
+		const extinf = i % 2 === 0 ? 6.016 : 5.995;
+		const start = frameCount * ADTS_FRAME_DURATION;
+		segmentStarts.push(start);
+		extinfSums.push(extinfSum);
+
+		const tag = timestampTags ? transportStreamTimestampTag(10 + start) : new Uint8Array();
+		const bytes = new Uint8Array(tag.length + frames * 24);
+		bytes.set(tag);
+		for (let j = 0; j < frames; j++) {
+			bytes.set(adtsFrame(), tag.length + j * 24);
+		}
+
+		files.set(`audio-${i}.aac`, bytes);
+		lines.push(`#EXTINF:${extinf},`, `audio-${i}.aac`);
+		frameCount += frames;
+		extinfSum += extinf;
+	}
+
+	lines.push('#EXT-X-ENDLIST');
+	files.set('audio.m3u8', new TextEncoder().encode(lines.join('\n')));
+
+	return { files, segmentStarts, extinfSums };
+};
+
+const serveFiles = (rootPath: string, files: Map<string, Uint8Array>) => new CustomPathedSource(rootPath, ({ path }) => {
+	const body = files.get(path.split('/').pop()!);
+	if (!body) {
+		throw new Error(`No such file: ${path}`);
+	}
+	return new BufferSource(body);
+});
+
+const firstPacketOfLastSegment = async (timestampTags: boolean) => {
+	const { files, segmentStarts, extinfSums } = packedAudioFiles(60, timestampTags);
+	using input = new Input({ source: serveFiles('audio.m3u8', files), formats: ALL_FORMATS });
+	const track = await input.getPrimaryAudioTrack();
+	assert(track);
+
+	const packetIndex = Math.round(segmentStarts.at(-1)! / ADTS_FRAME_DURATION);
+	let index = 0;
+	for await (const packet of new EncodedPacketSink(track).packets()) {
+		if (index++ === packetIndex) {
+			return { timestamp: packet.timestamp, trueStart: segmentStarts.at(-1)!, extinfStart: extinfSums.at(-1)! };
+		}
+	}
+	throw new Error('Stream ended early');
+};
+
+test('Packed audio segments are placed by their ID3 transport stream timestamp, not by EXTINF', async () => {
+	const tagged = await firstPacketOfLastSegment(true);
+	expect(tagged.extinfStart - tagged.trueStart).toBeGreaterThan(0.18);
+	expect(tagged.timestamp).toBeCloseTo(tagged.trueStart, 3);
+});
+
+test('Packed audio segments without a timestamp tag are placed by EXTINF', async () => {
+	const untagged = await firstPacketOfLastSegment(false);
+	// Packet timestamps snap to whole frames
+	expect(Math.abs(untagged.timestamp - untagged.extinfStart)).toBeLessThan(ADTS_FRAME_DURATION);
+});
+
+const AVC_PACKET = new Uint8Array([
+	0, 0, 0, 1, 9, 240,
+	0, 0, 0, 1, 39, 77, 64, 41, 169, 24, 15, 0, 68, 252, 184, 3, 80, 16, 16, 27, 108, 43, 94, 247, 192, 64,
+	0, 0, 0, 1, 40, 222, 9, 200,
+	0, 0, 0, 1, 37, 184, 32, 32, 33, 68, 197, 0, 1, 87, 155, 239, 190, 251,
+]);
+
+test('Separate renditions keep the start offset between them', async () => {
+	const files = packedAudioFiles(3, false).files;
+
+	const output = new Output({
+		format: new HlsOutputFormat({ segmentFormat: new CmafOutputFormat(), targetDuration: 2 }),
+		target: new PathedTarget('video.m3u8', (request) => {
+			const target = new BufferTarget();
+			target.on('finalized', () => files.set(request.path.split('/').pop()!, new Uint8Array(target.buffer!)));
+			return target;
+		}),
+	});
+	const video = new EncodedVideoPacketSource('avc');
+	output.addVideoTrack(video);
+	await output.start();
+	for (let i = 0; i < 100; i++) {
+		await video.add(
+			new EncodedPacket(AVC_PACKET, i % 25 === 0 ? 'key' : 'delta', 0.12 + i * 0.04, 0.04),
+			i === 0 ? { decoderConfig: { codec: 'avc1.4d401e', codedWidth: 1280, codedHeight: 720 } } : undefined,
+		);
+	}
+	await output.finalize();
+
+	const mediaPlaylist = new TextDecoder().decode(files.get('playlist-1.m3u8'));
+	const initName = /#EXT-X-MAP:URI="([^"]+)"/.exec(mediaPlaylist)![1]!.split('/').pop()!;
+	const firstSegmentName = mediaPlaylist.split('\n').find(line => line !== '' && !line.startsWith('#'))!.split('/').pop()!;
+	files.set('main.m3u8', new TextEncoder().encode([
+		'#EXTM3U',
+		'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="audio",DEFAULT=YES,AUTOSELECT=YES,URI="audio.m3u8"',
+		'#EXT-X-STREAM-INF:BANDWIDTH=200000,CODECS="avc1.4d401e,mp4a.40.2",AUDIO="audio"',
+		'playlist-1.m3u8',
+	].join('\n')));
+
+	using firstSegment = new Input({
+		source: new BufferSource(new Uint8Array([...files.get(initName)!, ...files.get(firstSegmentName)!])),
+		formats: ALL_FORMATS,
+	});
+	expect(await firstSegment.getFirstTimestamp()).toBeCloseTo(0.12, 3);
+
+	using input = new Input({ source: serveFiles('main.m3u8', files), formats: ALL_FORMATS });
+	const videoTrack = await input.getPrimaryVideoTrack();
+	const audioTrack = await input.getPrimaryAudioTrack();
+	assert(videoTrack && audioTrack);
+	expect(await videoTrack.getFirstTimestamp() - await audioTrack.getFirstTimestamp()).toBeCloseTo(0.12, 3);
+});
+
+// A single-file fMP4 media playlist with byte-range segments whose first segment carries tfdt 0
+const singleFileCmafPlaylist = async (playlistType: 'VOD' | 'EVENT' | null) => {
+	const written = new Map<string, Uint8Array>();
+	const output = new Output({
+		format: new HlsOutputFormat({ segmentFormat: new CmafOutputFormat(), targetDuration: 2 }),
+		target: new PathedTarget('video.m3u8', (request) => {
+			const target = new BufferTarget();
+			target.on('finalized', () => written.set(request.path.split('/').pop()!, new Uint8Array(target.buffer!)));
+			return target;
+		}),
+	});
+	const video = new EncodedVideoPacketSource('avc');
+	output.addVideoTrack(video);
+	await output.start();
+	for (let i = 0; i < 100; i++) {
+		await video.add(
+			new EncodedPacket(AVC_PACKET, i % 25 === 0 ? 'key' : 'delta', i * 0.04, 0.04),
+			i === 0 ? { decoderConfig: { codec: 'avc1.4d401e', codedWidth: 1280, codedHeight: 720 } } : undefined,
+		);
+	}
+	await output.finalize();
+
+	const generated = new TextDecoder().decode(written.get('playlist-1.m3u8')).split('\n');
+	const init = written.get(/#EXT-X-MAP:URI="([^"]+)"/.exec(generated.join('\n'))![1]!.split('/').pop()!)!;
+	const lines = ['#EXTM3U', '#EXT-X-VERSION:7', '#EXT-X-TARGETDURATION:7', '#EXT-X-MEDIA-SEQUENCE:1'];
+	if (playlistType) {
+		lines.push(`#EXT-X-PLAYLIST-TYPE:${playlistType}`);
+	}
+	lines.push(`#EXT-X-MAP:URI="media.mp4",BYTERANGE="${init.length}@0"`);
+
+	const chunks = [init];
+	let offset = init.length;
+	for (let i = 0; i < generated.length; i++) {
+		if (!generated[i]!.startsWith('#EXTINF:')) {
+			continue;
+		}
+		const segment = written.get(generated[i + 1]!.split('/').pop()!)!;
+		lines.push(generated[i]!, `#EXT-X-BYTERANGE:${segment.length}@${offset}`, 'media.mp4');
+		chunks.push(segment);
+		offset += segment.length;
+	}
+	if (playlistType === 'VOD') {
+		lines.push('#EXT-X-ENDLIST');
+	}
+
+	const media = new Uint8Array(offset);
+	let position = 0;
+	for (const chunk of chunks) {
+		media.set(chunk, position);
+		position += chunk.length;
+	}
+
+	const firstSegmentLength = chunks[1]!.length;
+	return {
+		files: new Map([['media.m3u8', new TextEncoder().encode(lines.join('\n'))], ['media.mp4', media]]),
+		initAndFirstSegment: media.slice(0, init.length + firstSegmentLength),
+	};
+};
+
+const firstTimestampOfPlaylist = async (playlistType: 'VOD' | 'EVENT' | null) => {
+	const { files, initAndFirstSegment } = await singleFileCmafPlaylist(playlistType);
+
+	using firstSegment = new Input({ source: new BufferSource(initAndFirstSegment), formats: ALL_FORMATS });
+	expect(await firstSegment.getFirstTimestamp()).toBe(0);
+
+	using input = new Input({ source: serveFiles('media.m3u8', files), formats: ALL_FORMATS });
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+	return await track.getFirstTimestamp();
+};
+
+test('VOD and EVENT playlists with a media sequence above 0 start at the media start', async () => {
+	expect(await firstTimestampOfPlaylist('VOD')).toBe(0);
+	expect(await firstTimestampOfPlaylist('EVENT')).toBe(0);
+});
+
+test('Untyped playlists with a media sequence above 0 are placed after the removed segments', async () => {
+	expect(await firstTimestampOfPlaylist(null)).toBe(7);
+});
+
+const firstIFramePacket = async (withMap: boolean) => {
+	const { files } = await singleFileCmafPlaylist('VOD');
+	const lines = new TextDecoder().decode(files.get('media.m3u8')).split('\n')
+		.filter(line => withMap || !line.startsWith('#EXT-X-MAP:'));
+	lines.splice(1, 0, '#EXT-X-I-FRAMES-ONLY');
+	files.set('media.m3u8', new TextEncoder().encode(lines.join('\n')));
+	files.set('main.m3u8', new TextEncoder().encode([
+		'#EXTM3U',
+		'#EXT-X-I-FRAME-STREAM-INF:BANDWIDTH=10000,CODECS="avc1.4d401e",RESOLUTION=1280x720,URI="media.m3u8"',
+	].join('\n')));
+
+	using input = new Input({ source: serveFiles('main.m3u8', files), formats: ALL_FORMATS });
+	const [track] = await input.getVideoTracks();
+	assert(track);
+	expect(await track.hasOnlyKeyPackets()).toBe(true);
+	const packet = await new EncodedPacketSink(track).getFirstPacket();
+	assert(packet);
+	return packet;
+};
+
+test('I-frame playlists without #EXT-X-MAP read the init section before their first I-frame', async () => {
+	const implicit = await firstIFramePacket(false);
+	const explicit = await firstIFramePacket(true);
+	expect(implicit.timestamp).toBe(0);
+	expect(implicit.data).toEqual(explicit.data);
 });

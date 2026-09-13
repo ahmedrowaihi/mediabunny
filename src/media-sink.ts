@@ -24,7 +24,8 @@ import {
 } from './codec-data';
 import { CustomVideoDecoder, customVideoDecoders, CustomAudioDecoder, customAudioDecoders } from './custom-coder';
 import { InputDisposedError } from './input';
-import { InputAudioTrack, InputTrack, InputVideoTrack } from './input-track';
+import { InputAudioTrack, InputSubtitleTrack, InputTrack, InputVideoTrack } from './input-track';
+import { SubtitleCue } from './subtitles';
 import {
 	AnyIterable,
 	assert,
@@ -2659,5 +2660,81 @@ export class AudioBufferSink {
 			this._audioSampleSink.samplesAtTimestamps(timestamps, options),
 			data => data && this._audioSampleToWrappedArrayBuffer(data),
 		);
+	}
+}
+
+/**
+ * Sink for reading the cues of a subtitle track.
+ *
+ * A cue that outlives one packet is written into every packet it overlaps - split into parts by the ISOBMFF
+ * WebVTT rules, or repeated whole by a self-timed TTML document. This sink rejoins those parts, so a cue that
+ * spans a segment boundary is yielded once, with the timing and text it was written with.
+ *
+ * @group Media sinks
+ * @public
+ */
+export class SubtitleCueSink {
+	/** @internal */
+	_track: InputSubtitleTrack;
+
+	/** Creates a new {@link SubtitleCueSink} for the given {@link InputSubtitleTrack}. */
+	constructor(subtitleTrack: InputSubtitleTrack) {
+		if (!(subtitleTrack instanceof InputSubtitleTrack)) {
+			throw new TypeError('subtitleTrack must be an InputSubtitleTrack.');
+		}
+
+		this._track = subtitleTrack;
+	}
+
+	/**
+	 * Creates an async iterator that yields the track's cues in ascending order of their start timestamp.
+	 *
+	 * @param startTimestamp - The timestamp in seconds at which to start yielding cues (inclusive).
+	 * @param endTimestamp - The timestamp in seconds at which to stop yielding cues (exclusive).
+	 * @param options - Options used for the underlying packet retrieval.
+	 */
+	async* cues(
+		startTimestamp = -Infinity,
+		endTimestamp = Infinity,
+		options: PacketRetrievalOptions = {},
+	): AsyncGenerator<SubtitleCue, void, unknown> {
+		validateTimestamp(startTimestamp);
+		validateTimestamp(endTimestamp);
+
+		const packetSink = new EncodedPacketSink(this._track);
+		// The parts of a cue live in the packet bodies, so cues can never be recovered from metadata alone.
+		const packetOptions: PacketRetrievalOptions = { ...options, metadataOnly: false };
+
+		// The whole track is read before anything is yielded: a cue's last part can be arbitrarily far from
+		// its first, and only once every part is in can the cues be ordered by start timestamp.
+		const cuesByKey = new Map<string, SubtitleCue>();
+
+		for await (const packet of packetSink.packets(undefined, undefined, packetOptions)) {
+			for (const decoded of this._track._backing.decodeCues(packet)) {
+				const key = decoded.continuationId !== null
+					? `id:${decoded.continuationId}`
+					: `cue:${decoded.cue.timestamp}:${decoded.cue.identifier ?? ''}:${decoded.cue.text}`;
+
+				const openCue = cuesByKey.get(key);
+				if (!openCue) {
+					cuesByKey.set(key, decoded.cue);
+					continue;
+				}
+
+				const end = Math.max(
+					openCue.timestamp + openCue.duration,
+					decoded.cue.timestamp + decoded.cue.duration,
+				);
+				openCue.duration = end - openCue.timestamp;
+			}
+		}
+
+		const cues = [...cuesByKey.values()].sort((a, b) => a.timestamp - b.timestamp);
+
+		for (const cue of cues) {
+			if (cue.timestamp + cue.duration > startTimestamp && cue.timestamp < endTimestamp) {
+				yield cue;
+			}
+		}
 	}
 }

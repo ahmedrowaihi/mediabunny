@@ -8,6 +8,7 @@
 
 import { Input } from './input';
 import { InputTrackBacking } from './input-track';
+import { PsshBox, SidxBox } from './isobmff/isobmff-misc';
 import { MetadataTags } from './metadata';
 
 /**
@@ -36,6 +37,19 @@ export abstract class Demuxer {
 	abstract getTrackBackings(): Promise<InputTrackBacking[]>;
 	abstract getMimeType(): Promise<string>;
 	abstract getMetadataTags(): Promise<MetadataTags>;
+
+	async getSegmentIndex(): Promise<SidxBox[]> {
+		return [];
+	}
+
+	/**
+	 * Top-level Protection System Specific Header (`pssh`) boxes — typically present once per
+	 * encrypted file under `moov`, one per DRM system. Returns an empty array for non-isobmff
+	 * formats and for clear isobmff files.
+	 */
+	async getPsshBoxes(): Promise<PsshBox[]> {
+		return [];
+	}
 
 	dispose() {
 		// Can be overridden

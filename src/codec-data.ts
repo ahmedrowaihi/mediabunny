@@ -56,6 +56,9 @@ export enum HevcNalUnitType {
 	RASL_N = 8,
 	RASL_R = 9,
 	BLA_W_LP = 16,
+	IDR_W_RADL = 19,
+	IDR_N_LP = 20,
+	CRA_NUT = 21,
 	RSV_IRAP_VCL23 = 23,
 	VPS_NUT = 32,
 	SPS_NUT = 33,
@@ -169,7 +172,8 @@ export const extractNalUnitTypeForAvc = (byte: number) => {
 	return byte & 0x1F;
 };
 
-const removeEmulationPreventionBytes = (data: Uint8Array) => {
+/** @internal */
+export const removeEmulationPreventionBytes = (data: Uint8Array) => {
 	const result: number[] = [];
 	const len = data.length;
 
@@ -954,25 +958,22 @@ export type HevcSpsInfo = {
 export const concatHevcNalUnits = (nalUnits: Uint8Array[], decoderConfig: VideoDecoderConfig) => {
 	if (decoderConfig.description) {
 		// Stream is length-prefixed. Let's extract the size of the length prefix from the decoder config
-
-		const bytes = toUint8Array(decoderConfig.description);
-		const lengthSizeMinusOne = bytes[21]! & 0b11;
-		const lengthSize = (lengthSizeMinusOne + 1) as 1 | 2 | 3 | 4;
-
-		return concatNalUnitsInLengthPrefixed(nalUnits, lengthSize);
+		return concatNalUnitsInLengthPrefixed(nalUnits, hevcNalUnitLengthSize(decoderConfig.description));
 	} else {
 		// Stream is in Annex B format
 		return concatNalUnitsInAnnexB(nalUnits);
 	}
 };
 
+/** The NAL unit length prefix size declared by an HEVCDecoderConfigurationRecord. @internal */
+export const hevcNalUnitLengthSize = (description: AllowSharedBufferSource): 1 | 2 | 3 | 4 => {
+	const bytes = toUint8Array(description);
+	return ((bytes[21]! & 0b11) + 1) as 1 | 2 | 3 | 4;
+};
+
 export const iterateHevcNalUnits = (packetData: Uint8Array, decoderConfig: VideoDecoderConfig) => {
 	if (decoderConfig.description) {
-		const bytes = toUint8Array(decoderConfig.description);
-		const lengthSizeMinusOne = bytes[21]! & 0b11;
-		const lengthSize = (lengthSizeMinusOne + 1) as 1 | 2 | 3 | 4;
-
-		return iterateNalUnitsInLengthPrefixed(packetData, lengthSize);
+		return iterateNalUnitsInLengthPrefixed(packetData, hevcNalUnitLengthSize(decoderConfig.description));
 	} else {
 		return iterateNalUnitsInAnnexB(packetData);
 	}
@@ -1266,7 +1267,8 @@ export const extractHevcDecoderConfigurationRecord = (packetData: Uint8Array) =>
 	}
 };
 
-const parseProfileTierLevel = (
+/** @internal */
+export const parseProfileTierLevel = (
 	bitstream: Bitstream,
 	maxNumSubLayersMinus1: number,
 ) => {
@@ -1338,7 +1340,8 @@ const skipAllStRefPicSets = (bitstream: Bitstream, num_short_term_ref_pic_sets: 
 	}
 };
 
-const skipStRefPicSet = (
+/** @internal */
+export const skipStRefPicSet = (
 	bitstream: Bitstream,
 	stRpsIdx: number,
 	num_short_term_ref_pic_sets: number,

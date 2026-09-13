@@ -7,6 +7,7 @@
  */
 
 import { parseAacAudioSpecificConfig } from '../shared/aac-misc';
+import { type HdrStaticMetadata } from './hdr-metadata';
 import {
 	Av1CodecInfo,
 	AvcDecoderConfigurationRecord,
@@ -26,6 +27,7 @@ import {
 	MATRIX_COEFFICIENTS_MAP_INVERSE,
 	TRANSFER_CHARACTERISTICS_MAP,
 	TRANSFER_CHARACTERISTICS_MAP_INVERSE,
+	videoRangeFromTransferCharacteristics,
 	assert,
 	assertNever,
 	base64ToBytes,
@@ -102,6 +104,7 @@ export const AUDIO_CODECS = [
  */
 export const SUBTITLE_CODECS = [
 	'webvtt',
+	'ttml',
 ] as const; // TODO add the rest
 
 /**
@@ -255,15 +258,49 @@ const PRORES_PROFILE_TARGET_BITRATES: { fourCc: ProresFourCc; bitrate: number; a
 	{ fourCc: 'ap4x', bitrate: 500_000_000, alpha: true }, // 4444 XQ
 ];
 
+/**
+ * List of known video bit depths, per color component.
+ * @group Encoding
+ * @public
+ */
+export const VIDEO_BIT_DEPTHS = [8, 10, 12] as const;
+/**
+ * The bit depth per color component of a video stream.
+ * @group Encoding
+ * @public
+ */
+export type VideoBitDepth = typeof VIDEO_BIT_DEPTHS[number];
+
+const CODEC_BIT_DEPTHS: Record<VideoCodec, VideoBitDepth[]> = {
+	avc: [8, 10],
+	hevc: [8, 10],
+	vp8: [8],
+	vp9: [8, 10, 12],
+	av1: [8, 10],
+	// ProRes stores 10 bits (422) or 12 bits (4444); the four-character code fixes it, so it can't be requested.
+	prores: [],
+};
+
 export const buildVideoCodecString = (
 	codec: VideoCodec,
 	width: number,
 	height: number,
 	bitrate: number,
 	alpha: boolean,
+	bitDepth?: VideoBitDepth,
 ) => {
+	if (bitDepth !== undefined && !CODEC_BIT_DEPTHS[codec].includes(bitDepth)) {
+		const supported = CODEC_BIT_DEPTHS[codec];
+		throw new TypeError(
+			`Codec '${codec}' has no ${bitDepth}-bit profile. `
+			+ (supported.length > 0
+				? `Request ${supported.join(' or ')} bits instead, or pick a different codec.`
+				: `Its bit depth follows from the profile, so leave bitDepth unset.`),
+		);
+	}
+
 	if (codec === 'avc') {
-		const profileIndication = 0x64; // High Profile
+		const profileIndication = bitDepth === 10 ? 0x6e : 0x64; // High 10 Profile / High Profile
 		const totalMacroblocks = Math.ceil(width / 16) * Math.ceil(height / 16);
 
 		// Determine the level based on the table
@@ -279,9 +316,10 @@ export const buildVideoCodecString = (
 		return `avc1.${hexProfileIndication}${hexProfileCompatibility}${hexLevelIndication}`;
 	} else if (codec === 'hevc') {
 		const profilePrefix = ''; // Profile space 0
-		const profileIdc = 1; // Main Profile
+		const profileIdc = bitDepth === 10 ? 2 : 1; // Main 10 Profile / Main Profile
 
-		const compatibilityFlags = '6'; // Taken from the example in ISO 14496-15
+		// Reversed general_profile_compatibility_flags: bit 1 and 2 for Main, bit 2 alone for Main 10.
+		const compatibilityFlags = bitDepth === 10 ? '4' : '6';
 
 		const pictureSize = width * height;
 		const levelInfo = HEVC_LEVEL_TABLE.find(
@@ -298,18 +336,20 @@ export const buildVideoCodecString = (
 	} else if (codec === 'vp8') {
 		return 'vp8'; // Easy, this one
 	} else if (codec === 'vp9') {
-		const profile = '00'; // Profile 0
+		const bits = bitDepth ?? 8;
+		// Profile 0 is 8-bit only and profile 2 is 10- and 12-bit only, so the two must be derived together.
+		const profile = bits === 8 ? '00' : '02';
 
 		const pictureSize = width * height;
 		const levelInfo = VP9_LEVEL_TABLE.find(
 			level => pictureSize <= level.maxPictureSize && bitrate <= level.maxBitrate,
 		) ?? last(VP9_LEVEL_TABLE)!;
 
-		const bitDepth = '08'; // 8-bit
+		const bitDepthString = bits.toString().padStart(2, '0');
 
-		return `vp09.${profile}.${levelInfo.level.toString().padStart(2, '0')}.${bitDepth}`;
+		return `vp09.${profile}.${levelInfo.level.toString().padStart(2, '0')}.${bitDepthString}`;
 	} else if (codec === 'av1') {
-		const profile = 0; // Main Profile, single digit
+		const profile = 0; // Main Profile, single digit; covers both 8 and 10 bits
 
 		const pictureSize = width * height;
 		const levelInfo = AV1_LEVEL_TABLE.find(
@@ -317,9 +357,9 @@ export const buildVideoCodecString = (
 		) ?? last(AV1_LEVEL_TABLE)!;
 		const level = levelInfo.level.toString().padStart(2, '0');
 
-		const bitDepth = '08'; // 8-bit
+		const bitDepthString = (bitDepth ?? 8).toString().padStart(2, '0');
 
-		return `av01.${profile}.${level}${levelInfo.tier}.${bitDepth}`;
+		return `av01.${profile}.${level}${levelInfo.tier}.${bitDepthString}`;
 	} else if (codec === 'prores') {
 		const referencePixels = 1920 * 1080;
 		const scaleFactor = Math.pow((width * height) / referencePixels, 0.95);
@@ -405,6 +445,7 @@ export const extractVideoCodecString = (trackInfo: {
 	codecDescription: Uint8Array | null;
 	colorSpace: VideoColorSpaceInit | null;
 	avcType: 1 | 3 | null;
+	hevcType: 'hvc1' | 'hev1' | null;
 	avcCodecInfo: AvcDecoderConfigurationRecord | null;
 	hevcCodecInfo: HevcDecoderConfigurationRecord | null;
 	vp9CodecInfo: Vp9CodecInfo | null;
@@ -441,6 +482,8 @@ export const extractVideoCodecString = (trackInfo: {
 
 		return `avc${trackInfo.avcType}.${bytesToHexString(codecDescription.subarray(1, 4))}`;
 	} else if (codec === 'hevc') {
+		assert(trackInfo.hevcType !== null);
+
 		let generalProfileSpace: number;
 		let generalProfileIdc: number;
 		let compatibilityFlags: number;
@@ -475,7 +518,8 @@ export const extractVideoCodecString = (trackInfo: {
 			}
 		}
 
-		let codecString = 'hev1.';
+		// The sample entry decides where the parameter sets live, so the string has to follow it.
+		let codecString = `${trackInfo.hevcType}.`;
 
 		codecString += ['', 'A', 'B', 'C'][generalProfileSpace]! + generalProfileIdc;
 		codecString += '.';
@@ -918,22 +962,185 @@ export const inferCodecFromCodecString = (codecString: string): MediaCodec | nul
 	// Subtitle codecs
 	if (codecString === 'webvtt') {
 		return 'webvtt';
+	} else if (codecString === 'ttml' || codecString === 'stpp') {
+		return 'ttml';
 	}
 
 	return null;
 };
 
-export const getVideoEncoderConfigExtension = (codec: VideoCodec) => {
+/**
+ * The bit depth per color component declared by a video codec string, or `null` when the string doesn't state one.
+ * @internal
+ */
+export const extractVideoBitDepth = (codecString: string): VideoBitDepth | null => {
+	if (codecString.startsWith('avc1') || codecString.startsWith('avc3')) {
+		const profileIndication = Number.parseInt(codecString.slice(5, 7), 16);
+		// High 10 (110), High 4:2:2 (122) and High 4:4:4 Predictive (244) are the 10-bit-capable AVC profiles.
+		return [110, 122, 244].includes(profileIndication) ? 10 : 8;
+	} else if (codecString.startsWith('hev1') || codecString.startsWith('hvc1')) {
+		// The profile IDC may be preceded by a profile space letter.
+		const profileIdc = Number(codecString.split('.')[1]?.replace(/^[ABC]/, ''));
+		return profileIdc === 2 ? 10 : 8;
+	} else if (codecString.startsWith('vp09') || codecString.startsWith('av01')) {
+		const bits = Number(codecString.split('.')[3]);
+		return bits === 10 || bits === 12 ? bits : 8;
+	}
+
+	return null;
+};
+
+/** @internal */
+export const transferNeedsTenBits = (transfer: VideoTransferCharacteristics | null | undefined) => {
+	if (!transfer) {
+		return false;
+	}
+
+	const range = videoRangeFromTransferCharacteristics(TRANSFER_CHARACTERISTICS_MAP[transfer]);
+	return range === 'PQ' || range === 'HLG';
+};
+
+// The one place that decides whether HDR10 static metadata may be written: it describes how a PQ or HLG grade was
+// mastered, so it may only sit on an output that still states such a transfer function at a depth able to carry it.
+/** @internal */
+export const outputCarriesHdrSignal = (
+	transfer: VideoTransferCharacteristics | null | undefined,
+	outputBitDepth: VideoBitDepth | null,
+) => transferNeedsTenBits(transfer) && (outputBitDepth === null || outputBitDepth >= 10);
+
+// PQ and HLG are defined from 10 bits up, so demanding one alongside a shallower depth demands a file
+// that states a transfer its samples cannot carry.
+/** @internal */
+export const validateBitDepthCarriesTransfer = (
+	bitDepth: VideoBitDepth | undefined,
+	colorSpace: VideoColorSpaceInit | undefined,
+	prefix: string,
+) => {
+	const transfer = colorSpace?.transfer;
+	if (bitDepth === undefined || bitDepth >= 10 || !transferNeedsTenBits(transfer)) {
+		return;
+	}
+
+	throw new TypeError(
+		`${prefix}colorSpace.transfer '${transfer}' needs at least 10 bits, but ${prefix}bitDepth is ${bitDepth}.`
+		+ ` Raise the bit depth, or leave the transfer function unset.`,
+	);
+};
+
+export const validateVideoColorSpaceInit = (colorSpace: VideoColorSpaceInit, prefix: string) => {
+	if (!colorSpace || typeof colorSpace !== 'object') {
+		throw new TypeError(`${prefix}, when provided, must be an object.`);
+	}
+
+	const primariesValues = Object.keys(COLOR_PRIMARIES_MAP);
+	if (colorSpace.primaries != null && !primariesValues.includes(colorSpace.primaries)) {
+		throw new TypeError(`${prefix} primaries, when defined, must be one of ${primariesValues.join(', ')}.`);
+	}
+
+	const transferValues = Object.keys(TRANSFER_CHARACTERISTICS_MAP);
+	if (colorSpace.transfer != null && !transferValues.includes(colorSpace.transfer)) {
+		throw new TypeError(`${prefix} transfer, when defined, must be one of ${transferValues.join(', ')}.`);
+	}
+
+	const matrixValues = Object.keys(MATRIX_COEFFICIENTS_MAP);
+	if (colorSpace.matrix != null && !matrixValues.includes(colorSpace.matrix)) {
+		throw new TypeError(`${prefix} matrix, when defined, must be one of ${matrixValues.join(', ')}.`);
+	}
+
+	if (colorSpace.fullRange != null && typeof colorSpace.fullRange !== 'boolean') {
+		throw new TypeError(`${prefix} fullRange, when defined, must be a boolean.`);
+	}
+};
+
+const validateUint = (value: unknown, bits: number, name: string) => {
+	// The fields are serialized with setUint16/setUint32, which wrap silently, so an out-of-range value would be
+	// written as a different number than the one that was stated.
+	if (!Number.isInteger(value) || (value as number) < 0 || (value as number) >= 2 ** bits) {
+		throw new TypeError(`${name} must be an integer in [0, ${2 ** bits - 1}].`);
+	}
+};
+
+/** @internal */
+export const validateHdrStaticMetadata = (hdrStaticMetadata: HdrStaticMetadata, prefix: string) => {
+	if (!hdrStaticMetadata || typeof hdrStaticMetadata !== 'object') {
+		throw new TypeError(`${prefix}, when provided, must be an object.`);
+	}
+
+	const masteringDisplay = hdrStaticMetadata.masteringDisplay;
+	if (masteringDisplay != null) {
+		if (typeof masteringDisplay !== 'object') {
+			throw new TypeError(`${prefix} masteringDisplay, when defined, must be an object.`);
+		}
+		if (
+			!Array.isArray(masteringDisplay.displayPrimaries)
+			|| masteringDisplay.displayPrimaries.length !== 3
+			|| masteringDisplay.displayPrimaries.some(pair => !Array.isArray(pair) || pair.length !== 2)
+		) {
+			throw new TypeError(
+				`${prefix} masteringDisplay.displayPrimaries must be three [x, y] pairs, in G, B, R order.`,
+			);
+		}
+		for (const [index, pair] of masteringDisplay.displayPrimaries.entries()) {
+			validateUint(pair[0], 16, `${prefix} masteringDisplay.displayPrimaries[${index}][0]`);
+			validateUint(pair[1], 16, `${prefix} masteringDisplay.displayPrimaries[${index}][1]`);
+		}
+		if (!Array.isArray(masteringDisplay.whitePoint) || masteringDisplay.whitePoint.length !== 2) {
+			throw new TypeError(`${prefix} masteringDisplay.whitePoint must be an [x, y] pair.`);
+		}
+		validateUint(masteringDisplay.whitePoint[0], 16, `${prefix} masteringDisplay.whitePoint[0]`);
+		validateUint(masteringDisplay.whitePoint[1], 16, `${prefix} masteringDisplay.whitePoint[1]`);
+		validateUint(
+			masteringDisplay.maxDisplayMasteringLuminance,
+			32,
+			`${prefix} masteringDisplay.maxDisplayMasteringLuminance`,
+		);
+		validateUint(
+			masteringDisplay.minDisplayMasteringLuminance,
+			32,
+			`${prefix} masteringDisplay.minDisplayMasteringLuminance`,
+		);
+	}
+
+	const contentLight = hdrStaticMetadata.contentLight;
+	if (contentLight != null) {
+		if (typeof contentLight !== 'object') {
+			throw new TypeError(`${prefix} contentLight, when defined, must be an object.`);
+		}
+		validateUint(contentLight.maxContentLightLevel, 16, `${prefix} contentLight.maxContentLightLevel`);
+		validateUint(contentLight.maxPicAverageLightLevel, 16, `${prefix} contentLight.maxPicAverageLightLevel`);
+	}
+};
+
+// MDCV and CLLI describe how a PQ or HLG grade was mastered, so a file that states them while stating no such
+// transfer describes a grade that isn't there.
+/** @internal */
+export const validateTransferCarriesHdrStaticMetadata = (
+	hdrStaticMetadata: HdrStaticMetadata | undefined,
+	colorSpace: VideoColorSpaceInit | undefined,
+	prefix: string,
+) => {
+	if (hdrStaticMetadata === undefined || transferNeedsTenBits(colorSpace?.transfer)) {
+		return;
+	}
+
+	throw new TypeError(
+		`${prefix}hdrStaticMetadata describes a PQ or HLG grade, but ${prefix}colorSpace.transfer is`
+		+ ` '${String(colorSpace?.transfer)}'. State the transfer function the metadata describes, or leave the`
+		+ ` metadata unset.`,
+	);
+};
+
+export const getVideoEncoderConfigExtension = (codec: VideoCodec, inBandParameterSets: boolean) => {
 	if (codec === 'avc') {
 		return {
 			avc: {
-				format: 'avc' as const, // Ensure the format is not Annex B
+				format: inBandParameterSets ? 'annexb' as const : 'avc' as const,
 			},
 		};
 	} else if (codec === 'hevc') {
 		return {
 			hevc: {
-				format: 'hevc' as const, // Ensure the format is not Annex B
+				format: inBandParameterSets ? 'annexb' as const : 'hevc' as const,
 			},
 		};
 	}
@@ -1040,43 +1247,10 @@ export const validateVideoChunkMetadata = (
 		}
 	}
 	if (metadata.decoderConfig.colorSpace !== undefined) {
-		const { colorSpace } = metadata.decoderConfig;
-
-		if (typeof colorSpace !== 'object') {
-			throw new TypeError(
-				'Video chunk metadata decoder configuration colorSpace, when provided, must be an object.',
-			);
-		}
-
-		const primariesValues = Object.keys(COLOR_PRIMARIES_MAP);
-		if (colorSpace.primaries != null && !primariesValues.includes(colorSpace.primaries)) {
-			throw new TypeError(
-				`Video chunk metadata decoder configuration colorSpace primaries, when defined, must be one of`
-				+ ` ${primariesValues.join(', ')}.`,
-			);
-		}
-
-		const transferValues = Object.keys(TRANSFER_CHARACTERISTICS_MAP);
-		if (colorSpace.transfer != null && !transferValues.includes(colorSpace.transfer)) {
-			throw new TypeError(
-				`Video chunk metadata decoder configuration colorSpace transfer, when defined, must be one of`
-				+ ` ${transferValues.join(', ')}.`,
-			);
-		}
-
-		const matrixValues = Object.keys(MATRIX_COEFFICIENTS_MAP);
-		if (colorSpace.matrix != null && !matrixValues.includes(colorSpace.matrix)) {
-			throw new TypeError(
-				`Video chunk metadata decoder configuration colorSpace matrix, when defined, must be one of`
-				+ ` ${matrixValues.join(', ')}.`,
-			);
-		}
-
-		if (colorSpace.fullRange != null && typeof colorSpace.fullRange !== 'boolean') {
-			throw new TypeError(
-				'Video chunk metadata decoder configuration colorSpace fullRange, when defined, must be a boolean.',
-			);
-		}
+		validateVideoColorSpaceInit(
+			metadata.decoderConfig.colorSpace,
+			'Video chunk metadata decoder configuration colorSpace',
+		);
 	}
 
 	if (metadata.decoderConfig.codec.startsWith('avc1') || metadata.decoderConfig.codec.startsWith('avc3')) {

@@ -40,14 +40,20 @@ export {
 	OutputFormat,
 	AdtsOutputFormat,
 	type AdtsOutputFormatOptions,
+	AdaptiveOutputFormat,
+	type AdaptiveOutputFormatOptions,
 	CmafOutputFormat,
 	type CmafOutputFormatOptions,
 	FlacOutputFormat,
 	type FlacOutputFormatOptions,
+	DashOutputFormat,
+	type DashOutputFormatOptions,
 	HlsOutputFormat,
 	type HlsOutputFormatOptions,
+	type SegmentedOutputFormatOptions,
 	type HlsOutputPlaylistInfo,
 	type HlsOutputSegmentInfo,
+	type SegmentPart,
 	IsobmffOutputFormat,
 	type IsobmffOutputFormatOptions,
 	MkvOutputFormat,
@@ -82,14 +88,22 @@ export {
 	type MediaStreamAudioTrackSourceOptions,
 	MediaStreamVideoTrackSource,
 	type MediaStreamVideoTrackSourceOptions,
+	SubtitleCueSource,
 	TextSubtitleSource,
 	VideoSampleSource,
 } from './media-source';
 export {
+	type SubtitleConfig,
+	type SubtitleCue,
+	type SubtitleMetadata,
+} from './subtitles';
+export {
 	type MediaCodec,
 	type VideoCodec,
+	type VideoBitDepth,
 	type AudioCodec,
 	type SubtitleCodec,
+	VIDEO_BIT_DEPTHS,
 	VIDEO_CODECS,
 	AUDIO_CODECS,
 	PCM_AUDIO_CODECS,
@@ -123,6 +137,7 @@ export {
 	getFirstEncodableAudioCodec,
 	getFirstEncodableSubtitleCodec,
 	Quality,
+	type QualityCapOptions,
 	type QualityOptions,
 	type QualitativeQualityOptions,
 	type QuantitativeQualityOptions,
@@ -169,7 +184,27 @@ export {
 	type LoggingEvents,
 } from './logging';
 export {
+	type ByteRange,
+	getSidxDurationSeconds,
+	getSidxIndexRange,
+	getSidxInitRange,
+	getSidxMaxSegmentDuration,
+	getSegmentDecodeTime,
+	getSidxPeakBitrate,
+	isInitializationSegment,
+	getSidxSegmentOffsets,
+	getInitSegmentTimescales,
+	iterateIsobmffBoxes,
+	type IsobmffBoxInfo,
+	setSegmentDecodeTime,
+	parsePsshBoxContents,
+	psshBoxesAreEqual,
+	rebaseSegmentDecodeTime,
 	type PsshBox,
+	type PsshBoxContents,
+	type SidxBox,
+	type SidxReference,
+	type TrackEncryptionInfo,
 } from './isobmff/isobmff-misc';
 export {
 	type Rational,
@@ -210,10 +245,12 @@ export {
 	InputFormat,
 	type InputFormatOptions,
 	AdtsInputFormat,
+	DashInputFormat,
 	FlacInputFormat,
 	IsobmffInputFormat,
 	type IsobmffInputFormatOptions,
 	HlsInputFormat,
+	type DashInputFormatOptions,
 	type HlsInputFormatOptions,
 	MatroskaInputFormat,
 	Mp3InputFormat,
@@ -224,8 +261,10 @@ export {
 	WaveInputFormat,
 	WebMInputFormat,
 	ALL_FORMATS,
+	DASH_FORMATS,
 	HLS_FORMATS,
 	ADTS,
+	DASH,
 	FLAC,
 	HLS,
 	MATROSKA,
@@ -251,6 +290,7 @@ export {
 	InputTrack,
 	InputVideoTrack,
 	InputAudioTrack,
+	InputSubtitleTrack,
 	type InputTrackQuery,
 	type FrameRateMetrics,
 	type FrameRateMetricsOptions,
@@ -289,6 +329,7 @@ export {
 	type CanvasSinkOptions,
 	EncodedPacketSink,
 	type PacketRetrievalOptions,
+	SubtitleCueSink,
 	VideoSampleSink,
 	type VideoSinkDecoderOptions,
 	type WrappedAudioBuffer,
@@ -299,6 +340,7 @@ export {
 	type ConversionOptions,
 	type ConversionVideoOptions,
 	type ConversionAudioOptions,
+	type ConversionSubtitleOptions,
 	type ConversionCopyOptions,
 	type ConversionExecuteOptions,
 	ConversionCanceledError,
@@ -319,5 +361,341 @@ export {
 	AttachedFile,
 	type TrackDisposition,
 } from './metadata';
+
+export {
+	HLS_MIME_TYPE,
+	TAG_STREAM_INF,
+	TAG_I_FRAME_STREAM_INF,
+	TAG_MEDIA,
+	TAG_EXTINF,
+	TAG_MAP,
+	TAG_KEY,
+	TAG_MEDIA_SEQUENCE,
+	TAG_BYTERANGE,
+	TAG_PROGRAM_DATE_TIME,
+	TAG_DISCONTINUITY,
+	TAG_PART,
+	TAG_PART_INF,
+	TAG_SERVER_CONTROL,
+	TAG_PRELOAD_HINT,
+	TAG_TARGETDURATION,
+	TAG_ENDLIST,
+	TAG_PLAYLIST_TYPE,
+	TAG_I_FRAMES_ONLY,
+	AttributeList,
+	canIgnoreLine,
+} from './hls/hls-misc';
+
+export {
+	parseHlsPlaylist,
+	type HlsPlaylist,
+	type HlsMasterPlaylist,
+	type HlsMediaPlaylistAst,
+	type HlsVariant,
+	type HlsIFrameStream,
+	type HlsMediaRendition,
+	type HlsSegment,
+	type HlsMap,
+	type HlsKey,
+	type HlsPart,
+	type HlsPreloadHint,
+	type HlsServerControl,
+} from './hls/hls-playlist-parser';
+
+export {
+	hlsMasterPlaylist,
+	hlsMediaPlaylist,
+	hlsMediaRendition,
+	hlsPart,
+	hlsSegment,
+	hlsVariant,
+} from './hls/hls-playlist-builder';
+
+export { serializeHls } from './hls/hls-serializer';
+
+export {
+	concatHlsMediaPlaylists,
+	rewriteHlsMasterUrisToBasename,
+	type HlsMediaPlaylistConcatInput,
+	type HlsMediaPlaylistConcatResult,
+} from './hls/hls-concat';
+
+export {
+	Tag,
+} from './hls/hls-tag';
+export {
+	type HlsEntry,
+	type HlsEntryType,
+	SegmentInfoEntry,
+	EncryptionInfoEntry,
+	DiscontinuityEntry,
+	PlacementOpportunityEntry,
+	ProgramDateTimeEntry,
+} from './hls/hls-entries';
+export {
+	type HlsPlaylistType,
+	type HlsMediaPlaylistStreamType,
+	type HlsEncryptionMethod,
+	type HlsContainerType,
+	type HlsVideoInfo,
+	type HlsAudioInfo,
+	type HlsAudioCodecSpecificData,
+	type HlsTextInfo,
+	type HlsMediaInfo,
+	type HlsParams,
+	type HlsCeaCaption,
+	adjustHlsVideoCodec,
+} from './hls/hls-types';
+export {
+	BandwidthEstimator,
+} from './bandwidth-estimator';
+export {
+	MediaPlaylist,
+} from './hls/hls-media-playlist';
+export {
+	MasterPlaylist,
+} from './hls/hls-master-playlist';
+
+export {
+	DASH_MIME_TYPE,
+	parseISODuration,
+	parseISODateTime,
+	parseByteRange,
+	parseFrameRate,
+	resolveURL,
+	resolveBaseURL,
+	getSegmentName,
+	substituteTemplate,
+	type SegmentTemplateValues,
+	normaliseKeyId,
+	psshContentsOffset,
+	type DashRational,
+} from './dash/dash-misc';
+export {
+	parseMpd,
+	type ParseMpdOptions,
+	type Mpd,
+	type MpdPeriod,
+	type MpdAdaptationSet,
+	type MpdServiceDescription,
+	type MpdRepresentation,
+	type SegmentTemplate,
+	type SegmentTimelineEntry,
+	type SegmentList,
+	type SegmentBase,
+	type ByteRange as DashByteRange,
+	type ContentProtection,
+	type DashDescriptor,
+} from './dash/dash-mpd-parser';
+
+export {
+	mpd,
+	mpdAdaptationSet,
+	mpdPeriod,
+	mpdRepresentation,
+	mpdSegmentList,
+} from './dash/dash-mpd-factories';
+
+export {
+	concatMpdPeriods,
+	type MpdConcatInput,
+	type MpdConcatResult,
+} from './dash/dash-concat';
+
+export {
+	type Element,
+	type ContentProtectionElement,
+} from './dash/dash-content-protection';
+export {
+	XmlNode,
+} from './dash/dash-xml-node';
+export { serializeMpd } from './dash/dash-mpd-serializer';
+export {
+	type Manifest,
+	type ManifestTransform,
+	parseManifest,
+	serializeManifest,
+	pipeManifest,
+} from './manifest';
+export {
+	type Rendition,
+	type RenditionPredicate,
+	type VideoRange,
+	type RangeFilter,
+	type ResolutionCap,
+	filterRenditions,
+	dropCodecs,
+	keepCodecs,
+	capResolution,
+	filterBitrate,
+	filterFramerate,
+	filterChannels,
+	dropByColorRange,
+	dropSubtitles,
+	rebaseManifest,
+	type DrmOptions,
+	drm,
+	type SegmentUrlKind,
+	type SegmentUrlMapper,
+	mapSegmentUrls,
+	type SegmentTemplateBuilder,
+	toSegmentTemplate,
+} from './manifest-transforms';
+export {
+	AdaptationSetXmlNode,
+	RepresentationBaseXmlNode,
+	RepresentationXmlNode,
+} from './dash/dash-representation-xml-node';
+export {
+	AdaptationSet,
+	type AdaptationSetRole,
+	type RepresentationCounter,
+} from './dash/dash-adaptation-set';
+export {
+	Period,
+} from './dash/dash-period';
+export {
+	type Clock as DashClock,
+	MpdBuilder,
+} from './dash/dash-mpd-builder';
+export {
+	addContentProtectionElements,
+} from './dash/dash-mpd-utils';
+export {
+	Representation,
+	type RepresentationStateChangeListener,
+	SuppressFlag,
+} from './dash/dash-representation';
+export {
+	type DashProfile,
+	type MpdType,
+	type UtcTiming,
+	type CeaCaption,
+	type MpdParams,
+	type MpdOptions,
+	type SegmentInfo,
+	createDefaultMpdParams,
+	createDefaultMpdOptions,
+} from './dash/dash-types';
+export {
+	type ContainerType as DashContainerType,
+	type TextType as DashTextType,
+	type AudioCodecSpecificData as DashAudioCodecSpecificData,
+	type VideoInfo as DashVideoInfo,
+	type AudioInfo as DashAudioInfo,
+	type TextInfo as DashTextInfo,
+	type ContentProtectionEntry as DashContentProtectionEntry,
+	type ProtectedContent as DashProtectedContent,
+	type ContentProtectionXml as DashContentProtectionXml,
+	type ContentProtectionXmlElement as DashContentProtectionXmlElement,
+	type MediaInfo as DashMediaInfo,
+	containerTypeName,
+	isMultiplexed,
+	textTypeName,
+} from './dash/dash-media-info';
+export {
+	languageToShortestForm,
+	languageToISO6392,
+} from './misc';
+export {
+	fourCCToString,
+} from './dash/dash-fourcc';
+export {
+	ENCRYPTED_MP4_SCHEME,
+	PSSH_ELEMENT_NAME,
+	MSPRO_ELEMENT_NAME,
+	TRANSFER_FUNCTION_PQ,
+	TRANSFER_FUNCTION_HLG,
+	hasVodOnlyFields,
+	hasLiveOnlyFields,
+	removeDuplicateAttributes,
+	getLanguage,
+	getCodecs,
+	getSupplementalCodecs,
+	getSupplementalProfiles,
+	getBaseCodec,
+	getAdaptationSetKey,
+	floatToXmlString,
+	secondsToXmlDuration,
+	getDurationAttribute,
+	moreThanOneTrue,
+	atLeastOneTrue,
+	onlyOneTrue,
+	hexToUUID,
+	updateContentProtectionPsshHelper,
+} from './dash/dash-mpd-utils';
+export {
+	type CmafKeyPeriod,
+	type CmafTrackKey,
+	type EncryptCmafOptions,
+	encryptCmaf,
+	encryptCmafInit,
+	encryptCmafSegment,
+} from './crypto/cmaf-encryptor';
+export {
+	type EncryptWebmOptions,
+	type WebmTrackKey,
+	encryptWebm,
+	encryptWebmInit,
+	encryptWebmSegment,
+} from './crypto/webm-encryptor';
+export {
+	type HlsAes128Options,
+	encryptHlsAes128,
+	buildHlsAes128KeyTag,
+} from './crypto/hls-aes128';
+export {
+	type SampleAesOptions,
+	sampleAesEncryptAudioFrame,
+	sampleAesEncryptVideoNal,
+} from './crypto/sample-aes';
+export {
+	type ProtectionScheme,
+} from './crypto/subsample-generator';
+export {
+	type DrmSystem,
+	CBCS_HLS_METHOD,
+	buildContentProtections,
+	buildCbcsContentProtections,
+	serializeContentProtection,
+	patchMpdContentProtection,
+	buildCbcsHlsKey,
+	buildHlsKeys,
+	patchMediaPlaylistKeys,
+} from './manifest-protection';
+export {
+	WIDEVINE_SYSTEM_ID,
+	FAIRPLAY_SYSTEM_ID,
+	MARLIN_SYSTEM_ID,
+	COMMON_SYSTEM_ID,
+	PLAYREADY_SYSTEM_ID,
+	buildWidevinePssh,
+	buildCommonPssh,
+	buildPlayReadyObject,
+	buildPlayReadyPssh,
+} from './crypto/pssh';
+export {
+	type DoviConfig,
+	parseDoviConfigRecord,
+	doviCodecString,
+	doviCompatibleBrand,
+} from './dovi';
+export {
+	type MasteringDisplayMetadata,
+	type ContentLightLevel,
+	type HdrStaticMetadata,
+	type VideoDecoderConfigWithHdr,
+	parseMasteringDisplayMetadata,
+	parseContentLightLevel,
+	parseHevcSeiHdrMetadata,
+	parseAvcSeiHdrMetadata,
+	buildMdcvBox,
+	buildClliBox,
+} from './hdr-metadata';
+export {
+	type ClosedCaptionChannel,
+	type ClosedCaptionBytePair,
+	type ClosedCaptionsMetadata,
+} from './closed-captions';
 
 // 🐡🦔

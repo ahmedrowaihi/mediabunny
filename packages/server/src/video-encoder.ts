@@ -8,6 +8,7 @@
 
 import {
 	CustomVideoEncoder,
+	Logging,
 	type MaybePromise,
 	Quality,
 	VideoCodec,
@@ -23,7 +24,7 @@ import {
 	unmapMatrixCoefficients,
 	unmapTransferCharacteristics,
 } from './misc';
-import { copyVideoSampleToAvFrame, AvFrameVideoSampleResource } from './video-sample';
+import { copyVideoSampleToAvFrame, AvFrameVideoSampleResource, applySampleColorToFrame } from './video-sample';
 import {
 	AvcNalUnitType,
 	extractAv1CodecInfoFromPacket,
@@ -38,7 +39,13 @@ import {
 	serializeAvcDecoderConfigurationRecord,
 	serializeHevcDecoderConfigurationRecord,
 } from '../../../src/codec-data';
-import { extractVideoCodecString, ProresFourCc } from '../../../src/codec';
+import {
+	extractVideoBitDepth,
+	extractVideoCodecString,
+	ProresFourCc,
+	VIDEO_BIT_DEPTHS,
+	VideoBitDepth,
+} from '../../../src/codec';
 import { assert, binarySearchLessOrEqual, simplifyRational, toUint8Array } from '../../../src/misc';
 
 const PRORES_FOURCC_TO_PROFILE: Record<ProresFourCc, NodeAv.AVProfile> = {
@@ -48,6 +55,186 @@ const PRORES_FOURCC_TO_PROFILE: Record<ProresFourCc, NodeAv.AVProfile> = {
 	apch: NodeAv.AV_PROFILE_PRORES_HQ,
 	ap4h: NodeAv.AV_PROFILE_PRORES_4444,
 	ap4x: NodeAv.AV_PROFILE_PRORES_XQ,
+};
+
+// In order of preference; an encoder can only reach a bit depth by being opened with a format that stores it
+const PIXEL_FORMATS_BY_BIT_DEPTH: Record<VideoBitDepth, NodeAv.AVPixelFormat[]> = {
+	8: [
+		NodeAv.AV_PIX_FMT_YUV420P,
+		NodeAv.AV_PIX_FMT_NV12,
+		NodeAv.AV_PIX_FMT_YUV422P,
+		NodeAv.AV_PIX_FMT_YUV444P,
+	],
+	10: [
+		NodeAv.AV_PIX_FMT_YUV420P10LE,
+		NodeAv.AV_PIX_FMT_P010LE,
+		NodeAv.AV_PIX_FMT_YUV422P10LE,
+		NodeAv.AV_PIX_FMT_YUV444P10LE,
+	],
+	12: [
+		NodeAv.AV_PIX_FMT_YUV420P12LE,
+		NodeAv.AV_PIX_FMT_YUV422P12LE,
+		NodeAv.AV_PIX_FMT_YUV444P12LE,
+	],
+};
+
+const ALPHA_PIXEL_FORMATS_BY_BIT_DEPTH: Record<VideoBitDepth, NodeAv.AVPixelFormat[]> = {
+	8: [
+		NodeAv.AV_PIX_FMT_YUVA420P,
+		NodeAv.AV_PIX_FMT_YUVA422P,
+		NodeAv.AV_PIX_FMT_YUVA444P,
+	],
+	10: [
+		NodeAv.AV_PIX_FMT_YUVA420P10LE,
+		NodeAv.AV_PIX_FMT_YUVA422P10LE,
+		NodeAv.AV_PIX_FMT_YUVA444P10LE,
+	],
+	12: [
+		NodeAv.AV_PIX_FMT_YUVA422P12LE,
+		NodeAv.AV_PIX_FMT_YUVA444P12LE,
+	],
+};
+
+const pixelFormatForBitDepth = (
+	supportedPixelFormats: NodeAv.AVPixelFormat[] | null,
+	bitDepth: VideoBitDepth,
+	wantsAlpha: boolean,
+): NodeAv.AVPixelFormat | null => {
+	const candidates = wantsAlpha
+		? ALPHA_PIXEL_FORMATS_BY_BIT_DEPTH[bitDepth]
+		: PIXEL_FORMATS_BY_BIT_DEPTH[bitDepth];
+
+	if (!supportedPixelFormats) {
+		// No list advertised, so the ideal format is the best we can say
+		return candidates[0]!;
+	}
+
+	return candidates.find(format => supportedPixelFormats.includes(format)) ?? null;
+};
+
+// Null for formats we don't track, which includes every RGB format
+const bitDepthOfPixelFormat = (pixelFormat: NodeAv.AVPixelFormat): VideoBitDepth | null => {
+	for (const bitDepth of VIDEO_BIT_DEPTHS) {
+		if (
+			PIXEL_FORMATS_BY_BIT_DEPTH[bitDepth].includes(pixelFormat)
+			|| ALPHA_PIXEL_FORMATS_BY_BIT_DEPTH[bitDepth].includes(pixelFormat)
+		) {
+			return bitDepth;
+		}
+	}
+
+	return null;
+};
+
+/**
+ * The transfer characteristics to signal for output encoded at `outputBitDepth`, given what the incoming frames claim.
+ * PQ and HLG are defined from 10 bits up, so encoding shallower leaves the label describing samples that no longer
+ * exist; the transfer is then stated as unspecified rather than stamped onto bytes that cannot carry it.
+ */
+export const transferForOutputBitDepth = (
+	frameColorTrc: NodeAv.AVColorTransferCharacteristic,
+	outputBitDepth: VideoBitDepth | null,
+): NodeAv.AVColorTransferCharacteristic => {
+	const isHdrTransfer = frameColorTrc === NodeAv.AVCOL_TRC_SMPTE2084
+		|| frameColorTrc === NodeAv.AVCOL_TRC_ARIB_STD_B67;
+
+	if (!isHdrTransfer || outputBitDepth === null || outputBitDepth >= 10) {
+		return frameColorTrc;
+	}
+
+	Logging._warn(
+		`Encoding ${outputBitDepth}-bit output from frames labelled`
+		+ ` '${frameColorTrc === NodeAv.AVCOL_TRC_SMPTE2084 ? 'pq' : 'hlg'}'. That transfer function needs at least`
+		+ ' 10 bits, so the output states no transfer instead of claiming one its samples cannot carry.',
+	);
+
+	return NodeAv.AVCOL_TRC_UNSPECIFIED;
+};
+
+/**
+ * Picks the pixel format the codec context will be opened with. A bit depth demanded by the codec string is either
+ * met or refused; where none is demanded, the incoming frames' depth is preserved when the encoder can.
+ */
+export const choosePixelFormat = (options: {
+	codecName: string | null | undefined;
+	/** Null when the encoder advertises no list, in which case any depth is assumed reachable. */
+	supportedPixelFormats: NodeAv.AVPixelFormat[] | null;
+	/** The depth the codec string states, which the output will be labelled with. */
+	requestedBitDepth: VideoBitDepth | null;
+	/** The depth of the frames handed to the encoder. */
+	incomingBitDepth: VideoBitDepth | null;
+	wantsAlpha: boolean;
+}): NodeAv.AVPixelFormat => {
+	const { codecName, supportedPixelFormats, requestedBitDepth, incomingBitDepth, wantsAlpha } = options;
+	const desiredBitDepth = requestedBitDepth ?? incomingBitDepth;
+
+	if (desiredBitDepth !== null) {
+		const match = pixelFormatForBitDepth(supportedPixelFormats, desiredBitDepth, wantsAlpha);
+		if (match !== null) {
+			return match;
+		}
+
+		if (requestedBitDepth !== null) {
+			throw new Error(
+				`Encoder '${codecName ?? 'unknown'}' cannot encode ${requestedBitDepth}-bit video`
+				+ `${wantsAlpha ? ' with alpha' : ''}, which the requested codec profile demands.`,
+			);
+		}
+
+		// Inherited, not demanded, so fall through to the encoder's default rather than failing the encode
+	}
+
+	let pixelFormat = NodeAv.AV_PIX_FMT_YUV420P;
+
+	if (supportedPixelFormats) {
+		if (!supportedPixelFormats.includes(NodeAv.AV_PIX_FMT_YUV420P)) {
+			pixelFormat = supportedPixelFormats[0]!;
+		}
+
+		if (wantsAlpha) {
+			if (supportedPixelFormats.includes(NodeAv.AV_PIX_FMT_YUVA420P)) {
+				pixelFormat = NodeAv.AV_PIX_FMT_YUVA420P;
+			} else {
+				// Let FFmpeg pick the best alpha-capable format it supports, minimizing data loss versus a
+				// high-quality YUVA source
+				pixelFormat = NodeAv.avcodecFindBestPixFmtOfList(
+					supportedPixelFormats,
+					NodeAv.AV_PIX_FMT_YUVA444P12LE,
+				);
+			}
+		}
+	}
+
+	return pixelFormat;
+};
+
+const getSoftwareEncoderCodec = (codec: VideoCodec, codecId: NodeAv.AVCodecID) => {
+	if (codec === 'prores') {
+		// Prefer prores_ks for ProRes
+		const proresKs = NodeAv.Codec.findEncoderByName(NodeAv.FF_ENCODER_PRORES_KS);
+		if (proresKs) {
+			return proresKs;
+		}
+	}
+
+	return NodeAv.Codec.findEncoder(codecId);
+};
+
+// NTSC rates are x/1001 exactly; anything else is kept to the millisecond. Rounding to whole frames would state 24
+// fps for 24000/1001 video.
+const toFramerateRational = (framerate: number) => {
+	const ntscNum = Math.round(framerate * 1001);
+	if (ntscNum % 1000 === 0 && Math.abs(ntscNum / 1001 - framerate) < 1e-4 && !Number.isInteger(framerate)) {
+		return { num: ntscNum, den: 1001 };
+	}
+
+	return simplifyRational({ num: Math.round(framerate * 1000), den: 1000 });
+};
+
+// A cap arrives in fields WebCodecs configs don't have
+const getQualityCap = (config: VideoEncoderConfig) => {
+	const { _maxBitrate, _bufferSize } = config as VideoEncoderConfig & { _maxBitrate?: number; _bufferSize?: number };
+	return _maxBitrate === undefined ? null : { maxBitrate: _maxBitrate, bufferSize: _bufferSize ?? 2 * _maxBitrate };
 };
 
 export class NodeAvVideoEncoder extends CustomVideoEncoder {
@@ -72,14 +259,44 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 	}[] = [];
 
 	static override supports(codec: VideoCodec, config: VideoEncoderConfig): boolean {
-		if (config.bitrateMode === 'quantizer') {
-			return codec === 'avc' || codec === 'hevc' || codec === 'vp9' || codec === 'av1';
+		const codecSupported = config.bitrateMode === 'quantizer'
+			? codec === 'avc' || codec === 'hevc' || codec === 'vp9' || codec === 'av1'
+			: codec === 'avc' || codec === 'hevc' || codec === 'vp8' || codec === 'vp9' || codec === 'av1'
+				|| codec === 'prores';
+
+		if (!codecSupported) {
+			return false;
 		}
 
-		return (
-			codec === 'avc' || codec === 'hevc' || codec === 'vp8' || codec === 'vp9' || codec === 'av1'
-			|| codec === 'prores'
-		);
+		if (getQualityCap(config)) {
+			if (config.bitrateMode !== 'quantizer') {
+				return false;
+			}
+
+			const codecId = CODEC_TO_CODEC_ID[codec];
+			assert(codecId !== undefined);
+			// rav1e has no capped mode, only a constant quantizer or a bitrate
+			if (getSoftwareEncoderCodec(codec, codecId)?.name === 'librav1e') {
+				return false;
+			}
+		}
+
+		const requestedBitDepth = extractVideoBitDepth(config.codec);
+		if (requestedBitDepth === null) {
+			return true;
+		}
+
+		// A depth stated by the codec string has to be deliverable, or the output would be labelled with a profile
+		// its samples don't have. Hardware encoders that can't reach it are skipped, so software decides.
+		const codecId = CODEC_TO_CODEC_ID[codec];
+		assert(codecId !== undefined);
+		const avCodec = getSoftwareEncoderCodec(codec, codecId);
+
+		return !!avCodec && pixelFormatForBitDepth(
+			avCodec.pixelFormats,
+			requestedBitDepth,
+			config.alpha === 'keep',
+		) !== null;
 	}
 
 	async init(): Promise<void> {
@@ -93,23 +310,14 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 		const codecId = CODEC_TO_CODEC_ID[this.codec];
 		assert(codecId !== undefined);
 
-		const getSoftwareCodec = () => {
-			if (this.codec === 'prores') {
-				// Prefer prores_ks for ProRes
-				const proresKs = NodeAv.Codec.findEncoderByName(NodeAv.FF_ENCODER_PRORES_KS);
-				if (proresKs) {
-					return proresKs;
-				}
-			}
-
-			return NodeAv.Codec.findEncoder(codecId);
-		};
+		const wantsAlpha = this.config.alpha === 'keep';
+		const requestedBitDepth = extractVideoBitDepth(this.config.codec);
 
 		let codec: NodeAv.Codec | null = null;
-		if (this.codec === 'vp9' && this.config.alpha === 'keep') {
+		if (this.codec === 'vp9' && wantsAlpha) {
 			codec = NodeAv.Codec.findEncoderByName(NodeAv.FF_ENCODER_LIBVPX_VP9) ?? NodeAv.Codec.findEncoder(codecId);
 		} else if (this.config.hardwareAcceleration === 'prefer-software') {
-			codec = getSoftwareCodec();
+			codec = getSoftwareEncoderCodec(this.codec, codecId);
 		} else {
 			let hardwareCodec = await getHardwareEncoderCodec(codecId);
 			if (hardwareCodec && this.config.bitrateMode === 'quantizer' && !hardwareCodec.name?.endsWith('_nvenc')) {
@@ -117,7 +325,16 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 				hardwareCodec = null;
 			}
 
-			codec = hardwareCodec ?? getSoftwareCodec();
+			if (
+				hardwareCodec
+				&& requestedBitDepth !== null
+				&& pixelFormatForBitDepth(hardwareCodec.pixelFormats, requestedBitDepth, wantsAlpha) === null
+			) {
+				// Hardware acceleration is a preference, but the requested bit depth is not
+				hardwareCodec = null;
+			}
+
+			codec = hardwareCodec ?? getSoftwareEncoderCodec(this.codec, codecId);
 		}
 
 		if (!codec) {
@@ -125,12 +342,6 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 		}
 
 		this.avCodec = codec;
-
-		if (this.config.bitrateMode !== 'quantizer') {
-			// In quantizer mode, the codec context is instead created lazily on the first encode, once the quantizer
-			// value is known
-			await this.createCodecContext();
-		}
 	}
 
 	async createCodecContext() {
@@ -139,26 +350,14 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 		const codecContext = new NodeAv.CodecContext();
 		codecContext.allocContext3(this.avCodec);
 
-		let pixelFormat = NodeAv.AV_PIX_FMT_YUV420P;
-
-		if (this.avCodec.pixelFormats) {
-			if (!this.avCodec.pixelFormats.includes(NodeAv.AV_PIX_FMT_YUV420P)) {
-				pixelFormat = this.avCodec.pixelFormats[0]!;
-			}
-
-			if (this.config.alpha === 'keep') {
-				if (this.avCodec.pixelFormats.includes(NodeAv.AV_PIX_FMT_YUVA420P)) {
-					pixelFormat = NodeAv.AV_PIX_FMT_YUVA420P;
-				} else {
-					// Let FFmpeg pick the best alpha-capable format it supports, minimizing data loss versus a
-					// high-quality YUVA source
-					pixelFormat = NodeAv.avcodecFindBestPixFmtOfList(
-						this.avCodec.pixelFormats,
-						NodeAv.AV_PIX_FMT_YUVA444P12LE,
-					);
-				}
-			}
-		}
+		const incomingBitDepth = bitDepthOfPixelFormat(this.frame.format as NodeAv.AVPixelFormat);
+		const pixelFormat = choosePixelFormat({
+			codecName: this.avCodec.name,
+			supportedPixelFormats: this.avCodec.pixelFormats,
+			requestedBitDepth: extractVideoBitDepth(this.config.codec),
+			incomingBitDepth,
+			wantsAlpha: this.config.alpha === 'keep',
+		});
 
 		const pixelAspectRatio = simplifyRational({
 			num: (this.config.displayWidth ?? this.config.width) * this.config.height,
@@ -169,8 +368,11 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 		codecContext.height = this.config.height;
 		codecContext.pixelFormat = pixelFormat;
 		codecContext.timeBase = new NodeAv.Rational(1, 1e6);
-		codecContext.gopSize = 60;
-		codecContext.framerate = new NodeAv.Rational(Math.round(this.config.framerate ?? 0) || 30, 1);
+		// Key frames come from the caller, which forces one every keyFrameInterval; a GOP length of the encoder's
+		// own would add key frames between the forced ones
+		codecContext.gopSize = 2 ** 30;
+		const framerate = toFramerateRational(this.config.framerate || 30);
+		codecContext.framerate = new NodeAv.Rational(framerate.num, framerate.den);
 		// In quantizer mode, the quantizer dictates the rate; a target bitrate would put encoders in the wrong rate
 		// control mode
 		codecContext.bitRate = this.config.bitrateMode === 'quantizer'
@@ -181,6 +383,16 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 				);
 		codecContext.sampleAspectRatio = new NodeAv.Rational(pixelAspectRatio.num, pixelAspectRatio.den);
 
+		// Carry the frames' color into the bitstream, so the stream states the color it holds. Only tracked (i.e.
+		// YUV) formats qualify: converting RGB hands swscale a matrix and range choice the frame's labels no longer
+		// describe.
+		if (incomingBitDepth !== null) {
+			codecContext.colorPrimaries = this.frame.colorPrimaries;
+			codecContext.colorTrc = transferForOutputBitDepth(this.frame.colorTrc, bitDepthOfPixelFormat(pixelFormat));
+			codecContext.colorSpace = this.frame.colorSpace;
+			codecContext.colorRange = this.frame.colorRange;
+		}
+
 		if (this.config.bitrateMode === 'constant') {
 			codecContext.rcMinRate = codecContext.bitRate;
 			codecContext.rcMaxRate = codecContext.bitRate;
@@ -189,12 +401,18 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 		const isRealtime = this.config.latencyMode === 'realtime';
 
 		if (this.avCodec.name === 'libx264') {
+			// Scene-cut detection would also add key frames between the forced ones
+			codecContext.setOption('x264-params', 'scenecut=0');
+
 			if (isRealtime) {
 				codecContext.setOption('tune', 'zerolatency');
 				codecContext.setOption('preset', 'ultrafast');
 			}
 		} else if (this.avCodec.name === 'libx265') {
-			codecContext.setOption('x265-params', 'log-level=error');
+			// Besides no scene-cut key frames, a forced key frame must be a true IDR: with an open GOP, x265 writes it
+			// as a CRA whose leading RASL pictures can't be decoded when playback starts there
+			codecContext.setOption('x265-params', 'log-level=error:scenecut=0:open-gop=0');
+			codecContext.setOption('forced-idr', '1');
 
 			if (isRealtime) {
 				codecContext.setOption('tune', 'zerolatency');
@@ -243,8 +461,32 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 				mapped = this.quantizer;
 			}
 
-			// Put the encoder into its constant-quantizer mode
-			if (this.avCodec.name === 'libx264' || this.avCodec.name === 'libx265') {
+			// Capped CRF needs the encoder's quality mode, not a constant quantizer
+			const cap = getQualityCap(this.config);
+			if (cap) {
+				if (this.avCodec.name === 'libx264' || this.avCodec.name === 'libx265') {
+					codecContext.setOption('crf', String(mapped));
+					codecContext.rcMaxRate = BigInt(cap.maxBitrate);
+					codecContext.rcBufferSize = cap.bufferSize;
+				} else if (this.avCodec.name === 'libsvtav1') {
+					// SVT-AV1 reads crf 0 as unset
+					codecContext.setOption('crf', String(Math.max(mapped, 1)));
+					codecContext.rcMaxRate = BigInt(cap.maxBitrate);
+				} else if (this.avCodec.name === 'libvpx-vp9' || this.avCodec.name === 'libaom-av1') {
+					// Constrained quality: the bitrate is a ceiling over the stream, not a buffer model
+					codecContext.setOption('crf', String(mapped));
+					codecContext.bitRate = BigInt(cap.maxBitrate);
+				} else if (this.avCodec.name?.endsWith('_nvenc')) {
+					// FFmpeg's NVENC wrapper discards the buffer size in this mode; the max bitrate is the bound
+					codecContext.setOption('rc', 'vbr');
+					codecContext.setOption('cq', String(mapped));
+					codecContext.rcMaxRate = BigInt(cap.maxBitrate);
+				} else {
+					throw new Error(
+						`Encoder '${this.avCodec.name}' cannot be used for capped quantizer-based encoding.`,
+					);
+				}
+			} else if (this.avCodec.name === 'libx264' || this.avCodec.name === 'libx265') {
 				codecContext.setOption('qp', String(mapped));
 			} else if (this.avCodec.name === 'libvpx-vp9' || this.avCodec.name === 'libaom-av1') {
 				codecContext.setOption('crf', String(mapped));
@@ -260,9 +502,11 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 				throw new Error(`Encoder '${this.avCodec.name}' cannot be used for quantizer-based encoding.`);
 			}
 
-			// Also pin the quantizer range so crf-based encoders (libvpx, libaom) hold the quantizer truly constant
-			codecContext.qMin = mapped;
-			codecContext.qMax = mapped;
+			if (!cap) {
+				// Also pin the quantizer range so crf-based encoders (libvpx, libaom) hold the quantizer truly constant
+				codecContext.qMin = mapped;
+				codecContext.qMax = mapped;
+			}
 		}
 
 		if (this.codec === 'prores') {
@@ -315,17 +559,13 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 			this.quantizer = quantizer;
 		}
 
-		if (this.codecContext === null) {
-			await this.createCodecContext();
-		}
-		assert(this.codecContext);
-
 		if (videoSample._data instanceof AvFrameVideoSampleResource) {
 			// Release any buffers still referenced from the previous encode before reffing the new frame, otherwise
 			// av_frame_ref leaks them
 			// https://github.com/Vanilagy/mediabunny/issues/392
 			this.frame.unref();
 			this.frame.ref(videoSample._data.frame);
+			applySampleColorToFrame(videoSample, this.frame);
 		} else {
 			if (videoSample.format === null) {
 				throw new Error('Cannot encode foreign VideoSample with unknown (null) format.');
@@ -333,6 +573,12 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 
 			this.lastBuffer = await copyVideoSampleToAvFrame(videoSample, this.frame, this.lastBuffer);
 		}
+
+		// Must run after the frame is prepared: the pixel format and color the context is opened with follow from it
+		if (this.codecContext === null) {
+			await this.createCodecContext();
+		}
+		assert(this.codecContext);
 
 		let frameToEncode = this.frame;
 
@@ -505,7 +751,10 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 					codec: this.codec,
 					codecDescription: serializedRecord,
 					colorSpace: null,
-					avcType: 1,
+					// Annex B leaves the parameter sets in the samples; otherwise they are stripped into
+					// the description, and the fourcc has to say which (ISO/IEC 14496-15).
+					avcType: expectsAnnexB ? 3 : 1,
+					hevcType: expectsAnnexB ? 'hev1' : 'hvc1',
 					avcCodecInfo: null,
 					hevcCodecInfo: null,
 					vp9CodecInfo: null,
@@ -582,6 +831,7 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 					codecDescription: null,
 					colorSpace: null,
 					avcType: null,
+					hevcType: null,
 					avcCodecInfo: null,
 					hevcCodecInfo: null,
 					vp9CodecInfo: null,
@@ -600,6 +850,7 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 					codecDescription: null,
 					colorSpace: null,
 					avcType: null,
+					hevcType: null,
 					avcCodecInfo: null,
 					hevcCodecInfo: null,
 					vp9CodecInfo,
@@ -618,6 +869,7 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 					codecDescription: null,
 					colorSpace: null,
 					avcType: null,
+					hevcType: null,
 					avcCodecInfo: null,
 					hevcCodecInfo: null,
 					vp9CodecInfo: null,
@@ -634,6 +886,7 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 					codecDescription: null,
 					colorSpace: null,
 					avcType: null,
+					hevcType: null,
 					avcCodecInfo: null,
 					hevcCodecInfo: null,
 					vp9CodecInfo: null,

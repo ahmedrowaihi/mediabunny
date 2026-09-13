@@ -6,26 +6,52 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
+/** MIME type for HLS playlists. @group HLS @public */
 export const HLS_MIME_TYPE = 'application/vnd.apple.mpegurl';
 
+/** HLS `#EXT-X-STREAM-INF:` master-playlist tag prefix. @group HLS @public */
 export const TAG_STREAM_INF = '#EXT-X-STREAM-INF:';
+/** HLS `#EXT-X-I-FRAME-STREAM-INF:` master-playlist tag prefix. @group HLS @public */
 export const TAG_I_FRAME_STREAM_INF = '#EXT-X-I-FRAME-STREAM-INF:';
+/** HLS `#EXT-X-MEDIA:` master-playlist tag prefix. @group HLS @public */
 export const TAG_MEDIA = '#EXT-X-MEDIA:';
+/** HLS `#EXTINF:` segment-duration tag prefix. @group HLS @public */
 export const TAG_EXTINF = '#EXTINF:';
+/** HLS `#EXT-X-MAP:` init-segment tag prefix. @group HLS @public */
 export const TAG_MAP = '#EXT-X-MAP:';
+/** HLS `#EXT-X-KEY:` segment-encryption tag prefix. @group HLS @public */
 export const TAG_KEY = '#EXT-X-KEY:';
+/** HLS `#EXT-X-MEDIA-SEQUENCE:` tag prefix. @group HLS @public */
 export const TAG_MEDIA_SEQUENCE = '#EXT-X-MEDIA-SEQUENCE:';
+/** HLS `#EXT-X-BYTERANGE:` tag prefix. @group HLS @public */
 export const TAG_BYTERANGE = '#EXT-X-BYTERANGE:';
+/** HLS `#EXT-X-PROGRAM-DATE-TIME:` tag prefix. @group HLS @public */
 export const TAG_PROGRAM_DATE_TIME = '#EXT-X-PROGRAM-DATE-TIME:';
+/** HLS `#EXT-X-DISCONTINUITY` tag. @group HLS @public */
 export const TAG_DISCONTINUITY = '#EXT-X-DISCONTINUITY';
+/** HLS `#EXT-X-TARGETDURATION:` tag prefix. @group HLS @public */
 export const TAG_TARGETDURATION = '#EXT-X-TARGETDURATION:';
+/** HLS `#EXT-X-ENDLIST` tag. @group HLS @public */
 export const TAG_ENDLIST = '#EXT-X-ENDLIST';
+/** HLS `#EXT-X-PLAYLIST-TYPE:` tag prefix. @group HLS @public */
 export const TAG_PLAYLIST_TYPE = '#EXT-X-PLAYLIST-TYPE:';
+/** HLS `#EXT-X-I-FRAMES-ONLY` tag. @group HLS @public */
 export const TAG_I_FRAMES_ONLY = '#EXT-X-I-FRAMES-ONLY';
+/** HLS `#EXT-X-PART:` partial-segment tag prefix. @group HLS @public */
+export const TAG_PART = '#EXT-X-PART:';
+/** HLS `#EXT-X-PART-INF:` tag prefix. @group HLS @public */
+export const TAG_PART_INF = '#EXT-X-PART-INF:';
+/** HLS `#EXT-X-SERVER-CONTROL:` tag prefix. @group HLS @public */
+export const TAG_SERVER_CONTROL = '#EXT-X-SERVER-CONTROL:';
+/** HLS `#EXT-X-PRELOAD-HINT:` tag prefix. @group HLS @public */
+export const TAG_PRELOAD_HINT = '#EXT-X-PRELOAD-HINT:';
 
+/** True for blank lines and `#`-prefixed comments that are not `#EXT...` tags. @group HLS @public */
 export const canIgnoreLine = (line: string) => line.length === 0 || (line.startsWith('#') && !line.startsWith('#EXT'));
 
+/** Parses an HLS attribute list (`KEY=VALUE,KEY2="quoted"`) into a case-insensitive map. @group HLS @public */
 export class AttributeList {
+	/** Lowercased attribute map. @internal */
 	_attributes: Record<string, string> = {};
 
 	constructor(str: string) {
@@ -61,10 +87,12 @@ export class AttributeList {
 		}
 	}
 
+	/** Get the attribute value (case-insensitive name), or `null` if absent. */
 	get(name: string) {
 		return this._attributes[name.toLowerCase()] ?? null;
 	}
 
+	/** Get the attribute value as a finite number, or `null` if absent or non-numeric. */
 	getAsNumber(name: string) {
 		const value = this.get(name);
 		if (value === null) {
@@ -75,6 +103,7 @@ export class AttributeList {
 		return Number.isFinite(num) ? num : null;
 	}
 
+	/** Merge another attribute list into this one, overwriting on key collision. */
 	merge(other: AttributeList) {
 		Object.assign(this._attributes, other._attributes);
 	}

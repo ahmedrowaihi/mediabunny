@@ -9,11 +9,21 @@
 import {
 	AUDIO_CODECS,
 	AudioCodec,
+	extractVideoBitDepth,
 	MediaCodec,
 	NON_PCM_AUDIO_CODECS,
+	SUBTITLE_CODECS,
+	SubtitleCodec,
+	validateBitDepthCarriesTransfer,
+	validateHdrStaticMetadata,
+	validateTransferCarriesHdrStaticMetadata,
+	validateVideoColorSpaceInit,
+	VIDEO_BIT_DEPTHS,
 	VIDEO_CODECS,
+	VideoBitDepth,
 	VideoCodec,
 } from './codec';
+import { type HdrStaticMetadata } from './hdr-metadata';
 import {
 	AudioEncodingConfig,
 	getEncodableAudioCodecs,
@@ -23,26 +33,30 @@ import {
 	VideoEncodingConfig,
 } from './encode';
 import { Input } from './input';
-import { InputAudioTrack, InputTrack, InputVideoTrack } from './input-track';
+import { InputAudioTrack, InputSubtitleTrack, InputTrack, InputVideoTrack } from './input-track';
 import { Logging } from './logging';
 import {
 	AudioSampleSink,
 	EncodedPacketSink,
+	SubtitleCueSink,
 	VideoSampleSink,
 } from './media-sink';
 import {
 	AudioSource,
 	EncodedVideoPacketSource,
 	EncodedAudioPacketSource,
+	SubtitleCueSource,
 	VideoSource,
 	VideoSampleSource,
 	AudioSampleSource,
+	DeclaredColorSpaceMismatchError,
 } from './media-source';
 import {
 	assert,
 	assertNever,
 	ceilToMultipleOfTwo,
 	clamp,
+	colorSpaceIsEmpty,
 	isIso639Dash2LanguageCode,
 	isNumber,
 	MaybePromise,
@@ -63,6 +77,7 @@ import {
 	VideoSampleResource,
 } from './sample';
 import { MetadataTags, validateMetadataTags } from './metadata';
+import { SubtitleCue, SubtitleMetadata } from './subtitles';
 import { NullTarget } from './target';
 
 /**
@@ -81,7 +96,9 @@ export type ConversionOptions = {
 	 * which case it defaults to `'primary'`.
 	 *
 	 * - `'all'`: All input tracks are eligible for conversion.
-	 * - `'primary'`: Only the primary video and audio track from the input are eligible for conversion.
+	 * - `'primary'`: Only the primary video and audio track from the input are eligible for conversion. There is no
+	 * primary subtitle track, so every subtitle track of the input is excluded and listed in
+	 * {@link Conversion.discardedTracks} with reason `'not_a_primary_track'`. Use `'all'` to convert subtitles.
 	 */
 	tracks?: 'all' | 'primary';
 
@@ -117,6 +134,21 @@ export type ConversionOptions = {
 		| ConversionAudioOptions[]
 		| ((track: InputAudioTrack, n: number) => MaybePromise<
 			ConversionAudioOptions | ConversionAudioOptions[] | undefined
+		>);
+
+	/**
+	 * Subtitle-specific options. When passing an object, the same options are applied to all subtitle tracks. When
+	 * passing a function, it will be invoked for each subtitle track and is expected to return or resolve to the
+	 * options for that specific track. The function is passed an instance of {@link InputSubtitleTrack} as well as a
+	 * number `n`, which is the 1-based index of the track in the list of all subtitle tracks.
+	 *
+	 * When passing an array or a function that returns an array, one output track per array element will be created,
+	 * allowing for "fan-out". Useful for emitting the same cues in multiple subtitle codecs.
+	 */
+	subtitle?: ConversionSubtitleOptions
+		| ConversionSubtitleOptions[]
+		| ((track: InputSubtitleTrack, n: number) => MaybePromise<
+			ConversionSubtitleOptions | ConversionSubtitleOptions[] | undefined
 		>);
 
 	/** Options to trim the input file. */
@@ -242,6 +274,45 @@ export type ConversionVideoOptions = {
 	 */
 	keyFrameInterval?: number;
 	/**
+	 * Where the AVC or HEVC parameter sets (SPS/PPS, plus VPS) are carried. Ignored by all other codecs.
+	 *
+	 * - `'outOfBand'` (default): They are kept solely in the sample entry, signalled as `avc1`/`hvc1`.
+	 * - `'inBand'`: They are also repeated throughout the bitstream, signalled as `avc3`/`hev1`, which lets a
+	 * player join mid-stream without the sample entry.
+	 *
+	 * Setting this field forces a transcode.
+	 */
+	parameterSets?: 'inBand' | 'outOfBand';
+	/**
+	 * The bit depth per color component to encode at, which selects the codec profile. Defaults to the bit depth of
+	 * the input track, falling back to the codec's 8-bit profile when no codec in the output format can encode the
+	 * input's depth.
+	 *
+	 * Setting this field forces a transcode.
+	 */
+	bitDepth?: VideoBitDepth;
+	/**
+	 * The color space to signal on the output track. Defaults to the color space of the input track, except when the
+	 * frames have to be re-rendered (resizing, cropping, rotating, processing, or an encoder that can't take the
+	 * input's frames), which converts them to 8-bit sRGB and therefore replaces the input's color space.
+	 *
+	 *
+	 * Setting this field forces a transcode.
+	 */
+	colorSpace?: VideoColorSpaceInit;
+	/**
+	 * The HDR10 static metadata (mastering display colour volume and content light level) to signal on the output
+	 * track. Defaults to the input track's, which describes how the content was graded and therefore still holds
+	 * after a re-encode of that same grade.
+	 *
+	 * Inherited or not, it is dropped from the output wherever the HDR transfer function it describes is dropped:
+	 * when the output is encoded at a bit depth too shallow to carry it, or when the frames are re-rendered into a
+	 * color space that no longer has it.
+	 *
+	 * Setting this field forces a transcode, and requires a `colorSpace` whose transfer function is PQ or HLG.
+	 */
+	hdrStaticMetadata?: HdrStaticMetadata;
+	/**
 	 * A hint that configures the hardware acceleration method used when transcoding. This is best left on
 	 * `'no-preference'`, the default.
 	 */
@@ -348,6 +419,32 @@ export type ConversionAudioOptions = {
 };
 
 /**
+ * Subtitle-specific options.
+ * @group Conversion
+ * @public
+ */
+export type ConversionSubtitleOptions = {
+	/** If `true`, all subtitle tracks will be discarded and will not be present in the output. */
+	discard?: boolean;
+	/**
+	 * The desired output subtitle codec. Defaults to the input track's codec when the output format can hold it, and
+	 * otherwise to the first subtitle codec the output format supports.
+	 *
+	 * Subtitle codecs are converted between by rewriting the cues, so any requested codec the output format supports
+	 * can be reached from any input codec. A codec the output format cannot hold discards the track with reason
+	 * `'unsupported_subtitle_codec'`.
+	 */
+	codec?: SubtitleCodec;
+	/**
+	 * Defines the group(s) the output track is a part of. For more, see {@link BaseTrackMetadata.group}.
+	 *
+	 * If left blank, tracks will internally be assigned to groups such that the output track pairability graph exactly
+	 * matches the input track pairability graph.
+	 */
+	group?: OutputTrackGroup | OutputTrackGroup[];
+};
+
+/**
  * Options for copying encoded media during conversion.
  * @group Conversion
  * @public
@@ -385,7 +482,8 @@ export type ConversionCopyOptions = {
 	boundaryPolicy?: 'expand' | 'shrink';
 };
 
-const validateVideoOptions = (videoOptions: ConversionVideoOptions) => {
+/** @internal */
+export const validateVideoOptions = (videoOptions: ConversionVideoOptions) => {
 	if (!videoOptions || typeof videoOptions !== 'object') {
 		throw new TypeError('options.video, when provided, must be an object.');
 	}
@@ -459,6 +557,30 @@ const validateVideoOptions = (videoOptions: ConversionVideoOptions) => {
 		&& (!Number.isFinite(videoOptions.keyFrameInterval) || videoOptions.keyFrameInterval < 0)
 	) {
 		throw new TypeError('options.video.keyFrameInterval, when provided, must be a non-negative number.');
+	}
+	if (
+		videoOptions?.parameterSets !== undefined
+		&& !['inBand', 'outOfBand'].includes(videoOptions.parameterSets)
+	) {
+		throw new TypeError('options.video.parameterSets, when provided, must be \'inBand\' or \'outOfBand\'.');
+	}
+	if (
+		videoOptions?.bitDepth !== undefined
+		&& !(VIDEO_BIT_DEPTHS as readonly number[]).includes(videoOptions.bitDepth)
+	) {
+		throw new TypeError(`options.video.bitDepth, when provided, must be one of ${VIDEO_BIT_DEPTHS.join(', ')}.`);
+	}
+	if (videoOptions?.colorSpace !== undefined) {
+		validateVideoColorSpaceInit(videoOptions.colorSpace, 'options.video.colorSpace');
+	}
+	if (videoOptions?.hdrStaticMetadata !== undefined) {
+		validateHdrStaticMetadata(videoOptions.hdrStaticMetadata, 'options.video.hdrStaticMetadata');
+	}
+	{
+		validateBitDepthCarriesTransfer(videoOptions?.bitDepth, videoOptions?.colorSpace, 'options.video.');
+		validateTransferCarriesHdrStaticMetadata(
+			videoOptions?.hdrStaticMetadata, videoOptions?.colorSpace, 'options.video.',
+		);
 	}
 	if (videoOptions?.process !== undefined && typeof videoOptions.process !== 'function') {
 		throw new TypeError('options.video.process, when provided, must be a function.');
@@ -569,6 +691,31 @@ const validateAudioOptions = (audioOptions: ConversionAudioOptions) => {
 	}
 };
 
+const validateSubtitleOptions = (subtitleOptions: ConversionSubtitleOptions) => {
+	if (!subtitleOptions || typeof subtitleOptions !== 'object') {
+		throw new TypeError('options.subtitle, when provided, must be an object.');
+	}
+	if (subtitleOptions?.discard !== undefined && typeof subtitleOptions.discard !== 'boolean') {
+		throw new TypeError('options.subtitle.discard, when provided, must be a boolean.');
+	}
+	if (subtitleOptions?.codec !== undefined && !SUBTITLE_CODECS.includes(subtitleOptions.codec)) {
+		throw new TypeError(
+			`options.subtitle.codec, when provided, must be one of: ${SUBTITLE_CODECS.join(', ')}.`,
+		);
+	}
+	if (
+		subtitleOptions?.group !== undefined
+		&& !(
+			subtitleOptions.group instanceof OutputTrackGroup
+			|| (Array.isArray(subtitleOptions.group) && subtitleOptions.group.every(x => x instanceof OutputTrackGroup))
+		)
+	) {
+		throw new TypeError(
+			'options.subtitle.group, when provided, must be an OutputTrackGroup or an array of OutputTrackGroups.',
+		);
+	}
+};
+
 const FALLBACK_NUMBER_OF_CHANNELS = 2;
 const FALLBACK_SAMPLE_RATE = 48000;
 
@@ -595,6 +742,10 @@ export type DiscardedTrack = {
 	 * you requested a codec that cannot be contained within the output format.
 	 * - `'cannot_copy'`: {@link ConversionCopyOptions.mode} was set to `'forced'` but the track could not be copied
 	 * with the given copy configuration because it would require a transcode instead.
+	 * - `'unsupported_subtitle_codec'`: The output format cannot hold this subtitle track, because it holds no
+	 * subtitle codec at all or none that matches the codec you requested.
+	 * - `'not_a_primary_track'`: {@link ConversionOptions.tracks} was `'primary'` and this track is not a primary
+	 * track of the input. Subtitle tracks are never primary tracks.
 	 */
 	reason:
 		| 'discarded_by_user'
@@ -603,9 +754,11 @@ export type DiscardedTrack = {
 		| 'unknown_source_codec'
 		| 'undecodable_source_codec'
 		| 'no_encodable_target_codec'
-		| 'cannot_copy';
+		| 'cannot_copy'
+		| 'unsupported_subtitle_codec'
+		| 'not_a_primary_track';
 	/** The options that were provided for this track, or `{}` if none were provided. */
-	trackOptions: ConversionVideoOptions | ConversionAudioOptions;
+	trackOptions: ConversionVideoOptions | ConversionAudioOptions | ConversionSubtitleOptions;
 };
 
 /**
@@ -841,6 +994,18 @@ export class Conversion {
 			// We'll validate the return value later
 		}
 
+		if (options.subtitle !== undefined && typeof options.subtitle !== 'function') {
+			if (Array.isArray(options.subtitle)) {
+				for (const obj of options.subtitle) {
+					validateSubtitleOptions(obj);
+				}
+			} else {
+				validateSubtitleOptions(options.subtitle);
+			}
+		} else {
+			// We'll validate the return value later
+		}
+
 		if (options.trim !== undefined && (!options.trim || typeof options.trim !== 'object')) {
 			throw new TypeError('options.trim, when provided, must be an object.');
 		}
@@ -902,6 +1067,16 @@ export class Conversion {
 			const primaryAudioTrack = await this.input.getPrimaryAudioTrack();
 
 			tracks = [primaryVideoTrack, primaryAudioTrack].filter(x => x !== null);
+
+			// The input has no primary subtitle track to select, so 'primary' holds none. Record them instead of
+			// letting them go missing without a word.
+			for (const subtitleTrack of await this.input.getSubtitleTracks()) {
+				this.discardedTracks.push({
+					track: subtitleTrack,
+					reason: 'not_a_primary_track',
+					trackOptions: {},
+				});
+			}
 		} else {
 			assertNever(trackMode);
 			assert(false);
@@ -912,13 +1087,15 @@ export class Conversion {
 		// Input track counters
 		let nVideo = 1;
 		let nAudio = 1;
+		let nSubtitle = 1;
 
 		// All tracks that aren't discarded by the user
 		const filteredTracks: InputTrack[] = [];
-		const filteredTrackOptions: (ConversionVideoOptions | ConversionAudioOptions)[][] = [];
+		const filteredTrackOptions: (ConversionVideoOptions | ConversionAudioOptions | ConversionSubtitleOptions)[][]
+			= [];
 
 		for (const track of tracks) {
-			let trackOptions: (ConversionVideoOptions | ConversionAudioOptions)[];
+			let trackOptions: (ConversionVideoOptions | ConversionAudioOptions | ConversionSubtitleOptions)[];
 
 			if (track.isVideoTrack()) {
 				if (this._options.video) {
@@ -968,6 +1145,32 @@ export class Conversion {
 						trackOptions = Array.isArray(this._options.audio)
 							? this._options.audio
 							: [this._options.audio];
+					}
+				} else {
+					trackOptions = [{}];
+				}
+			} else if (track.isSubtitleTrack()) {
+				if (this._options.subtitle) {
+					if (typeof this._options.subtitle === 'function') {
+						const returnedTrackOptions = await this._options.subtitle(track, nSubtitle) ?? {};
+						if (Array.isArray(returnedTrackOptions)) {
+							for (const obj of returnedTrackOptions) {
+								validateSubtitleOptions(obj);
+							}
+						} else {
+							validateSubtitleOptions(returnedTrackOptions);
+						}
+
+						trackOptions = Array.isArray(returnedTrackOptions)
+							? returnedTrackOptions
+							: [returnedTrackOptions];
+
+						nSubtitle++;
+					} else {
+						// Already validated
+						trackOptions = Array.isArray(this._options.subtitle)
+							? this._options.subtitle
+							: [this._options.subtitle];
 					}
 				} else {
 					trackOptions = [{}];
@@ -1054,6 +1257,8 @@ export class Conversion {
 					await this._processVideoTrack(track, option as ConversionVideoOptions, outputTrackId);
 				} else if (track.isAudioTrack()) {
 					await this._processAudioTrack(track, option as ConversionAudioOptions, outputTrackId);
+				} else if (track.isSubtitleTrack()) {
+					await this._processSubtitleTrack(track, option as ConversionSubtitleOptions, outputTrackId);
 				} else {
 					assert(false);
 				}
@@ -1459,6 +1664,14 @@ export class Conversion {
 			|| !!trackOptions.forceTranscode
 			|| !!trackOptions.frameRate
 			|| trackOptions.keyFrameInterval !== undefined
+			// Where the parameter sets sit is a property of the bitstream, so only a re-encode moves them.
+			|| trackOptions.parameterSets !== undefined
+			// Same for the bit depth, which is fixed by the codec profile the samples were encoded with.
+			|| trackOptions.bitDepth !== undefined
+			|| trackOptions.colorSpace !== undefined
+			// Unreachable while a demanded `hdrStaticMetadata` requires a demanded `colorSpace`, which already forces
+			// the transcode. Stated anyway, so that relaxing that pairing cannot turn into a copy silently ignoring it.
+			|| trackOptions.hdrStaticMetadata !== undefined
 			|| trackOptions.process !== undefined
 			|| trackOptions.quality !== undefined
 			// eslint-disable-next-line @typescript-eslint/no-deprecated
@@ -1666,7 +1879,15 @@ export class Conversion {
 			const quality = resolveQuality(trackOptions.quality, trackOptions.bitrate)
 				?? new Quality('high');
 
-			const encodableCodec = await getFirstEncodableVideoCodec(videoCodecs, {
+			const sourceDecoderConfig = await track.getDecoderConfig();
+			const sourceColorSpace = await track.getColorSpace();
+			let bitDepth = trackOptions.bitDepth
+				?? (sourceDecoderConfig ? extractVideoBitDepth(sourceDecoderConfig.codec) ?? undefined : undefined);
+			const colorSpace = trackOptions.colorSpace
+				?? (colorSpaceIsEmpty(sourceColorSpace) ? undefined : sourceColorSpace);
+			const hdrStaticMetadata = trackOptions.hdrStaticMetadata ?? sourceDecoderConfig?.hdrStaticMetadata;
+
+			const encodableCodecOptions = {
 				width: trackOptions.process && trackOptions.processedWidth
 					? trackOptions.processedWidth
 					: width,
@@ -1674,7 +1895,18 @@ export class Conversion {
 					? trackOptions.processedHeight
 					: height,
 				quality,
+			};
+
+			let encodableCodec = await getFirstEncodableVideoCodec(videoCodecs, {
+				...encodableCodecOptions,
+				bitDepth,
 			});
+			if (!encodableCodec && trackOptions.bitDepth === undefined && bitDepth !== undefined) {
+				// The source's bit depth is inherited, not demanded, so a format that can't reach it falls back to the
+				// codec default rather than dropping the track.
+				bitDepth = undefined;
+				encodableCodec = await getFirstEncodableVideoCodec(videoCodecs, encodableCodecOptions);
+			}
 			if (!encodableCodec) {
 				this.discardedTracks.push({
 					track,
@@ -1688,6 +1920,13 @@ export class Conversion {
 				codec: encodableCodec,
 				quality,
 				keyFrameInterval: trackOptions.keyFrameInterval,
+				parameterSets: trackOptions.parameterSets,
+				bitDepth,
+				colorSpace,
+				hdrStaticMetadata,
+				_bitDepthIsInherited: trackOptions.bitDepth === undefined,
+				_colorSpaceIsInherited: trackOptions.colorSpace === undefined,
+				_hdrStaticMetadataIsInherited: trackOptions.hdrStaticMetadata === undefined,
 				sizeChangeBehavior: trackOptions.fit ?? 'passThrough',
 				alpha,
 				hardwareAcceleration: trackOptions.hardwareAcceleration,
@@ -1702,6 +1941,15 @@ export class Conversion {
 				// Don't expect encoders to reliably handle non-square pixels:
 				|| squarePixelWidth !== await track.getCodedWidth()
 				|| squarePixelHeight !== await track.getCodedHeight();
+
+			// A re-render may keep the input's depth and color (a YUV-to-YUV scale) or flatten them to 8-bit sRGB (a
+			// 2D canvas), and only the re-rendered samples say which, so what they don't back is dropped further
+			// down, at the encoder. What follows is for the case where the encoder itself refuses them.
+			const dropInheritedColor = () => {
+				encodingConfig.bitDepth = trackOptions.bitDepth;
+				encodingConfig.colorSpace = trackOptions.colorSpace;
+				encodingConfig.hdrStaticMetadata = trackOptions.hdrStaticMetadata;
+			};
 
 			if (!needsRerender) {
 				// If we're directly passing decoded samples back to the encoder, sometimes the encoder may error due
@@ -1732,13 +1980,26 @@ export class Conversion {
 						firstSample.close();
 						await tempOutput.finalize();
 					} catch (error) {
+						if (error instanceof DeclaredColorSpaceMismatchError && trackOptions.colorSpace !== undefined) {
+							// The caller demanded this color space and the source doesn't carry it; re-rendering
+							// would only hide the conflict behind a canvas.
+							void tempOutput.cancel();
+							throw error;
+						}
+
 						Logging._warn(
-							'An error occurred when probing encoder support. Falling back to rerender path.', error,
+							error instanceof DeclaredColorSpaceMismatchError
+								? 'The color space inherited from the input contradicts the samples reaching the'
+								+ ' encoder, so it is dropped and the frames are re-rendered. The output states no'
+								+ ' color rather than one its samples do not have.'
+								: 'An error occurred when probing encoder support. Falling back to rerender path.',
+							error,
 						);
 						void tempOutput.cancel();
 
 						needsRerender = true;
 						encodingConfig.transform.force = true;
+						dropInheritedColor();
 					}
 				} else {
 					await tempOutput.cancel();
@@ -2213,6 +2474,107 @@ export class Conversion {
 			// TODO: This condition can be removed when all demuxers properly homogenize to BCP47 in v2
 			languageCode: isIso639Dash2LanguageCode(audioTrackLanguageCode)
 				? audioTrackLanguageCode
+				: undefined,
+			name: trackName ?? undefined,
+			disposition: trackDisposition,
+			group: ownGroup ?? trackOptions.group,
+		});
+
+		this.utilizedTracks.push(track);
+		this._outputTrackIds.push(outputTrackId);
+		this._outputOwnTrackGroups.push(ownGroup);
+	}
+
+	/** @internal */
+	async _processSubtitleTrack(
+		track: InputSubtitleTrack,
+		trackOptions: ConversionSubtitleOptions,
+		outputTrackId: number,
+	) {
+		const sourceCodec = await track.getCodec();
+		if (!sourceCodec) {
+			this.discardedTracks.push({
+				track,
+				reason: 'unknown_source_codec',
+				trackOptions,
+			});
+			return;
+		}
+
+		const supportedCodecs = this.output.format.getSupportedSubtitleCodecs();
+
+		// Every subtitle codec is driven from the same cue representation, so any supported codec is reachable from
+		// any source codec; only a codec the format cannot hold is out of reach.
+		let targetCodec: SubtitleCodec | null;
+		if (trackOptions.codec) {
+			targetCodec = supportedCodecs.includes(trackOptions.codec) ? trackOptions.codec : null;
+		} else {
+			targetCodec = supportedCodecs.includes(sourceCodec) ? sourceCodec : supportedCodecs[0] ?? null;
+		}
+
+		if (!targetCodec) {
+			this.discardedTracks.push({
+				track,
+				reason: 'unsupported_subtitle_codec',
+				trackOptions,
+			});
+			return;
+		}
+
+		// The config is the source codec's own header block, so it only means anything to that same codec.
+		const config = targetCodec === sourceCodec ? await track.getConfig() : null;
+		const source = new SubtitleCueSource(targetCodec);
+
+		this._registerTrackPump(async (pump) => {
+			const sink = new SubtitleCueSink(track);
+
+			// Only the first cue carries the track's config.
+			let meta: SubtitleMetadata | undefined = { config: config ?? { description: '' } };
+
+			for await (const cue of sink.cues(this._startTimestamp, this._endTimestamp)) {
+				if (this._state === 'canceled') {
+					break;
+				}
+
+				const cueStart = Math.max(cue.timestamp, this._startTimestamp);
+				const cueEnd = Math.min(cue.timestamp + cue.duration, this._endTimestamp);
+
+				const shiftedCue: SubtitleCue = {
+					...cue,
+					timestamp: cueStart + this._timestampOffset,
+					duration: Math.max(cueEnd - cueStart, 0),
+				};
+
+				this._reportProgress(outputTrackId, shiftedCue.timestamp + shiftedCue.duration);
+				await source.add(shiftedCue, meta);
+				meta = undefined;
+
+				if (this._synchronizer.shouldWait(outputTrackId, shiftedCue.timestamp)) {
+					await this._synchronizer.wait(shiftedCue.timestamp);
+				}
+
+				await this._checkpoint(pump, shiftedCue.timestamp);
+			}
+
+			source.close();
+			this._synchronizer.closeTrack(outputTrackId);
+		});
+
+		let ownGroup: OutputTrackGroup | null = null;
+		if (!trackOptions.group && !this._composable) {
+			// Create per-track groups to replicate the input's pairability graph. Don't do this for composable
+			// conversions.
+			ownGroup = new OutputTrackGroup();
+		}
+
+		const subtitleTrackLanguageCode = await track.getLanguageCode();
+		const trackName = await track.getName();
+		const trackDisposition = await track.getDisposition();
+
+		this.output.addSubtitleTrack(source, {
+			// TODO: This condition can be removed when all demuxers properly homogenize to BCP47 in v2
+			languageCode: isIso639Dash2LanguageCode(subtitleTrackLanguageCode)
+				? subtitleTrackLanguageCode
 				: undefined,
 			name: trackName ?? undefined,
 			disposition: trackDisposition,

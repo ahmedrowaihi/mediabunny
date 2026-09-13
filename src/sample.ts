@@ -244,6 +244,13 @@ export type VideoSampleInit = {
 	_doNotCopy?: boolean;
 };
 
+// A transformer is free to carry over part of the source's color (FFmpeg's filter graph keeps transfer and matrix
+// but loses primaries), so state nothing rather than a half-stale claim about re-rendered pixels.
+const dropColorSpace = (sample: VideoSample) => {
+	(sample as { colorSpace: VideoSampleColorSpace }).colorSpace = new VideoSampleColorSpace();
+	return sample;
+};
+
 /**
  * Represents a raw, unencoded video sample (frame). Mainly used as an expressive wrapper around WebCodecs API's
  * [`VideoFrame`](https://developer.mozilla.org/en-US/docs/Web/API/VideoFrame), but can also be used standalone.
@@ -1552,6 +1559,9 @@ export class VideoSample implements Disposable {
 	 * Transform this video sample to a new video sample given the options. Can be used to resize, rotate, flip, and
 	 * crop the sample.
 	 *
+	 * The returned sample has an empty color space: its pixels have been re-rendered, so this sample's color space no
+	 * longer describes them.
+	 *
 	 * In non-browser environments, this method will not work by default. To make it work, register a custom
 	 * transformer function via {@link registerVideoSampleTransformer}.
 	 */
@@ -1657,7 +1667,7 @@ export class VideoSample implements Disposable {
 			if (isThenable(result)) result = await result;
 
 			if (result !== null) {
-				return result;
+				return dropColorSpace(result);
 			}
 		}
 
@@ -1674,13 +1684,13 @@ export class VideoSample implements Disposable {
 			fillBlack: description.alpha === 'discard',
 		});
 
-		return new VideoSample(canvas, {
+		return dropColorSpace(new VideoSample(canvas, {
 			timestamp: this.timestamp,
 			duration: this.duration,
 			// Any previous rotation and flip are now baked in
 			rotation: 0,
 			flip: false,
-		});
+		}));
 	}
 
 	/** Sets the rotation metadata of this video sample. */

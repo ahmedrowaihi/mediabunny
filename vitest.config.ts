@@ -21,6 +21,11 @@ export default defineConfig({
 		},
 	},
 	test: {
+		// node-gc tests force collections to check finalization behaviour. --expose-gc is a V8 flag, which
+		// worker_threads execArgv rejects, so the whole run needs the forked pool. These must stay at the
+		// root: set inside a project entry they are ignored silently, and the tests run without gc.
+		pool: 'forks',
+		poolOptions: { forks: { execArgv: ['--expose-gc'] } },
 		projects: [
 			{
 				extends: true,
@@ -28,6 +33,15 @@ export default defineConfig({
 					name: 'node',
 					root: 'test',
 					include: ['node/**/*.test.ts'],
+					environment: 'node',
+				},
+			},
+			{
+				extends: true,
+				test: {
+					name: 'node-gc',
+					root: 'test',
+					include: ['node-gc/**/*.test.ts'],
 					environment: 'node',
 				},
 			},

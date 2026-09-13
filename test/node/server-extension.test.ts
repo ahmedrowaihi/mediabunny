@@ -284,7 +284,7 @@ describe('Video', async () => {
 				expect(naluTypes).toContain(AvcNalUnitType.PPS);
 
 				expect(meta.decoderConfig).toBeDefined();
-				expect(meta.decoderConfig!.codec.startsWith('avc1.')).toBe(true);
+				expect(meta.decoderConfig!.codec.startsWith('avc3.')).toBe(true);
 				expect(meta.decoderConfig!.description).toBeUndefined();
 			}
 		}, async (sample, i) => {
@@ -319,7 +319,7 @@ describe('Video', async () => {
 
 			if (i === 0) {
 				expect(meta.decoderConfig).toBeDefined();
-				expect(meta.decoderConfig!.codec.startsWith('hev1.')).toBe(true);
+				expect(meta.decoderConfig!.codec.startsWith('hvc1.')).toBe(true);
 				expect(meta.decoderConfig!.description).toBeDefined();
 				expect(toUint8Array(meta.decoderConfig!.description!)[0]).toBe(1); // configurationVersion
 			}
@@ -861,6 +861,156 @@ describe('Video', async () => {
 
 		return packets;
 	};
+
+	// Real footage scaled to 640x360, where a low quantizer far exceeds the caps below
+	const convertWithQuality = async (codec: VideoCodec, quality: Quality) => {
+		using input = new Input({ source: new FilePathSource('./test/public/video.mp4'), formats: ALL_FORMATS });
+		const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+		const conversion = await Conversion.init({
+			input,
+			output,
+			video: { codec, width: 640, quality, keyFrameInterval: 2, forceTranscode: true },
+			audio: { discard: true },
+			trim: { end: 4 },
+		});
+		await conversion.execute();
+
+		using result = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		const track = await result.getPrimaryVideoTrack();
+		assert(track);
+
+		const packets: EncodedPacket[] = [];
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			packets.push(packet);
+		}
+		return packets;
+	};
+
+	// Worst share of the VBV allowance (cap × window + buffer) over any window; above 1 breaks the cap
+	const worstShareOfCap = (packets: EncodedPacket[], maxBitrate: number, bufferSize: number, seconds: number) => {
+		let worst = 0;
+		for (const first of packets) {
+			const bits = packets
+				.filter(x => x.timestamp >= first.timestamp && x.timestamp < first.timestamp + seconds)
+				.reduce((sum, x) => sum + 8 * x.data.byteLength, 0);
+			worst = Math.max(worst, bits / (maxBitrate * seconds + bufferSize));
+		}
+		return worst;
+	};
+
+	test.each(['avc', 'hevc', 'vp9', 'av1'] as const)(
+		'%s capped quality stays within its bitrate cap',
+		{ timeout: 180_000 },
+		async (codec) => {
+			const quantizer = codec === 'av1' ? 16 : 4;
+			const maxBitrate = 400_000;
+			const bufferSize = 400_000;
+
+			const uncapped = await convertWithQuality(codec, new Quality({ quantizer }));
+			const capped = await convertWithQuality(codec, new Quality({ quantizer, maxBitrate, bufferSize }));
+			const uncappedShare = worstShareOfCap(uncapped, maxBitrate, bufferSize, 2);
+			const cappedShare = worstShareOfCap(capped, maxBitrate, bufferSize, 2);
+
+			expect(uncappedShare).toBeGreaterThan(1.5);
+			expect(cappedShare).toBeLessThanOrEqual(1);
+		},
+	);
+
+	// VP9 is left out: libvpx's capped mode is a target over the stream rather than a buffer model
+	test.each(['avc', 'hevc', 'av1'] as const)(
+		'%s capped quality holds its cap at 50 fps',
+		{ timeout: 120_000 },
+		async (codec) => {
+			using input = new Input({
+				source: new FilePathSource('./test/public/scene-cut-50fps.mp4'),
+				formats: ALL_FORMATS,
+			});
+			const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+			const maxBitrate = 100_000;
+			const bufferSize = 2 * maxBitrate;
+			const conversion = await Conversion.init({
+				input,
+				output,
+				video: {
+					codec,
+					quality: new Quality({ quantizer: codec === 'av1' ? 32 : 8, maxBitrate, bufferSize }),
+					keyFrameInterval: 2,
+					forceTranscode: true,
+				},
+			});
+			await conversion.execute();
+
+			using result = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+			const track = await result.getPrimaryVideoTrack();
+			assert(track);
+
+			let bytes = 0;
+			for await (const packet of new EncodedPacketSink(track).packets()) {
+				bytes += packet.data.byteLength;
+			}
+			const duration = await track.computeDuration();
+
+			expect(8 * bytes).toBeLessThanOrEqual(maxBitrate * duration + bufferSize);
+		},
+	);
+
+	// A hard scene cut at 5.0 s, 50 fps, 12 s: where an encoder choosing key frames itself would add one
+	const convertVideoPackets = async (codec: VideoCodec) => {
+		using input = new Input({
+			source: new FilePathSource('./test/public/scene-cut-50fps.mp4'),
+			formats: ALL_FORMATS,
+		});
+		const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+		const conversion = await Conversion.init({
+			input,
+			output,
+			video: { codec, keyFrameInterval: 2, forceTranscode: true },
+		});
+		await conversion.execute();
+
+		using result = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		const track = await result.getPrimaryVideoTrack();
+		assert(track);
+
+		const packets: EncodedPacket[] = [];
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			packets.push(packet);
+		}
+
+		return packets;
+	};
+
+	test.each(['avc', 'hevc', 'vp9', 'av1'] as const)(
+		'%s key frames land only on the forced key frame interval',
+		{ timeout: 60_000 },
+		async (codec) => {
+			const packets = await convertVideoPackets(codec);
+			expect(packets.filter(packet => packet.type === 'key').map(packet => packet.timestamp))
+				.toEqual([0, 2, 4, 6, 8, 10]);
+		},
+	);
+
+	test('A forced HEVC key frame is an IDR, with no CRA or RASL pictures', { timeout: 60_000 }, async () => {
+		const packets = await convertVideoPackets('hevc');
+
+		const naluTypes = new Set<number>();
+		for (const packet of packets) {
+			const types = [...iterateNalUnitsInLengthPrefixed(packet.data, 4)]
+				.map(loc => extractNalUnitTypeForHevc(packet.data[loc.offset]!));
+			types.forEach(type => naluTypes.add(type));
+
+			if (packet.type === 'key') {
+				expect(types.some(type => type === HevcNalUnitType.IDR_W_RADL || type === HevcNalUnitType.IDR_N_LP))
+					.toBe(true);
+			}
+		}
+
+		// Leading RASL pictures reference frames before their CRA, so playback starting at that key frame can't
+		// decode them
+		expect(naluTypes.has(HevcNalUnitType.CRA_NUT)).toBe(false);
+		expect(naluTypes.has(HevcNalUnitType.RASL_N)).toBe(false);
+		expect(naluTypes.has(HevcNalUnitType.RASL_R)).toBe(false);
+	});
 
 	test('AVC conversion roundtrip', { timeout: 20_000 }, async () => {
 		await conversionRoundtrip('avc');
@@ -1477,6 +1627,50 @@ describe('Video', async () => {
 				},
 			});
 			await conversion.execute();
+		});
+	});
+
+	describe('Inherited bit depth', () => {
+		const transcode = async (file: string, bitDepth?: 8 | 10) => {
+			using input = new Input({ source: new FilePathSource(file), formats: ALL_FORMATS });
+			const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+
+			const conversion = await Conversion.init({
+				input,
+				output,
+				video: { codec: 'avc', forceTranscode: true, bitDepth },
+			});
+			await conversion.execute();
+
+			using result = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+			const track = await result.getPrimaryVideoTrack();
+			assert(track);
+			const sample = await new VideoSampleSink(track).getSample(0);
+			assert(sample);
+			const format = sample.format;
+			sample.close();
+
+			return { codec: (await track.getDecoderConfig())!.codec, format };
+		};
+
+		test('an 8-bit source whose profile allows 10 bits stays 8-bit', async () => {
+			// High 4:4:4 Predictive (x264 lossless) carrying yuv420p
+			const { codec, format } = await transcode('./test/public/avc-high444-8bit.mp4');
+
+			expect(codec).toMatch(/^avc1\.64/);
+			expect(format).toBe('I420');
+		});
+
+		test('a 10-bit source still inherits 10 bits', async () => {
+			const { codec, format } = await transcode('./test/public/avc-high10.mp4');
+
+			expect(codec).toMatch(/^avc1\.6e/);
+			expect(format).toBe('I420P10');
+		});
+
+		test('a requested depth is honoured regardless of the source', async () => {
+			expect((await transcode('./test/public/avc-high444-8bit.mp4', 10)).codec).toMatch(/^avc1\.6e/);
+			expect((await transcode('./test/public/avc-high10.mp4', 8)).codec).toMatch(/^avc1\.64/);
 		});
 	});
 });

@@ -11,6 +11,8 @@ import { InputFormat, InputFormatOptions, validateInputFormatOptions } from './i
 import {
 	InputAudioTrack,
 	InputAudioTrackBacking,
+	InputSubtitleTrack,
+	InputSubtitleTrackBacking,
 	InputTrack,
 	InputTrackBacking,
 	InputVideoTrack,
@@ -424,6 +426,15 @@ export class Input<S extends Source = Source> extends EventEmitter<InputEvents> 
 		return queryInputTracks(audioTracks, query);
 	}
 
+	/** Returns the list of all subtitle tracks of this input file. An optional query can be provided. */
+	async getSubtitleTracks(query?: InputTrackQuery<InputSubtitleTrack>): Promise<InputSubtitleTrack[]> {
+		query &&= toValidatedInputTrackQuery(query);
+
+		const tracks = await this.getTracks();
+		const subtitleTracks = tracks.filter((x): x is InputSubtitleTrack => x.isSubtitleTrack());
+		return queryInputTracks(subtitleTracks, query);
+	}
+
 	/**
 	 * Returns the primary video track of this input file, or null if there are no video tracks.
 	 *
@@ -487,9 +498,14 @@ export class Input<S extends Source = Source> extends EventEmitter<InputEvents> 
 		}
 
 		const type = backing.getType();
-		const track = type === 'video'
-			? new InputVideoTrack(this, backing as InputVideoTrackBacking)
-			: new InputAudioTrack(this, backing as InputAudioTrackBacking);
+		let track: InputTrack;
+		if (type === 'video') {
+			track = new InputVideoTrack(this, backing as InputVideoTrackBacking);
+		} else if (type === 'audio') {
+			track = new InputAudioTrack(this, backing as InputAudioTrackBacking);
+		} else {
+			track = new InputSubtitleTrack(this, backing as InputSubtitleTrackBacking);
+		}
 
 		this._backingToTrack.set(backing, track);
 		return track;
@@ -508,6 +524,26 @@ export class Input<S extends Source = Source> extends EventEmitter<InputEvents> 
 	async getMetadataTags() {
 		const demuxer = await this._getDemuxer();
 		return demuxer.getMetadataTags();
+	}
+
+	/**
+	 * Returns parsed `sidx` (Segment Index) boxes from the file, if any. Multiple boxes are valid (typically
+	 * one per track, distinguished by their `referenceID`). Returns an empty array for formats without a
+	 * `sidx` equivalent.
+	 */
+	async getSegmentIndex() {
+		const demuxer = await this._getDemuxer();
+		return demuxer.getSegmentIndex();
+	}
+
+	/**
+	 * Returns top-level Protection System Specific Header (`pssh`) boxes from the file, one per DRM system
+	 * (Widevine, PlayReady, FairPlay, etc.). Use {@link parsePsshBoxContents} on the raw bytes to get
+	 * structured fields. Returns an empty array for clear files and for formats without a `pssh` equivalent.
+	 */
+	async getPsshBoxes() {
+		const demuxer = await this._getDemuxer();
+		return demuxer.getPsshBoxes();
 	}
 
 	/**

@@ -76,6 +76,7 @@ export abstract class SegmentedInput {
 	firstSegmentFirstTimestamps = new WeakMap<Segment, number>();
 
 	firstTimestampCache = new WeakMap<Input, number>();
+	timelineCorrectionPromise: Promise<number> | null = null;
 
 	constructor(input: Input, path: string, trackDeclarations: SegmentedInputTrackDeclaration[] | null) {
 		this.input = input;
@@ -90,6 +91,11 @@ export abstract class SegmentedInput {
 	abstract getInputForSegment(segment: Segment): Input;
 
 	abstract getLiveRefreshInterval(): Promise<number | null>;
+
+	// Renditions playable alongside this one, at most one per track type
+	getPairedSegmentedInputs(): SegmentedInput[] {
+		return [];
+	}
 
 	async getDurationFromMetadata(options: DurationMetadataRequestOptions) {
 		const lastSegment = await this.getSegmentAt(Infinity, {
@@ -184,6 +190,36 @@ export abstract class SegmentedInput {
 		return firstTimestamp;
 	}
 
+	async getFirstSegmentMediaOffset() {
+		const firstSegment = await this.getFirstSegment({});
+		if (!firstSegment) {
+			return null;
+		}
+
+		return firstSegment.timestamp - await this.getFirstTimestampForInput(this.getInputForSegment(firstSegment));
+	}
+
+	// Renditions share one media timeline (RFC 8216 §6.2.4), so a later-starting one keeps its lag
+	getTimelineCorrection() {
+		return this.timelineCorrectionPromise ??= (async () => {
+			const ownOffset = await this.getFirstSegmentMediaOffset();
+			if (ownOffset === null) {
+				return 0;
+			}
+
+			let correction = 0;
+			for (const other of this.getPairedSegmentedInputs()) {
+				const otherOffset = await other.getFirstSegmentMediaOffset().catch(() => null);
+				// Renditions more than 0.5 s apart are treated as separate timelines, not as one with a lag
+				if (otherOffset !== null && Math.abs(otherOffset - ownOffset) <= 0.5) {
+					correction = Math.max(correction, otherOffset - ownOffset);
+				}
+			}
+
+			return correction;
+		})();
+	}
+
 	async getMediaOffset(segment: Segment, input: Input) {
 		const firstSegment = segment.firstSegment ?? segment;
 
@@ -197,7 +233,7 @@ export abstract class SegmentedInput {
 		}
 
 		if (firstSegment === segment) {
-			return firstSegment.timestamp - firstSegmentFirstTimestamp;
+			return firstSegment.timestamp - firstSegmentFirstTimestamp + await this.getTimelineCorrection();
 		}
 
 		const segmentFirstTimestamp = await this.getFirstTimestampForInput(input);
@@ -207,7 +243,7 @@ export abstract class SegmentedInput {
 
 		if (Math.abs(difference) <= Math.min(0.25, segmentElapsed)) { // Heuristic
 			// We're close enough
-			return firstSegment.timestamp - firstSegmentFirstTimestamp;
+			return firstSegment.timestamp - firstSegmentFirstTimestamp + await this.getTimelineCorrection();
 		} else {
 			// Ideally, each segment has absolute timestamps that are relative to some outside clock which is
 			// consistent across segments. This is often the case, but not always. Either the container format used is
@@ -320,6 +356,10 @@ class SegmentedInputInputTrackBacking implements InputTrackBacking {
 
 	getInternalCodecId() {
 		return this.delegate(() => this.firstInputTrack!._backing.getInternalCodecId());
+	}
+
+	getEncryptionInfo() {
+		return this.delegate(() => this.firstInputTrack!._backing.getEncryptionInfo());
 	}
 
 	getDisposition() {

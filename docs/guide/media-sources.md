@@ -202,6 +202,30 @@ new Quality({
 });
 ```
 
+#### Capped quality
+
+A qualitative quality or a quantizer can be capped at a peak bitrate. The quality is then held until holding it would exceed the cap, and the bitrate otherwise follows the content. This rate control is also known as capped CRF, or QVBR in AWS Elemental encoders. It suits adaptive streaming, where each rendition's peak bitrate must stay within what its manifest promises.
+
+```ts
+import { Quality } from 'mediabunny';
+
+// Hold quantizer 22, but never exceed 6 Mbps
+new Quality({
+	quantizer: 22,
+	maxBitrate: 6e6,
+});
+
+// The cap is enforced against a rate-control buffer, twice maxBitrate by
+// default; a smaller buffer keeps the bitrate closer to the cap
+new Quality({
+	quality: 'high',
+	maxBitrate: 6e6,
+	bufferSize: 6e6,
+});
+```
+
+Capped quality needs an encoder that implements it, such as those of `@mediabunny/server`; WebCodecs has no such mode. Where it can't be used, a `bitrate` set alongside is the fallback, and a qualitative quality falls back to bitrate-based encoding at no more than `maxBitrate`. A quantizer without a `bitrate` fallback throws.
+
 ## Video sources
 
 Video sources feed data to video tracks on an `Output`. They all extend the abstract `VideoSource` class.

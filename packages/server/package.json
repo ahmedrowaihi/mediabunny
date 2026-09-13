@@ -1,5 +1,5 @@
 {
-  "name": "@mediabunny/server",
+  "name": "@ahmedrowaihi/mediabunny-server",
   "author": "Vanilagy",
   "version": "1.58.0",
   "description": "Adds full video and audio decoder and encoder support to Mediabunny for use in server-side environments (Node, Bun, Deno). Based on NodeAV.",
@@ -18,15 +18,18 @@
     "dist",
     "src"
   ],
-  "sideEffects": false,
+  "publishConfig": {
+  "access": "public"
+ },
+ "sideEffects": false,
   "license": "MPL-2.0",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Vanilagy/mediabunny.git",
+    "url": "git+https://github.com/ahmedrowaihi/mediabunny.git",
     "directory": "packages/server"
   },
   "bugs": {
-    "url": "https://github.com/Vanilagy/mediabunny/issues"
+    "url": "https://github.com/ahmedrowaihi/mediabunny/issues"
   },
   "homepage": "https://mediabunny.dev/guide/extensions/server",
   "funding": {

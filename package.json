@@ -1,7 +1,10 @@
 {
-  "name": "mediabunny",
+  "name": "@ahmedrowaihi/mediabunny",
   "author": "Vanilagy",
   "version": "1.58.0",
+  "publishConfig": {
+    "access": "public"
+  },
   "description": "Pure TypeScript media toolkit for reading, writing, and converting media files, directly in the browser.",
   "type": "module",
   "workspaces": [
@@ -29,6 +32,8 @@
     "README.md",
     "package.json",
     "LICENSE",
+    "LICENSE.shaka-packager",
+    "NOTICE",
     "dist",
     "src"
   ],
@@ -64,7 +69,7 @@
   "license": "MPL-2.0",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Vanilagy/mediabunny.git"
+    "url": "git+https://github.com/ahmedrowaihi/mediabunny.git"
   },
   "bugs": {
     "url": "https://github.com/Vanilagy/mediabunny/issues"

@@ -12,7 +12,12 @@ import { assert } from '../../src/misc.js';
 
 const SAMPLE_URL = 'https://pub-1ee78aacb848486482b20a72b55b3121.r2.dev/turbores-sample.mov';
 
-test.concurrent('ProRes MOV file reading', { timeout: 20_000 }, async () => {
+// Every test here downloads SAMPLE_URL and then transmuxes or decodes it. Under a full parallel run the
+// download competes with the rest of the suite for bandwidth and CPU, and 20s was not enough: the two
+// transmuxing tests timed out in 3 of 4 runs while reaching the network fine (no connect errors).
+const NETWORK_TIMEOUT = 60_000;
+
+test.concurrent('ProRes MOV file reading', { timeout: NETWORK_TIMEOUT }, async () => {
 	using input = new Input({
 		source: new UrlSource(SAMPLE_URL),
 		formats: ALL_FORMATS,
@@ -28,7 +33,7 @@ test.concurrent('ProRes MOV file reading', { timeout: 20_000 }, async () => {
 	expect(decoderConfig.description).toBeUndefined();
 });
 
-test.concurrent('ProRes transmuxing into MOV', { timeout: 20_000 }, async () => {
+test.concurrent('ProRes transmuxing into MOV', { timeout: NETWORK_TIMEOUT }, async () => {
 	using input = new Input({
 		source: new UrlSource(SAMPLE_URL),
 		formats: ALL_FORMATS,
@@ -65,7 +70,7 @@ test.concurrent('ProRes transmuxing into MOV', { timeout: 20_000 }, async () => 
 	expect(decoderConfig.description).toBeUndefined();
 });
 
-test.concurrent('ProRes transmuxing into MKV', { timeout: 20_000 }, async () => {
+test.concurrent('ProRes transmuxing into MKV', { timeout: NETWORK_TIMEOUT }, async () => {
 	using input = new Input({
 		source: new UrlSource(SAMPLE_URL),
 		formats: ALL_FORMATS,
@@ -114,7 +119,7 @@ test.concurrent('ProRes transmuxing into MKV', { timeout: 20_000 }, async () => 
 	expect(str.includes('icpf')).toBe(true);
 });
 
-test('Custom coder registration', { timeout: 20_000 }, async () => {
+test('Custom coder registration', { timeout: NETWORK_TIMEOUT }, async () => {
 	using input = new Input({
 		source: new UrlSource(SAMPLE_URL),
 		formats: ALL_FORMATS,
@@ -131,7 +136,7 @@ test('Custom coder registration', { timeout: 20_000 }, async () => {
 	expect(await videoTrack.canDecode()).toBe(true);
 });
 
-test('ProRes decoding', { timeout: 20_000 }, async () => {
+test('ProRes decoding', { timeout: NETWORK_TIMEOUT }, async () => {
 	registerProresDecoder();
 
 	using input = new Input({

@@ -53,6 +53,12 @@ export class EncodedPacket {
 
 	/** Additional data carried with this packet. */
 	readonly sideData: EncodedPacketSideData;
+	/**
+	 * The decode timestamp of this packet in seconds — when this packet must be decoded, as opposed
+	 * to when it is presented. Equal to {@link EncodedPacket.timestamp} for a stream with no
+	 * reordering, and earlier for a packet that is presented after a later-decoded one.
+	 */
+	readonly decodeTimestamp: number;
 
 	/** Creates a new {@link EncodedPacket} from raw bytes and timing information. */
 	constructor(
@@ -79,6 +85,12 @@ export class EncodedPacket {
 		public readonly sequenceNumber = -1,
 		byteLength?: number,
 		sideData?: EncodedPacketSideData,
+		/**
+		 * The decode timestamp in seconds, when the source states one. Equal to {@link timestamp}
+		 * unless the packet is reordered, where it is earlier. Muxers that must write a decode time
+		 * (MPEG-TS) need it: it cannot be derived from presentation timestamps alone.
+		 */
+		decodeTimestamp?: number,
 	) {
 		if (data === PLACEHOLDER_DATA && byteLength === undefined) {
 			throw new Error(
@@ -89,6 +101,8 @@ export class EncodedPacket {
 		if (byteLength === undefined) {
 			byteLength = data.byteLength;
 		}
+
+		this.decodeTimestamp = decodeTimestamp ?? timestamp;
 
 		if (!(data instanceof Uint8Array)) {
 			throw new TypeError('data must be a Uint8Array.');
@@ -251,6 +265,8 @@ export class EncodedPacket {
 		sequenceNumber?: number;
 		/** The side data of the cloned packet. */
 		sideData?: EncodedPacketSideData;
+		/** The decode timestamp of the cloned packet in seconds. */
+		decodeTimestamp?: number;
 	}): EncodedPacket {
 		if (options !== undefined && (typeof options !== 'object' || options === null)) {
 			throw new TypeError('options, when provided, must be an object.');
@@ -274,14 +290,21 @@ export class EncodedPacket {
 			throw new TypeError('options.sideData, when provided, must be an object.');
 		}
 
+		// Re-timing a packet moves when it is decoded by the same amount: the gap between the two is
+		// the reorder delay, and a muxer that must write both reads it from here.
+		const timestamp = options?.timestamp ?? this.timestamp;
+		const decodeTimestamp = options?.decodeTimestamp
+			?? this.decodeTimestamp + (timestamp - this.timestamp);
+
 		return new EncodedPacket(
 			options?.data ?? this.data,
 			options?.type ?? this.type,
-			options?.timestamp ?? this.timestamp,
+			timestamp,
 			options?.duration ?? this.duration,
 			options?.sequenceNumber ?? this.sequenceNumber,
 			this.byteLength,
 			options?.sideData ?? this.sideData,
+			decodeTimestamp,
 		);
 	}
 }

@@ -78,6 +78,8 @@ export abstract class SegmentedInput {
 	learnedSegmentTimestampOffset: number | null = null;
 	segmentMediaOffsets = new WeakMap<Segment, Promise<number>>();
 
+	timelineCorrectionPromise: Promise<number> | null = null;
+
 	constructor(input: Input, path: string, trackDeclarations: SegmentedInputTrackDeclaration[] | null) {
 		this.input = input;
 		this.path = path;
@@ -95,6 +97,11 @@ export abstract class SegmentedInput {
 	abstract getFirstSegmentTimestampOffset(): Promise<number>;
 	abstract getRawTimestampOffset(input: Input): Promise<number | null>; // Needed to make things like MP3/ADTS work
 	abstract getTimestampWrapPeriod(): number;
+
+	// Renditions playable alongside this one, at most one per track type
+	getPairedSegmentedInputs(): SegmentedInput[] {
+		return [];
+	}
 
 	async getDurationFromMetadata(options: DurationMetadataRequestOptions) {
 		const lastSegment = await this.getSegmentAt(Infinity, {
@@ -316,6 +323,10 @@ class SegmentedInputInputTrackBacking implements InputTrackBacking {
 
 	getInternalCodecId() {
 		return this.delegate(() => this.firstInputTrack!._backing.getInternalCodecId());
+	}
+
+	getEncryptionInfo() {
+		return this.delegate(() => this.firstInputTrack!._backing.getEncryptionInfo());
 	}
 
 	getDisposition() {

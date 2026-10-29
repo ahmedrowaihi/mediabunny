@@ -103,6 +103,14 @@ export abstract class Source extends EventEmitter<SourceEvents> {
 	 */
 	_refFinalizationRegistry: FinalizationRegistry<Source> | null = null;
 
+	/**
+	 * Marked `true` by `DashInputFormat._canReadInput` when this source is
+	 * the root of a DASH manifest; sub-source disposal hygiene uses the same
+	 * mechanism as HLS.
+	 * @internal
+	 */
+	_usedForDash = false;
+
 	/** @internal */
 	private _sizePromise: Promise<number | null> | null = null;
 
@@ -111,6 +119,17 @@ export abstract class Source extends EventEmitter<SourceEvents> {
 
 		if (typeof FinalizationRegistry !== 'undefined') {
 			this._refFinalizationRegistry = new FinalizationRegistry((source) => {
+				// Reaching here means .free() was never called; free() unregisters. HLS and DASH reading
+				// evict cached segment inputs without disposing them — an evicted one may still be being
+				// read — and leave the refs to the registry by design, so the warning would be noise there.
+				if (!source._usedForHls && !source._usedForDash) {
+					Logging._warn(
+						'A SourceRef was garbage-collected without being freed. Hold on to the ref and call .free()'
+						+ ' when done, otherwise the source can dispose itself at an arbitrary later point and'
+						+ ' unrelated reads will fail with InputDisposedError.',
+					);
+				}
+
 				source._decrementRefCount();
 			});
 		}
@@ -124,7 +143,7 @@ export abstract class Source extends EventEmitter<SourceEvents> {
 	 */
 	async getSizeOrNull() {
 		if (this._disposed) {
-			throw new InputDisposedError();
+			throw new InputDisposedError('Cannot get the source size; the source has been disposed.');
 		}
 
 		return this._sizePromise ??= (async () => {
@@ -149,7 +168,7 @@ export abstract class Source extends EventEmitter<SourceEvents> {
 	 */
 	async getSize() {
 		if (this._disposed) {
-			throw new InputDisposedError();
+			throw new InputDisposedError('Cannot get the source size; the source has been disposed.');
 		}
 
 		const result = await this.getSizeOrNull();
@@ -158,6 +177,50 @@ export abstract class Source extends EventEmitter<SourceEvents> {
 		}
 
 		return result;
+	}
+
+	/**
+	 * Resolves with the bytes in the range `[start, end)`, or with null if that range lies outside the source's data.
+	 *
+	 * The returned bytes are a copy owned by the caller. Throws if the source provides fewer bytes than the range
+	 * asks for, rather than returning a short result that reads as the whole range.
+	 */
+	async readRange(start: number, end: number) {
+		if (this._disposed) {
+			throw new InputDisposedError(`Cannot read bytes [${start}, ${end}); the source has been disposed.`);
+		}
+		if (!isNumber(start) || !Number.isInteger(start) || start < 0) {
+			throw new TypeError('start must be a non-negative integer.');
+		}
+		if (!isNumber(end) || !Number.isInteger(end) || end < start) {
+			throw new TypeError('end must be an integer greater than or equal to start.');
+		}
+
+		if (start === end) {
+			return new Uint8Array(0);
+		}
+
+		const fileSize = this._getFileSize();
+		if (typeof fileSize === 'number' && end > fileSize) {
+			return null;
+		}
+
+		const result = await this._read(start, end, DEFAULT_MIN_READ_POSITION, DEFAULT_MAX_READ_POSITION);
+		if (!result) {
+			return null;
+		}
+
+		const bufferStart = start - result.offset;
+		const bytes = result.bytes.slice(bufferStart, bufferStart + (end - start));
+		// Serving fewer bytes as if they were the whole range is worse than failing
+		if (bytes.length !== end - start) {
+			throw new Error(
+				`Short read: asked for bytes [${start}, ${end}) but the source provided ${bytes.length} of`
+				+ ` ${end - start}.`,
+			);
+		}
+
+		return bytes;
 	}
 
 	/**
@@ -325,6 +388,7 @@ export abstract class PathedSource extends Source {
 				: result;
 
 			ref.source._usedForHls ||= this._usedForHls;
+			ref.source._usedForDash ||= this._usedForDash;
 
 			return ref;
 		};
@@ -419,8 +483,7 @@ export class CustomPathedSource extends PathedSource {
 			this._root.free();
 		} else if (this._rootRequest) {
 			void this._rootRequest
-				.then(ref => ref.free())
-				.catch(() => {});
+				.then(ref => ref.free());
 		}
 	}
 }
@@ -702,6 +765,9 @@ const DEFAULT_RETRY_DELAY
 		return Math.min(2 ** (previousAttempts - 2), 16);
 	}) satisfies UrlSourceOptions['getRetryDelay'];
 
+/** Seconds of continuous failure after which a read gives up. See `UrlSourceOptions.retryTimeout`. */
+const DEFAULT_RETRY_TIMEOUT = 60;
+
 const warnedOrigins = new Set<string>();
 
 /**
@@ -724,10 +790,24 @@ export type UrlSourceOptions = {
 	 * with the number of previous, unsuccessful attempts, as well as with the error with which the previous request
 	 * failed. If the function returns `null`, no more retries will be made.
 	 *
-	 * By default, it uses an exponential backoff algorithm that never gives up unless
-	 * a CORS error is suspected (`fetch()` did reject, `navigator.onLine` is true and origin is different).
+	 * By default, it uses an exponential backoff algorithm that keeps retrying unless a CORS error is
+	 * suspected (`fetch()` did reject, `navigator.onLine` is true and origin is different). It is bounded
+	 * by {@link UrlSourceOptions.retryTimeout} rather than by this function, so overriding it does not
+	 * make a read unbounded.
 	 */
 	getRetryDelay?: (previousAttempts: number, error: unknown, url: string | URL | Request) => number | null;
+
+	/**
+	 * How long, in seconds, a request may keep failing before the read is given up on and rejects with
+	 * {@link RetryTimeoutError}. Defaults to 60. Pass `null` to retry for as long as the source is alive.
+	 *
+	 * This exists because a retry policy alone cannot end: the default {@link
+	 * UrlSourceOptions.getRetryDelay} returns a delay for every failure and never `null`, so against a
+	 * closed port or a blackholed host the read would never settle and a caller would have no rejection
+	 * to handle. Disposing the input still cancels everything in flight; this is for the case where
+	 * nobody is there to dispose it.
+	 */
+	retryTimeout?: number | null;
 
 	/** The maximum number of bytes the cache is allowed to hold in memory. Defaults to 64 MiB. */
 	maxCacheSize?: number;
@@ -757,6 +837,8 @@ export class UrlSource extends PathedSource {
 	_url: string | URL | Request;
 	/** @internal */
 	_getRetryDelay: (previousAttempts: number, error: unknown, url: string | URL | Request) => number | null;
+	/** Seconds a request may keep failing before the read is given up on; null retries while alive. */
+	_retryTimeout: number | null;
 	/** @internal */
 	_options: UrlSourceOptions;
 	/** @internal */
@@ -811,6 +893,12 @@ export class UrlSource extends PathedSource {
 			throw new TypeError('options.getRetryDelay, when provided, must be a function.');
 		}
 		if (
+			options.retryTimeout !== undefined && options.retryTimeout !== null
+			&& (!isNumber(options.retryTimeout) || options.retryTimeout < 0)
+		) {
+			throw new TypeError('options.retryTimeout, when provided, must be a non-negative number or null.');
+		}
+		if (
 			options.maxCacheSize !== undefined
 			&& (!isNumber(options.maxCacheSize) || options.maxCacheSize < 0)
 		) {
@@ -841,6 +929,7 @@ export class UrlSource extends PathedSource {
 		this._url = url;
 		this._options = options;
 		this._getRetryDelay = options.getRetryDelay ?? DEFAULT_RETRY_DELAY;
+		this._retryTimeout = options.retryTimeout === undefined ? DEFAULT_RETRY_TIMEOUT : options.retryTimeout;
 
 		// A user-supplied Range header is interpreted as a byte offset (and optional length) into the resource. We
 		// pull it out of the request and remember it for subsequent requests.
@@ -970,6 +1059,7 @@ export class UrlSource extends PathedSource {
 				}),
 				this._getRetryDelay,
 				() => abortController.signal.aborted,
+				this._retryTimeout,
 			);
 
 			if (!response.ok) {
@@ -1071,7 +1161,7 @@ export class UrlSource extends PathedSource {
 					return;
 				}
 
-				let readResult: ReadableStreamReadResult<Uint8Array>;
+				let readResult: Awaited<ReturnType<typeof reader.read>>;
 
 				try {
 					readResult = await reader.read();
@@ -1177,6 +1267,7 @@ export class UrlSource extends PathedSource {
 							}),
 							this._getRetryDelay,
 							() => this._disposed,
+							this._retryTimeout,
 						);
 
 						if (!newResponse.ok) {
@@ -1971,7 +2062,9 @@ export class ReadableStreamSource extends Source {
 	/** @internal */
 	_dispose() {
 		for (const pendingSlice of this._pendingSlices) {
-			pendingSlice.reject(new InputDisposedError());
+			pendingSlice.reject(new InputDisposedError(
+				`Cannot read bytes [${pendingSlice.start}, ${pendingSlice.end}); the source has been disposed.`,
+			));
 		}
 
 		this._pendingSlices.length = 0;
@@ -2044,6 +2137,16 @@ const PREFETCH_PROFILES = {
 
 				const extent = Math.min(b, a);
 				end = Math.max(end, worker.startPos + extent);
+			}
+
+			// A read ending just before a worker's region means the file is being walked backwards (such as when
+			// rewinding to a previous packet), so grow the start the same way instead of paying one request per
+			// padding step.
+			if (end <= worker.startPos && end > worker.startPos - paddingStart) {
+				const size = worker.targetPos - worker.startPos;
+				const extent = Math.min(2 ** Math.ceil(Math.log2(size + 1)), maxExtensionAmount);
+				const extendedStart = Math.floor((worker.startPos - extent) / paddingStart) * paddingStart;
+				start = Math.max(0, Math.min(start, extendedStart));
 			}
 		}
 
@@ -2751,7 +2854,10 @@ class ReadOrchestrator {
 	dispose() {
 		for (const worker of this.workers) {
 			for (const slice of worker.pendingSlices) {
-				slice.reject(new InputDisposedError());
+				slice.reject(new InputDisposedError(
+					`Cannot read bytes [${slice.start}, ${slice.start + slice.bytes.length});`
+					+ ` the source has been disposed.`,
+				));
 			}
 
 			worker.pendingSlices.length = 0;
@@ -2765,7 +2871,10 @@ class ReadOrchestrator {
 
 		for (const queuedRead of this.queuedReads) {
 			for (const slice of queuedRead.pendingSlices) {
-				slice.reject(new InputDisposedError());
+				slice.reject(new InputDisposedError(
+					`Cannot read bytes [${slice.start}, ${slice.start + slice.bytes.length});`
+					+ ` the source has been disposed.`,
+				));
 			}
 		}
 

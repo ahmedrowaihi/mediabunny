@@ -597,3 +597,81 @@ const findBtrtBoxes = (bytes: Uint8Array) => {
 
 	return boxes;
 };
+
+const muxWithCreationTime = async (creationTime: Date) => {
+	using input = new Input({
+		source: new FilePathSource(path.join(__dirname, '../public/video.mp4')),
+		formats: ALL_FORMATS,
+	});
+
+	const output = new Output({
+		format: new Mp4OutputFormat({ creationTime }),
+		target: new BufferTarget(),
+	});
+	await (await Conversion.init({ input, output })).execute();
+	return new Uint8Array(output.target.buffer!);
+};
+
+// Three full conversions; the default 5s budget is not enough under a loaded suite.
+test('creationTime is written into the container and makes muxing reproducible', { timeout: 30_000 }, async () => {
+	const early = new Date('2020-01-01T00:00:00Z');
+	const [first, second] = [await muxWithCreationTime(early), await muxWithCreationTime(early)];
+	const late = await muxWithCreationTime(new Date('2021-06-15T12:00:00Z'));
+
+	// Equality alone would also hold if the option were ignored and both runs landed in the same
+	// wall-clock second, so a second date is what proves the value reaches the file.
+	expect(second).toEqual(first);
+	expect(late).not.toEqual(first);
+});
+
+test('creationTime rejects a value that would write a garbage timestamp', () => {
+	expect(() => new Mp4OutputFormat({ creationTime: new Date('nope') })).toThrow(/valid Date/);
+});
+
+// Regression: two concurrent encoders finishing in a different order must not change the file. Before the
+// non-fragmented path queued its samples, chunks were written on arrival, so one audio and one video chunk
+// could swap places around a chunk boundary — byte-identical media laid out two different ways.
+const twoTrackMp4 = async (arrival: 'ordered' | 'videoRunsAhead') => {
+	const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+	const video = new EncodedVideoPacketSource('vp8');
+	const audio = new EncodedAudioPacketSource('pcm-s16');
+	output.addVideoTrack(video);
+	output.addAudioTrack(audio);
+	await output.start();
+
+	const videoMeta = { decoderConfig: { codec: 'vp8', codedWidth: 320, codedHeight: 240 } };
+	const audioMeta = { decoderConfig: { codec: 'pcm-s16', sampleRate: 44100, numberOfChannels: 1 } };
+	const videoPacket = (i: number) =>
+		new EncodedPacket(new Uint8Array(1024).fill(i & 0xff), i % 10 === 0 ? 'key' : 'delta', i * 0.1, 0.1);
+	const audioPacket = (i: number) =>
+		new EncodedPacket(new Uint8Array(512).fill(i & 0xff), 'key', i * 0.1, 0.1);
+
+	const count = 40;
+	if (arrival === 'ordered') {
+		for (let i = 0; i < count; i++) {
+			await video.add(videoPacket(i), i === 0 ? videoMeta : undefined);
+			await audio.add(audioPacket(i), i === 0 ? audioMeta : undefined);
+		}
+	} else {
+		// The video encoder gets a long way ahead before the audio encoder delivers anything
+		await video.add(videoPacket(0), videoMeta);
+		await audio.add(audioPacket(0), audioMeta);
+		for (let i = 1; i < count; i++) {
+			await video.add(videoPacket(i));
+		}
+		for (let i = 1; i < count; i++) {
+			await audio.add(audioPacket(i));
+		}
+	}
+
+	await output.finalize();
+	return new Uint8Array(output.target.buffer!);
+};
+
+test('Non-fragmented output is byte-identical regardless of the order tracks deliver samples in', async () => {
+	const ordered = await twoTrackMp4('ordered');
+	const videoAhead = await twoTrackMp4('videoRunsAhead');
+
+	expect(videoAhead.length).toBe(ordered.length);
+	expect(Buffer.from(videoAhead).equals(Buffer.from(ordered))).toBe(true);
+});

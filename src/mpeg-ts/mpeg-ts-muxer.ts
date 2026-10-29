@@ -8,6 +8,8 @@
 
 import { buildAdtsHeaderTemplate, parseAacAudioSpecificConfig, writeAdtsFrameLength } from '../../shared/aac-misc';
 import { validateAudioChunkMetadata, validateVideoChunkMetadata } from '../codec';
+import { UnsupportedMediaError } from '../errors';
+import { sampleAesEncryptAdtsFrame, sampleAesEncryptAnnexBAccessUnit } from '../crypto/sample-aes';
 import {
 	AC3_REGISTRATION_DESCRIPTOR,
 	AvcDecoderConfigurationRecord,
@@ -33,6 +35,8 @@ import { Writer } from '../writer';
 import {
 	buildMpegTsMimeType,
 	MpegTsStreamType,
+	buildAudioSetupDescriptor,
+	buildPrivateDataIndicatorDescriptor,
 	secondsToMpegTsTimestamp,
 	TS_PACKET_SIZE,
 } from './mpeg-ts-misc';
@@ -64,6 +68,8 @@ type MpegTsTrackData = {
 	hevcDecoderConfig: HevcDecoderConfigurationRecord | null;
 	adtsHeader: Uint8Array | null;
 	adtsHeaderBitstream: Bitstream | null;
+	/** AudioSpecificConfig, for the SAMPLE-AES audio setup descriptor; null when not encrypting. */
+	audioSetupData: Uint8Array | null;
 	firstPacketWritten: boolean;
 	closed: boolean;
 };
@@ -71,6 +77,8 @@ type MpegTsTrackData = {
 type QueuedPacket = {
 	data: Uint8Array;
 	presentationTimestamp: number;
+	/** What the source said; equals the presentation timestamp when it stated no separate one. */
+	sourceDecodeTimestamp: number;
 	decodeTimestamp: number | null;
 	isKeyframe: boolean;
 };
@@ -91,6 +99,7 @@ export class MpegTsMuxer extends Muxer {
 	private audioTrackIndex = 0;
 
 	private adaptationFieldBuffer = new Uint8Array(184);
+	private pcrPid: number | null = null;
 	private payloadBuffer = new Uint8Array(184);
 
 	constructor(output: Output, format: MpegTsOutputFormat) {
@@ -125,8 +134,15 @@ export class MpegTsMuxer extends Muxer {
 		const codec = track.source._codec;
 		assert(codec === 'avc' || codec === 'hevc');
 
+		const encryption = this.format._options.sampleAesEncryption;
+		if (encryption && codec !== 'avc') {
+			throw new UnsupportedMediaError(
+				`SAMPLE-AES is specified for H.264 only; this output's video track is '${codec}'.`,
+			);
+		}
+
 		const streamType = codec === 'avc'
-			? MpegTsStreamType.AVC
+			? (encryption ? MpegTsStreamType.SAMPLE_AES_AVC : MpegTsStreamType.AVC)
 			: MpegTsStreamType.HEVC;
 		const pid = FIRST_TRACK_PID + this.trackDatas.length;
 		const streamId = VIDEO_STREAM_ID_BASE + this.videoTrackIndex++;
@@ -145,6 +161,7 @@ export class MpegTsMuxer extends Muxer {
 			hevcDecoderConfig: null,
 			adtsHeader: null,
 			adtsHeaderBitstream: null,
+			audioSetupData: null,
 			firstPacketWritten: false,
 			closed: false,
 		};
@@ -170,12 +187,19 @@ export class MpegTsMuxer extends Muxer {
 		const codec = track.source._codec;
 		assert(codec === 'aac' || codec === 'mp3' || codec === 'ac3' || codec === 'eac3' || codec === 'dts');
 
+		const audioEncryption = this.format._options.sampleAesEncryption;
+		if (audioEncryption && codec !== 'aac') {
+			throw new UnsupportedMediaError(
+				`SAMPLE-AES here encrypts AAC audio only; this output's audio track is '${codec}'.`,
+			);
+		}
+
 		let streamType: MpegTsStreamType;
 		let streamId: number;
 
 		switch (codec) {
 			case 'aac': {
-				streamType = MpegTsStreamType.AAC;
+				streamType = audioEncryption ? MpegTsStreamType.SAMPLE_AES_AAC : MpegTsStreamType.AAC;
 				streamId = AUDIO_STREAM_ID_BASE + this.audioTrackIndex++;
 			}; break;
 
@@ -216,9 +240,18 @@ export class MpegTsMuxer extends Muxer {
 			hevcDecoderConfig: null,
 			adtsHeader: null,
 			adtsHeaderBitstream: null,
+			audioSetupData: audioEncryption
+				? toUint8Array(meta.decoderConfig.description ?? new Uint8Array(0))
+				: null,
 			firstPacketWritten: false,
 			closed: false,
 		};
+		if (newTrackData.audioSetupData?.byteLength === 0) {
+			throw new UnsupportedMediaError(
+				'SAMPLE-AES needs this AAC track\'s AudioSpecificConfig for the PMT audio setup descriptor,'
+				+ ' but its decoder config states none.',
+			);
+		}
 
 		this.trackDatas.push(newTrackData);
 
@@ -254,6 +287,7 @@ export class MpegTsMuxer extends Muxer {
 			trackData.timestampProcessingQueue.push({
 				data: preparedData,
 				presentationTimestamp: packet.timestamp,
+				sourceDecodeTimestamp: packet.decodeTimestamp,
 				decodeTimestamp: null,
 				isKeyframe: packet.type === 'key',
 			});
@@ -287,6 +321,7 @@ export class MpegTsMuxer extends Muxer {
 			trackData.timestampProcessingQueue.push({
 				data: preparedData,
 				presentationTimestamp: packet.timestamp,
+				sourceDecodeTimestamp: packet.decodeTimestamp,
 				decodeTimestamp: null,
 				isKeyframe: packet.type === 'key',
 			});
@@ -321,11 +356,13 @@ export class MpegTsMuxer extends Muxer {
 			}
 		}
 
-		if (trackData.inputIsAnnexB) {
-			return this.prepareAnnexBVideoPacket(packet.data, codec as 'avc' | 'hevc');
-		} else {
-			return this.prepareLengthPrefixedVideoPacket(trackData, packet, codec as 'avc' | 'hevc');
-		}
+		const annexB = trackData.inputIsAnnexB
+			? this.prepareAnnexBVideoPacket(packet.data, codec as 'avc' | 'hevc')
+			: this.prepareLengthPrefixedVideoPacket(trackData, packet, codec as 'avc' | 'hevc');
+
+		// After Annex B framing, so the parameter sets and AUD this adds stay clear, as the spec requires
+		const encryption = this.format._options.sampleAesEncryption;
+		return encryption ? sampleAesEncryptAnnexBAccessUnit(annexB, encryption) : annexB;
 	}
 
 	private prepareAnnexBVideoPacket(data: Uint8Array, codec: 'avc' | 'hevc'): Uint8Array {
@@ -445,7 +482,7 @@ export class MpegTsMuxer extends Muxer {
 		}
 
 		if (trackData.inputIsAdts) {
-			return packet.data;
+			return this.encryptAdtsIfNeeded(packet.data);
 		}
 
 		assert(trackData.adtsHeader);
@@ -459,7 +496,12 @@ export class MpegTsMuxer extends Muxer {
 		result.set(header, 0);
 		result.set(packet.data, header.byteLength);
 
-		return result;
+		return this.encryptAdtsIfNeeded(result);
+	}
+
+	private encryptAdtsIfNeeded(frame: Uint8Array) {
+		const encryption = this.format._options.sampleAesEncryption;
+		return encryption ? sampleAesEncryptAdtsFrame(frame, encryption) : frame;
 	}
 
 	private allTracksAreKnown() {
@@ -477,13 +519,21 @@ export class MpegTsMuxer extends Muxer {
 			return;
 		}
 
+		// 13818-1 2.4.2 wants DTS <= PTS; sorting presentation timestamps only achieves that when the
+		// reorder depth is uniform, so prefer what the source stated
+		const reordered = trackData.timestampProcessingQueue.some(
+			packet => packet.sourceDecodeTimestamp !== packet.presentationTimestamp,
+		);
 		const sortedTimestamps = trackData.timestampProcessingQueue
 			.map(packet => packet.presentationTimestamp)
 			.sort((a, b) => a - b);
 
 		for (let i = 0; i < trackData.timestampProcessingQueue.length; i++) {
 			const queuedPacket = trackData.timestampProcessingQueue[i]!;
-			queuedPacket.decodeTimestamp = sortedTimestamps[i]!;
+			queuedPacket.decodeTimestamp = reordered
+				? queuedPacket.sourceDecodeTimestamp
+				// Nothing stated: the i'th packet to decode presents no earlier than the i'th smallest
+				: Math.min(sortedTimestamps[i]!, queuedPacket.presentationTimestamp);
 			trackData.packetQueue.push(queuedPacket);
 		}
 
@@ -543,6 +593,7 @@ export class MpegTsMuxer extends Muxer {
 		assert(!this.tablesWritten);
 
 		this.writePsiSection(PAT_PID, PAT_SECTION);
+		this.pcrPid = pcrTrackOf(this.trackDatas)?.pid ?? null;
 		this.writePsiSection(PMT_PID, buildPmt(this.trackDatas));
 
 		this.tablesWritten = true;
@@ -630,9 +681,14 @@ export class MpegTsMuxer extends Muxer {
 			const randomAccessIndicator = isFirstTsPacket && queuedPacket.isKeyframe;
 			const discontinuityIndicator = isFirstTsPacket && !trackData.firstPacketWritten;
 			const basePaddingNeeded = Math.max(0, 184 - remainingData);
+			// One per access unit stays well inside the 0.1 s the spec allows, with no clock of its own
+			const writePcr = isFirstTsPacket && trackData.pid === this.pcrPid;
 
 			let adaptationFieldSize: number;
-			if (randomAccessIndicator || discontinuityIndicator) {
+			if (writePcr) {
+				// length + flags + 6 PCR bytes
+				adaptationFieldSize = Math.max(8, basePaddingNeeded);
+			} else if (randomAccessIndicator || discontinuityIndicator) {
 				// We need at least two bytes
 				adaptationFieldSize = Math.max(2, basePaddingNeeded);
 			} else {
@@ -649,8 +705,16 @@ export class MpegTsMuxer extends Muxer {
 					buf[0] = adaptationFieldSize - 1; // adaptation_field_length
 					buf[1]
 						= (Number(discontinuityIndicator) << 7) // discontinuity_indicator
-							| (Number(randomAccessIndicator) << 6); // random_access_indicator
-					buf.fill(0xFF, 2, adaptationFieldSize); // stuffing_bytes
+							| (Number(randomAccessIndicator) << 6) // random_access_indicator
+							| (Number(writePcr) << 4); // PCR_flag
+					let stuffingStart = 2;
+					if (writePcr) {
+						writePcrInto(buf, 2, secondsToMpegTsTimestamp(
+							queuedPacket.decodeTimestamp! + this.timestampOffset,
+						));
+						stuffingStart = 8;
+					}
+					buf.fill(0xFF, stuffingStart, adaptationFieldSize); // stuffing_bytes
 				}
 
 				adaptationField = buf.subarray(0, adaptationFieldSize);
@@ -724,23 +788,24 @@ export class MpegTsMuxer extends Muxer {
 		}
 	}
 
-	// eslint-disable-next-line @typescript-eslint/no-misused-promises
 	override async onTrackClose(track: OutputTrack) {
 		const release = await this.mutex.acquire();
 
-		const trackData = this.trackDatas.find(x => x.track === track);
-		if (trackData) {
-			trackData.closed = true;
-			await this.flushTimestampQueue(trackData, false);
+		try {
+			const trackData = this.trackDatas.find(x => x.track === track);
+			if (trackData) {
+				trackData.closed = true;
+				await this.flushTimestampQueue(trackData, false);
+			}
+
+			if (this.allTracksAreKnown()) {
+				this.allTracksKnown.resolve();
+			}
+
+			await this.interleavePackets();
+		} finally {
+			release();
 		}
-
-		if (this.allTracksAreKnown()) {
-			this.allTracksKnown.resolve();
-		}
-
-		await this.interleavePackets();
-
-		release();
 	}
 
 	async finalize() {
@@ -797,10 +862,46 @@ const PAT_SECTION = new Uint8Array(16);
 	view.setUint32(12, computeMpegTsCrc32(PAT_SECTION.subarray(0, 12)), false); // CRC_32
 }
 
+// SAMPLE-AES marks each encrypted elementary stream with a private data indicator, and an encrypted
+// audio stream additionally carries its setup information in a registration descriptor.
+const sampleAesDescriptorsFor = (trackData: MpegTsTrackData): Uint8Array[] => {
+	if (trackData.streamType === MpegTsStreamType.SAMPLE_AES_AVC) {
+		return [buildPrivateDataIndicatorDescriptor('zavc')];
+	}
+	if (trackData.streamType === MpegTsStreamType.SAMPLE_AES_AAC) {
+		assert(trackData.audioSetupData);
+		return [
+			buildPrivateDataIndicatorDescriptor('aacd'),
+			buildAudioSetupDescriptor('zaac', trackData.audioSetupData),
+		];
+	}
+	return [];
+};
+
+// 2.4.4.9 allows PCR_PID=0x1FFF only for a program with no PCR at all
+const pcrTrackOf = (trackDatas: MpegTsTrackData[]) =>
+	trackDatas.find(trackData => trackData.track.type === 'video') ?? trackDatas[0] ?? null;
+
+/** PCR: 33-bit base at 90 kHz, 6 reserved bits, 9-bit extension at 27 MHz/300. */
+const writePcrInto = (buf: Uint8Array, offset: number, base90kHz: number) => {
+	buf[offset] = Math.floor(base90kHz / 2 ** 25) & 0xFF;
+	buf[offset + 1] = Math.floor(base90kHz / 2 ** 17) & 0xFF;
+	buf[offset + 2] = Math.floor(base90kHz / 2 ** 9) & 0xFF;
+	buf[offset + 3] = Math.floor(base90kHz / 2) & 0xFF;
+	buf[offset + 4] = ((base90kHz % 2) << 7) | 0x7E; // low base bit, reserved, ext high bit = 0
+	buf[offset + 5] = 0x00; // extension low bits
+};
+
 const buildPmt = (trackDatas: MpegTsTrackData[]) => {
+	const sampleAesDescriptors = new Map<MpegTsTrackData, Uint8Array[]>();
+
 	let totalEsBytes = 0;
 	for (const trackData of trackDatas) {
 		totalEsBytes += 5;
+
+		const descriptors = sampleAesDescriptorsFor(trackData);
+		sampleAesDescriptors.set(trackData, descriptors);
+		totalEsBytes += descriptors.reduce((sum, descriptor) => sum + descriptor.length, 0);
 
 		if (trackData.streamType === MpegTsStreamType.AC3_SYSTEM_A) {
 			totalEsBytes += AC3_REGISTRATION_DESCRIPTOR.length;
@@ -820,7 +921,8 @@ const buildPmt = (trackDatas: MpegTsTrackData[]) => {
 	section[5] = 0xC1; // reserved=11, version_number=0, current_next_indicator=1
 	section[6] = 0x00; // section_number
 	section[7] = 0x00; // last_section_number
-	view.setUint16(8, 0xE000 | 0x1FFF, false); // reserved=111, PCR_PID=0x1FFF (none)
+	const pcrTrack = pcrTrackOf(trackDatas);
+	view.setUint16(8, 0xE000 | ((pcrTrack?.pid ?? 0x1FFF) & 0x1FFF), false); // reserved=111, PCR_PID
 	view.setUint16(10, 0xF000, false); // reserved=1111, program_info_length=0
 
 	let offset = 12;
@@ -829,7 +931,16 @@ const buildPmt = (trackDatas: MpegTsTrackData[]) => {
 		view.setUint16(offset, 0xE000 | (trackData.pid & 0x1FFF), false); // reserved=111, elementary_PID
 		offset += 2;
 
-		if (trackData.streamType === MpegTsStreamType.AC3_SYSTEM_A) {
+		const descriptors = sampleAesDescriptors.get(trackData)!;
+		if (descriptors.length > 0) {
+			const length = descriptors.reduce((sum, descriptor) => sum + descriptor.length, 0);
+			view.setUint16(offset, 0xF000 | length, false);
+			offset += 2;
+			for (const descriptor of descriptors) {
+				section.set(descriptor, offset);
+				offset += descriptor.length;
+			}
+		} else if (trackData.streamType === MpegTsStreamType.AC3_SYSTEM_A) {
 			view.setUint16(offset, 0xF000 | AC3_REGISTRATION_DESCRIPTOR.length, false);
 			offset += 2;
 			section.set(AC3_REGISTRATION_DESCRIPTOR, offset);

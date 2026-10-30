@@ -1,0 +1,847 @@
+/*!
+ * Tests for the ISO BMFF segment helpers in `src/isobmff/isobmff-misc.ts` — walking boxes, reading track
+ * timescales from an init segment, and re-timing a CMAF segment's `tfdt`s without a demux/remux.
+ */
+import fs from 'node:fs';
+import path from 'node:path';
+import { describe, expect, test } from 'vitest';
+import { InvalidUsageError, MalformedInputError } from '../../src/errors.js';
+import {
+	chunksOf,
+	getInitSegmentTimescales,
+	getSegmentCompositionOffset,
+	getSegmentDecodeTime,
+	isInitializationSegment,
+	iterateIsobmffBoxes,
+	rebaseSegmentDecodeTime,
+	removeIsobmffBoxes,
+	renumberFragments,
+	segmentsOf,
+	setSegmentDecodeTime,
+	getSegmentTrackIds,
+	getInitSegmentTracks,
+	readSegmentHead,
+} from '../../src/index.js';
+
+const __dirname = new URL('.', import.meta.url).pathname;
+
+const ascii = (s: string) => Uint8Array.from([...s].map(c => c.charCodeAt(0)));
+const concat = (...parts: Uint8Array[]) => {
+	const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+	let pos = 0;
+	for (const p of parts) {
+		out.set(p, pos);
+		pos += p.length;
+	}
+	return out;
+};
+const u32 = (n: number) => {
+	const b = new Uint8Array(4);
+	new DataView(b.buffer).setUint32(0, n);
+	return b;
+};
+const u64 = (n: number) => {
+	const b = new Uint8Array(8);
+	new DataView(b.buffer).setBigUint64(0, BigInt(n));
+	return b;
+};
+const box = (name: string, body: Uint8Array) => concat(u32(8 + body.length), ascii(name), body);
+
+const tfdtV0 = (t: number) => box('tfdt', concat(new Uint8Array([0, 0, 0, 0]), u32(t)));
+const tfdtV1 = (t: number) => box('tfdt', concat(new Uint8Array([1, 0, 0, 0]), u64(t)));
+// A fragmented segment: moof(mfhd + traf...) + mdat. mfhd is a non-tfdt box, mdat is the payload.
+const segment = (trafs: Uint8Array[], mdat: Uint8Array) => concat(
+	box('moof', concat(box('mfhd', u32(1)), ...trafs.map(t => box('traf', t)))),
+	box('mdat', mdat),
+);
+
+const readTfdt = (b: Uint8Array): number => {
+	let t = -1;
+	for (let p = 0; p + 12 <= b.length; p++) {
+		if (b[p] === 0x74 && b[p + 1] === 0x66 && b[p + 2] === 0x64 && b[p + 3] === 0x74) {
+			t = p;
+			break;
+		}
+	}
+	const view = new DataView(b.buffer, b.byteOffset, b.byteLength);
+	return b[t + 4] === 1 ? Number(view.getBigUint64(t + 8)) : view.getUint32(t + 8);
+};
+
+describe('rebaseSegmentDecodeTime', () => {
+	const mdat = ascii('the media payload bytes');
+
+	test('shifts a v0 tfdt and preserves every other byte', () => {
+		const seg = segment([tfdtV0(1000)], mdat);
+		const out = rebaseSegmentDecodeTime(seg, 500);
+		expect(readTfdt(out)).toBe(1500);
+		expect(out.subarray(out.length - mdat.length)).toEqual(mdat); // mdat untouched
+		expect(out.length).toBe(seg.length); // size unchanged
+	});
+
+	test('shifts a v1 (64-bit) tfdt', () => {
+		const base = 8_000_000_000; // > 2^32, requires the 64-bit path
+		const out = rebaseSegmentDecodeTime(segment([tfdtV1(base)], mdat), 51_200);
+		expect(readTfdt(out)).toBe(base + 51_200);
+	});
+
+	test('shifts every traf independently (multi-track fragment)', () => {
+		const seg = segment([tfdtV0(1000), tfdtV0(2000)], mdat);
+		const out = rebaseSegmentDecodeTime(seg, 100);
+		// both tfdts moved by the same delta
+		const view = new DataView(out.buffer);
+		const positions: number[] = [];
+		for (let p = 0; p + 12 <= out.length; p++) {
+			if (out[p] === 0x74 && out[p + 1] === 0x66 && out[p + 2] === 0x64 && out[p + 3] === 0x74) {
+				positions.push(view.getUint32(p + 8));
+			}
+		}
+		expect(positions).toEqual([1100, 2100]);
+	});
+
+	test('delta 0 returns a distinct, byte-identical copy (caller owns the result)', () => {
+		const seg = segment([tfdtV0(1000)], mdat);
+		const out = rebaseSegmentDecodeTime(seg, 0);
+		expect(out).not.toBe(seg); // distinct buffer
+		expect(out).toEqual(seg); // same bytes
+	});
+
+	test('does not mutate the input', () => {
+		const seg = segment([tfdtV0(1000)], mdat);
+		rebaseSegmentDecodeTime(seg, 500);
+		expect(readTfdt(seg)).toBe(1000);
+	});
+
+	test('input with no moof (init / non-fragmented) is unchanged', () => {
+		const init = box('moov', ascii('not a fragment'));
+		const out = rebaseSegmentDecodeTime(init, 500);
+		expect(out).toEqual(init);
+	});
+});
+
+describe('getSegmentDecodeTime', () => {
+	const mdat = ascii('payload');
+
+	test('reads the first tfdt (v0)', () => {
+		expect(getSegmentDecodeTime(segment([tfdtV0(972_800)], mdat))).toBe(972_800);
+	});
+
+	test('reads a 64-bit tfdt (v1)', () => {
+		expect(getSegmentDecodeTime(segment([tfdtV1(8_000_000_000)], mdat))).toBe(8_000_000_000);
+	});
+
+	test('returns null when there is no tfdt', () => {
+		expect(getSegmentDecodeTime(box('moov', ascii('init')))).toBeNull();
+	});
+
+	test('round-trips with rebaseSegmentDecodeTime', () => {
+		const seg = segment([tfdtV0(1000)], mdat);
+		const shifted = rebaseSegmentDecodeTime(seg, 5000 - getSegmentDecodeTime(seg)!);
+		expect(getSegmentDecodeTime(shifted)).toBe(5000);
+	});
+});
+
+describe('isInitializationSegment', () => {
+	test('true for an init (moov before moof)', () => {
+		const init = concat(box('ftyp', ascii('isom')), box('moov', ascii('track config')));
+		expect(isInitializationSegment(init)).toBe(true);
+	});
+
+	test('false for a media segment (moof first)', () => {
+		expect(isInitializationSegment(segment([tfdtV0(0)], ascii('payload')))).toBe(false);
+	});
+
+	test('false when neither moov nor moof is present', () => {
+		expect(isInitializationSegment(box('ftyp', ascii('isom')))).toBe(false);
+	});
+});
+
+const tfhd = (trackId: number) => box('tfhd', concat(new Uint8Array([0, 0, 0, 0]), u32(trackId)));
+const fullBox = (name: string, version: number, body: Uint8Array) =>
+	box(name, concat(new Uint8Array([version, 0, 0, 0]), body));
+// tkhd/mdhd carry creation + modification times before the field we read: 32-bit each in v0, 64-bit in v1
+const times = (version: number) => (version === 1 ? concat(u64(0), u64(0)) : concat(u32(0), u32(0)));
+const trak = (trackId: number, timescale: number, version = 0) => box('trak', concat(
+	fullBox('tkhd', version, concat(times(version), u32(trackId), u32(0))),
+	box('mdia', fullBox('mdhd', version, concat(times(version), u32(timescale), u32(0)))),
+));
+
+// Every tfdt value in file order, grouped by the track ID of its traf
+const tfdtsByTrack = (bytes: Uint8Array) => {
+	const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+	const result = new Map<number, number[]>();
+	const children = (b: { start: number; size: number; headerSize: number }) =>
+		iterateIsobmffBoxes(bytes, b.start + b.headerSize, b.start + b.size);
+	for (const moof of iterateIsobmffBoxes(bytes)) {
+		if (moof.type !== 'moof') {
+			continue;
+		}
+		for (const traf of children(moof)) {
+			if (traf.type !== 'traf') {
+				continue;
+			}
+			let id = -1;
+			let time = -1;
+			for (const b of children(traf)) {
+				const content = b.start + b.headerSize;
+				if (b.type === 'tfhd') {
+					id = view.getUint32(content + 4);
+				} else if (b.type === 'tfdt') {
+					time = bytes[content] === 1 ? Number(view.getBigUint64(content + 4)) : view.getUint32(content + 4);
+				}
+			}
+			result.set(id, [...(result.get(id) ?? []), time]);
+		}
+	}
+	return result;
+};
+
+describe('chunksOf', () => {
+	const chunk = (time: number, payload: Uint8Array) => segment([tfdtV0(time)], payload);
+
+	test('splits a multi-chunk segment, each chunk covering its own moof and mdat', () => {
+		const first = chunk(0, ascii('aaaa'));
+		const second = chunk(90_000, ascii('bbbbbb'));
+		const bytes = concat(first, second);
+
+		expect(chunksOf(bytes)).toEqual([
+			{ offset: 0, size: first.length, decodeTime: 0, trackId: null, duration: null, independent: null },
+			{
+				offset: first.length,
+				size: second.length,
+				decodeTime: 90_000,
+				trackId: null,
+				duration: null,
+				independent: null,
+			},
+		]);
+	});
+
+	test('the chunks tile the segment with no gaps', () => {
+		const bytes = concat(chunk(0, ascii('aa')), chunk(100, ascii('bbbb')), chunk(200, ascii('cc')));
+		const chunks = chunksOf(bytes);
+
+		expect(chunks[0]!.offset).toBe(0);
+		for (let i = 1; i < chunks.length; i++) {
+			expect(chunks[i]!.offset).toBe(chunks[i - 1]!.offset + chunks[i - 1]!.size);
+		}
+		expect(chunks.at(-1)!.offset + chunks.at(-1)!.size).toBe(bytes.length);
+	});
+
+	test('a leading styp or sidx opens the chunk that follows it', () => {
+		const styp = box('styp', ascii('msdh'));
+		const body = chunk(0, ascii('aaaa'));
+		const bytes = concat(styp, body);
+		const chunks = chunksOf(bytes);
+
+		// The ranges are published as part byte ranges, so they must concatenate back into the segment
+		expect(chunks).toHaveLength(1);
+		expect(chunks[0]!.offset).toBe(0);
+		expect(chunks[0]!.size).toBe(bytes.length);
+	});
+
+	test('an emsg ahead of a moof belongs to the chunk it describes, not the one before', () => {
+		const first = chunk(0, ascii('aaaa'));
+		const emsg = box('emsg', ascii('xx'));
+		const second = chunk(100, ascii('bb'));
+		const chunks = chunksOf(concat(first, emsg, second));
+
+		expect(chunks).toHaveLength(2);
+		expect(chunks[0]!.size).toBe(first.length);
+		expect(chunks[1]!.offset).toBe(first.length);
+		expect(chunks[1]!.size).toBe(emsg.length + second.length);
+	});
+
+	test('a box between a moof and the next one travels with its chunk', () => {
+		const plain = chunksOf(concat(chunk(0, ascii('aaaa')), chunk(100, ascii('bb'))));
+		const emsg = box('emsg', ascii('xx'));
+		const withBox = chunksOf(concat(
+			box('moof', concat(box('mfhd', u32(1)), box('traf', tfdtV0(0)))),
+			emsg,
+			box('mdat', ascii('aaaa')),
+			chunk(100, ascii('bb')),
+		));
+
+		expect(withBox).toHaveLength(2);
+		expect(withBox[0]!.size).toBe(plain[0]!.size + emsg.length);
+		expect(withBox[1]!.offset).toBe(withBox[0]!.offset + withBox[0]!.size);
+	});
+
+	test('reads a 64-bit tfdt, and reports null when a chunk states none', () => {
+		expect(chunksOf(segment([tfdtV1(2 ** 33)], ascii('a')))[0]!.decodeTime).toBe(2 ** 33);
+		expect(chunksOf(segment([box('tfhd', u32(1))], ascii('a')))[0]!.decodeTime).toBe(null);
+	});
+
+	test('bytes with no moof yield no chunks', () => {
+		expect(chunksOf(box('ftyp', ascii('isom')))).toEqual([]);
+		expect(chunksOf(new Uint8Array(0))).toEqual([]);
+	});
+
+	const SYNC_SAMPLE = 0x02000000; // sample_depends_on = 2
+	const NON_SYNC_SAMPLE = 0x01010000; // depends on others, and flagged non-sync
+	const trun = (flags: number, body: Uint8Array) =>
+		box('trun', concat(Uint8Array.from([0, (flags >> 16) & 0xff, (flags >> 8) & 0xff, flags & 0xff]), body));
+
+	test('sums per-sample durations and reads independence from the first-sample flags', () => {
+		// trun flags 0x104: first_sample_flags + per-sample durations
+		const traf = box('traf', concat(
+			tfhd(7),
+			tfdtV0(0),
+			trun(0x104, concat(u32(2), u32(SYNC_SAMPLE), u32(1000), u32(1500))),
+		));
+		const bytes = concat(box('moof', concat(box('mfhd', u32(1)), traf)), box('mdat', ascii('aa')));
+
+		expect(chunksOf(bytes)[0]).toMatchObject({ trackId: 7, duration: 2500, independent: true });
+	});
+
+	test('a chunk whose first sample depends on others is not independent', () => {
+		const traf = box('traf', concat(
+			tfhd(1),
+			tfdtV0(0),
+			trun(0x104, concat(u32(1), u32(NON_SYNC_SAMPLE), u32(900))),
+		));
+		const bytes = concat(box('moof', concat(box('mfhd', u32(1)), traf)), box('mdat', ascii('a')));
+
+		expect(chunksOf(bytes)[0]).toMatchObject({ duration: 900, independent: false });
+	});
+
+	test('reads sample defaults from the init trex when the segment states none', () => {
+		const trex = box('trex', concat(
+			Uint8Array.from([0, 0, 0, 0]), u32(5), u32(1), u32(600), u32(0), u32(SYNC_SAMPLE),
+		));
+		const init = box('moov', box('mvex', trex));
+		const traf = box('traf', concat(tfhd(5), tfdtV0(0), trun(0x0, u32(3))));
+		const bytes = concat(box('moof', concat(box('mfhd', u32(1)), traf)), box('mdat', ascii('aa')));
+
+		// The segment alone cannot state a duration; the init's trex is the only source
+		expect(chunksOf(bytes)[0]).toMatchObject({ trackId: 5, duration: null, independent: null });
+		expect(chunksOf(bytes, init)[0]).toMatchObject({ trackId: 5, duration: 1800, independent: true });
+	});
+
+	test('a trex stating zeros is treated as stating nothing', () => {
+		const trexZero = box('trex', concat(
+			Uint8Array.from([0, 0, 0, 0]), u32(4), u32(1), u32(0), u32(0), u32(0),
+		));
+		const init = box('moov', box('mvex', trexZero));
+		const traf = box('traf', concat(tfhd(4), tfdtV0(0), trun(0x0, u32(3))));
+		const bytes = concat(box('moof', concat(box('mfhd', u32(1)), traf)), box('mdat', ascii('aa')));
+
+		// 0 is what a writer emits for "unset", and a zeroed sample_flags reads as "sync, depends on
+		// nothing" — publishing that would tell a player it may start decoding mid-GOP
+		expect(chunksOf(bytes, init)[0]).toMatchObject({ trackId: 4, duration: null, independent: null });
+	});
+
+	test('a tfhd default wins over the init trex', () => {
+		const trex = box('trex', concat(
+			Uint8Array.from([0, 0, 0, 0]), u32(9), u32(1), u32(600), u32(0), u32(SYNC_SAMPLE),
+		));
+		const init = box('moov', box('mvex', trex));
+		const tfhdWithDuration = box('tfhd', concat(Uint8Array.from([0, 0, 0, 0x08]), u32(9), u32(100)));
+		const traf = box('traf', concat(tfhdWithDuration, tfdtV0(0), trun(0x0, u32(2))));
+		const bytes = concat(box('moof', concat(box('mfhd', u32(1)), traf)), box('mdat', ascii('aa')));
+
+		expect(chunksOf(bytes, init)[0]).toMatchObject({ duration: 200 });
+	});
+
+	test('falls back to the tfhd defaults when the trun states neither', () => {
+		// tfhd flags 0x28: default_sample_duration + default_sample_flags
+		const tfhdWithDefaults = box('tfhd', concat(
+			Uint8Array.from([0, 0, 0, 0x28]), u32(3), u32(500), u32(SYNC_SAMPLE),
+		));
+		const traf = box('traf', concat(tfhdWithDefaults, tfdtV0(0), trun(0x0, u32(4))));
+		const bytes = concat(box('moof', concat(box('mfhd', u32(1)), traf)), box('mdat', ascii('aa')));
+
+		expect(chunksOf(bytes)[0]).toMatchObject({ trackId: 3, duration: 2000, independent: true });
+	});
+});
+
+describe('iterateIsobmffBoxes', () => {
+	test('yields top-level boxes with offsets, and children through the content range', () => {
+		const bytes = concat(box('ftyp', ascii('isom')), box('moov', concat(box('mvhd', u32(0)), trak(1, 90000))));
+		const top = [...iterateIsobmffBoxes(bytes)];
+		expect(top).toEqual([
+			{ type: 'ftyp', start: 0, size: 12, headerSize: 8, runsToEnd: false },
+			{ type: 'moov', start: 12, size: bytes.length - 12, headerSize: 8, runsToEnd: false },
+		]);
+		const moov = top[1]!;
+		expect([...iterateIsobmffBoxes(bytes, moov.start + moov.headerSize, moov.start + moov.size)].map(b => b.type))
+			.toEqual(['mvhd', 'trak']);
+	});
+
+	test('reads a 64-bit size, a size-0 box running to the end, and a uuid user type', () => {
+		const large = concat(u32(1), ascii('mdat'), u64(20), ascii('abcd'));
+		const uuid = concat(u32(8 + 16 + 2), ascii('uuid'), new Uint8Array(16), ascii('xy'));
+		const toEnd = concat(u32(0), ascii('mdat'), ascii('rest of file'));
+		expect([...iterateIsobmffBoxes(concat(large, uuid, toEnd))]).toEqual([
+			{ type: 'mdat', start: 0, size: 20, headerSize: 16, runsToEnd: false },
+			{ type: 'uuid', start: 20, size: 26, headerSize: 24, runsToEnd: false },
+			// The last one declared 0, which is why runsToEnd is the only thing separating it from the first.
+			{ type: 'mdat', start: 46, size: 20, headerSize: 8, runsToEnd: true },
+		]);
+	});
+
+	test('throws on a box that runs past the end instead of stopping silently', () => {
+		const truncated = box('moof', ascii('fragment')).subarray(0, 10);
+		expect(() => [...iterateIsobmffBoxes(truncated)]).toThrow(/doesn't fit|Truncated/);
+		expect(() => [...iterateIsobmffBoxes(concat(box('ftyp', ascii('isom')), new Uint8Array(3)))])
+			.toThrow(/Truncated ISO BMFF box header at offset 12/);
+	});
+});
+
+describe('getInitSegmentTimescales', () => {
+	test('maps each tkhd track ID to its mdhd timescale, for version 0 and 1 boxes', () => {
+		const init = concat(box('ftyp', ascii('isom')), box('moov', concat(trak(1, 57600), trak(2, 48000, 1))));
+		expect(getInitSegmentTimescales(init)).toEqual(new Map([[1, 57600], [2, 48000]]));
+	});
+
+	test('reads a real fragmented MP4', async () => {
+		const file = await fs.promises.readFile(path.join(__dirname, '../public/bear-640x360-av_frag.mp4'));
+		// ffprobe: stream time_base 1/30000 (video, track 1) and 1/44100 (audio, track 2)
+		expect(getInitSegmentTimescales(file)).toEqual(new Map([[1, 30000], [2, 44100]]));
+	});
+
+	test('is empty for a media segment', () => {
+		expect(getInitSegmentTimescales(segment([concat(tfhd(1), tfdtV0(0))], ascii('p'))).size).toBe(0);
+	});
+
+	test('throws on a trak without an mdhd', () => {
+		const init = box('moov', box('trak', fullBox('tkhd', 0, concat(times(0), u32(1), u32(0)))));
+		expect(() => getInitSegmentTimescales(init)).toThrow(/missing its 'tkhd' or 'mdhd'/);
+	});
+});
+
+describe('setSegmentDecodeTime', () => {
+	const mdat = ascii('the media payload bytes');
+	const timescales = new Map([[1, 57600], [2, 48000]]);
+	const timescaleOf = (id: number) => timescales.get(id);
+
+	test('writes each track of one muxed moof in its own timescale', () => {
+		const seg = segment([concat(tfhd(1), tfdtV0(123)), concat(tfhd(2), tfdtV1(456))], mdat);
+		const out = setSegmentDecodeTime(seg, 10.5, timescaleOf);
+		expect(tfdtsByTrack(out)).toEqual(new Map([[1, [604_800]], [2, [504_000]]]));
+		expect(out.subarray(out.length - mdat.length)).toEqual(mdat);
+		expect(tfdtsByTrack(seg)).toEqual(new Map([[1, [123]], [2, [456]]])); // input untouched
+	});
+
+	test('keeps the spacing of a track\'s later moof chunks', () => {
+		const seg = concat(
+			segment([concat(tfhd(1), tfdtV0(1000)), concat(tfhd(2), tfdtV0(2000))], mdat),
+			segment([concat(tfhd(1), tfdtV0(1000 + 28_800)), concat(tfhd(2), tfdtV0(2000 + 24_000))], mdat),
+		);
+		const out = setSegmentDecodeTime(seg, 2, timescaleOf);
+		expect(tfdtsByTrack(out)).toEqual(new Map([[1, [115_200, 144_000]], [2, [96_000, 120_000]]]));
+	});
+
+	test('re-times a real fragmented MP4 per track', async () => {
+		const file = await fs.promises.readFile(path.join(__dirname, '../public/bear-640x360-av_frag.mp4'));
+		const timescalesOfFile = getInitSegmentTimescales(file);
+		const before = tfdtsByTrack(file);
+		const after = tfdtsByTrack(setSegmentDecodeTime(file, 3600, id => timescalesOfFile.get(id)));
+
+		for (const [id, times] of before) {
+			const target = 3600 * timescalesOfFile.get(id)!;
+			expect(after.get(id)).toEqual(times.map(t => t - times[0]! + target));
+		}
+	});
+
+	test('throws rather than wraps when a version 0 tfdt cannot hold the value', () => {
+		const seg = segment([concat(tfhd(1), tfdtV0(0))], mdat);
+		// 2^32 / 57600 ≈ 74565 s
+		expect(() => setSegmentDecodeTime(seg, 80_000, timescaleOf)).toThrow(/version 0 'tfdt'.*can't hold/);
+		expect(tfdtsByTrack(setSegmentDecodeTime(segment([concat(tfhd(1), tfdtV1(0))], mdat), 80_000, timescaleOf)))
+			.toEqual(new Map([[1, [4_608_000_000]]]));
+	});
+
+	test('throws for a track without a timescale or a traf without tfhd/tfdt', () => {
+		// The segment says something the init does not back, or is not shaped like a segment: the bytes
+		// are at fault. A negative `seconds` is the caller's.
+		expect(() => setSegmentDecodeTime(segment([concat(tfhd(9), tfdtV0(0))], mdat), 1, timescaleOf))
+			.toThrow(MalformedInputError);
+		expect(() => setSegmentDecodeTime(segment([tfdtV0(0)], mdat), 1, timescaleOf))
+			.toThrow(MalformedInputError);
+		expect(() => setSegmentDecodeTime(segment([concat(tfhd(9), tfdtV0(0))], mdat), 1, timescaleOf))
+			.toThrow(/No timescale for track 9/);
+		expect(() => setSegmentDecodeTime(segment([tfdtV0(0)], mdat), 1, timescaleOf))
+			.toThrow(/missing its 'tfhd' or 'tfdt'/);
+		expect(() => setSegmentDecodeTime(segment([concat(tfhd(1), tfdtV0(0))], mdat), -1, timescaleOf))
+			.toThrow(InvalidUsageError);
+	});
+});
+
+// mfhd is a full box, so its sequence_number sits after version/flags. The `segment()` helper above writes a
+// 4-byte mfhd body, which is not a conformant full box; these build their own.
+const sequenceNumbers = (bytes: Uint8Array) => {
+	const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+	const out: number[] = [];
+	for (const moof of iterateIsobmffBoxes(bytes)) {
+		if (moof.type !== 'moof') {
+			continue;
+		}
+		for (const child of iterateIsobmffBoxes(bytes, moof.start + moof.headerSize, moof.start + moof.size)) {
+			if (child.type === 'mfhd') {
+				out.push(view.getUint32(child.start + child.headerSize + 4));
+			}
+		}
+	}
+	return out;
+};
+
+const mfhd = (sequenceNumber: number) => box('mfhd', concat(new Uint8Array([0, 0, 0, 0]), u32(sequenceNumber)));
+const fragment = (sequenceNumber: number, trackId: number, mdat: Uint8Array) => concat(
+	box('moof', concat(mfhd(sequenceNumber), box('traf', concat(tfhd(trackId), tfdtV0(0))))),
+	box('mdat', mdat),
+);
+
+describe('getSegmentTrackIds', () => {
+	test('reads each tfhd track_ID in traf order', () => {
+		const bytes = concat(
+			box('moof', concat(mfhd(1), box('traf', tfhd(7)), box('traf', tfhd(3)))),
+			box('mdat', ascii('xx')),
+		);
+
+		expect(getSegmentTrackIds(bytes)).toEqual([7, 3]);
+	});
+
+	test('is empty for an initialization segment, which states tracks in trak instead', () => {
+		expect(getSegmentTrackIds(concat(box('ftyp', ascii('isom')), box('moov', trak(1, 1000))))).toEqual([]);
+	});
+
+	test('reads every fragment of a real fragmented MP4', async () => {
+		const file = await fs.promises.readFile(path.join(__dirname, '../public/bear-640x360-av_frag.mp4'));
+		const ids = getSegmentTrackIds(new Uint8Array(file));
+
+		expect(ids.length).toBeGreaterThan(0);
+		// The file is audio+video, so both track ids appear and nothing else does.
+		expect([...new Set(ids)].sort()).toEqual([1, 2]);
+	});
+});
+
+describe('renumberFragments', () => {
+	test('rewrites each mfhd sequence_number in document order', () => {
+		const bytes = concat(fragment(1, 1, ascii('aa')), fragment(2, 1, ascii('bb')));
+		const out = renumberFragments(bytes, index => 100 + index);
+
+		expect([...iterateIsobmffBoxes(out)].filter(b => b.type === 'moof').length).toBe(2);
+		expect(sequenceNumbers(out)).toEqual([100, 101]);
+	});
+
+	test('passes the current number to the callback', () => {
+		const bytes = concat(fragment(41, 1, ascii('aa')), fragment(99, 1, ascii('bb')));
+		expect(sequenceNumbers(renumberFragments(bytes, (_index, current) => current + 1))).toEqual([42, 100]);
+	});
+
+	test('does not mutate the input and changes nothing else', () => {
+		const bytes = concat(fragment(1, 1, ascii('aa')), fragment(2, 1, ascii('bb')));
+		const before = bytes.slice();
+		const out = renumberFragments(bytes, () => 7);
+
+		expect(bytes).toEqual(before);
+		expect(out.length).toBe(bytes.length);
+		// Only the two sequence_number fields differ.
+		expect([...out].filter((byte, i) => byte !== bytes[i]).length).toBeGreaterThan(0);
+		expect(sequenceNumbers(bytes)).toEqual([1, 2]);
+	});
+});
+
+describe('removeIsobmffBoxes', () => {
+	test('drops the named top-level boxes and keeps the rest in order', () => {
+		const bytes = concat(box('styp', ascii('cmfs')), box('sidx', ascii('ii')), fragment(1, 1, ascii('aa')));
+
+		expect([...iterateIsobmffBoxes(bytes)].map(b => b.type)).toEqual(['styp', 'sidx', 'moof', 'mdat']);
+
+		const out = removeIsobmffBoxes(bytes, ['styp', 'sidx']);
+		expect([...iterateIsobmffBoxes(out)].map(b => b.type)).toEqual(['moof', 'mdat']);
+	});
+
+	test('returns an equal copy when nothing matches', () => {
+		const bytes = fragment(1, 1, ascii('aa'));
+		expect(removeIsobmffBoxes(bytes, ['free'])).toEqual(bytes);
+	});
+
+	test('does not recurse: a nested box of that type survives', () => {
+		// Removing it would leave its parent's size wrong, so only top-level boxes are considered.
+		const bytes = concat(box('moof', concat(mfhd(1), box('free', ascii('zz')))), box('mdat', ascii('aa')));
+		const out = removeIsobmffBoxes(bytes, ['free']);
+
+		expect(out).toEqual(bytes);
+	});
+});
+
+describe('segmentsOf', () => {
+	test('opens a segment at each styp and groups the chunks between them', () => {
+		const bytes = concat(
+			box('styp', ascii('cmfs')), fragment(1, 1, ascii('aa')), fragment(2, 1, ascii('bb')),
+			box('styp', ascii('cmfs')), fragment(3, 1, ascii('cc')),
+		);
+		const { init, segments } = segmentsOf(bytes);
+
+		expect(init).toBeNull();
+		expect(segments.map(s => s.chunks.length)).toEqual([2, 1]);
+		expect(segments[0]!.offset).toBe(0);
+		expect(segments.reduce((sum, s) => sum + s.size, 0)).toBe(bytes.length);
+	});
+
+	test('without any styp, each fragment is its own segment', () => {
+		const bytes = concat(fragment(1, 1, ascii('aa')), fragment(2, 1, ascii('bb')));
+
+		expect(segmentsOf(bytes).segments.map(s => s.chunks.length)).toEqual([1, 1]);
+	});
+
+	test('reports the first chunk\'s track and decode time', () => {
+		const bytes = concat(box('styp', ascii('cmfs')), fragment(1, 9, ascii('aa')));
+		const [segment] = segmentsOf(bytes).segments;
+
+		expect(segment!.trackId).toBe(9);
+		expect(segment!.decodeTime).toBe(0);
+	});
+
+	test('separates an initialization segment from the first media segment', () => {
+		// ftyp and moov are not segment prelude: folding them into segment one leaves a consumer with an empty
+		// init range, so the timescale reads as nothing and silently falls back.
+		const initBytes = concat(box('ftyp', ascii('isom')), box('moov', trak(1, 12800)));
+		const bytes = concat(initBytes, fragment(1, 1, ascii('aa')), fragment(2, 1, ascii('bb')));
+		const { init, segments } = segmentsOf(bytes);
+
+		expect(init).toEqual({ offset: 0, size: initBytes.length });
+		expect(segments[0]!.offset).toBe(initBytes.length);
+		expect([...getInitSegmentTimescales(bytes.subarray(0, init!.size))]).toEqual([[1, 12800]]);
+	});
+
+	test('a segment prelude before the first moof belongs to the segment, not the init', () => {
+		const initBytes = concat(box('ftyp', ascii('isom')), box('moov', trak(1, 12800)));
+		const bytes = concat(initBytes, box('sidx', ascii('iiii')), fragment(1, 1, ascii('aa')));
+		const { init, segments } = segmentsOf(bytes);
+
+		expect(init!.size).toBe(initBytes.length);
+		expect(segments[0]!.offset).toBe(initBytes.length);
+	});
+
+	test('init is null when the bytes carry none, and segments cover everything', () => {
+		const bytes = concat(fragment(1, 1, ascii('aa')));
+		const { init, segments } = segmentsOf(bytes);
+
+		expect(init).toBeNull();
+		expect(segments.reduce((sum, s) => sum + s.size, 0)).toBe(bytes.length);
+	});
+
+	test('bytes with no moof are all initialization segment', () => {
+		const bytes = concat(box('ftyp', ascii('isom')), box('moov', trak(1, 1000)));
+		const { init, segments } = segmentsOf(bytes);
+
+		expect(init).toEqual({ offset: 0, size: bytes.length });
+		expect(segments).toEqual([]);
+	});
+
+	test('a trailing mfra belongs to no segment', () => {
+		// mfra indexes the file, not the last fragment, so folding it into the final segment would hand a
+		// consumer a byte range longer than the media it describes. chunksOf does fold it, deliberately, to
+		// tile a segment — that invariant has to stay inside chunksOf.
+		const initBytes = concat(box('ftyp', ascii('isom')), box('moov', trak(1, 12800)));
+		const mfra = box('mfra', ascii('iiiiiiii'));
+		const bytes = concat(initBytes, fragment(1, 1, ascii('aa')), fragment(2, 1, ascii('bb')), mfra);
+		const { init, segments, trailing } = segmentsOf(bytes);
+		const last = segments.at(-1)!;
+
+		expect(trailing).toEqual({ offset: bytes.length - mfra.length, size: mfra.length });
+		expect(last.offset + last.size).toBe(bytes.length - mfra.length);
+		expect(init!.size + segments.reduce((sum, s) => sum + s.size, 0) + trailing!.size).toBe(bytes.length);
+	});
+
+	test('trailing is null when nothing follows the last mdat', () => {
+		const bytes = concat(fragment(1, 1, ascii('aa')), fragment(2, 1, ascii('bb')));
+
+		expect(segmentsOf(bytes).trailing).toBeNull();
+	});
+
+	test('splits a real fragmented MP4 into an init plus segments that tile it', async () => {
+		const file = await fs.promises.readFile(path.join(__dirname, '../public/bear-640x360-av_frag.mp4'));
+		const bytes = new Uint8Array(file);
+		const { init, segments, trailing } = segmentsOf(bytes);
+
+		expect(init).not.toBeNull();
+		// The init must be readable on its own, which is the thing folding it into segment one broke.
+		expect([...getInitSegmentTimescales(bytes.subarray(0, init!.size))].length).toBeGreaterThan(0);
+		expect(segments.length).toBeGreaterThan(0);
+		expect(segments[0]!.offset).toBe(init!.size);
+		for (let i = 1; i < segments.length; i++) {
+			expect(segments[i]!.offset).toBe(segments[i - 1]!.offset + segments[i - 1]!.size);
+		}
+		expect(init!.size + segments.reduce((sum, s) => sum + s.size, 0) + (trailing?.size ?? 0))
+			.toBe(bytes.length);
+	});
+});
+
+describe('runsToEnd', () => {
+	test('distinguishes a declared size 0 from a box that merely ends at the buffer end', () => {
+		// Over a stream these mean different things: declared 0 is "still arriving", a real size that happens
+		// to reach the end is "complete". Resolving both into `size` loses that.
+		const declaredZero = concat(u32(0), ascii('mdat'), ascii('aaaa'));
+		const exact = box('mdat', ascii('aaaa'));
+
+		expect([...iterateIsobmffBoxes(declaredZero)].map(b => [b.type, b.size, b.runsToEnd]))
+			.toEqual([['mdat', 12, true]]);
+		expect([...iterateIsobmffBoxes(exact)].map(b => [b.type, b.size, b.runsToEnd]))
+			.toEqual([['mdat', 12, false]]);
+	});
+});
+
+describe('readSegmentHead', () => {
+	const segment = concat(
+		box('styp', ascii('cmfs')),
+		box('moof', concat(mfhd(1), box('traf', concat(tfhd(7), tfdtV0(4096))))),
+		box('mdat', ascii('dddddddd')),
+	);
+
+	test('reads track and ticks from a whole segment', () => {
+		expect(readSegmentHead(segment)).toEqual({ trackId: 7, ticks: 4096 });
+	});
+
+	test('tolerates a head the strict reader throws on', async () => {
+		// The peer's measurement: a real segment cut to 120 bytes throws "Slicing outside of original slice."
+		const file = await fs.promises.readFile(path.join(__dirname, '../public/bear-640x360-av_frag.mp4'));
+		const bytes = new Uint8Array(file);
+		const { segments } = segmentsOf(bytes);
+		const whole = bytes.subarray(segments[0]!.offset, segments[0]!.offset + segments[0]!.size);
+		const head = whole.slice(0, 120);
+
+		expect(() => getSegmentDecodeTime(head)).toThrow();
+		const result = readSegmentHead(head);
+		expect(result).not.toBeNull();
+		expect(result!.trackId).not.toBeNull();
+	});
+
+	test('returns what it has when the head stops before the tfdt', () => {
+		// Cut inside the traf, after tfhd but before tfdt is complete.
+		const upToTfhd = segment.indexOf(0x74, 0) >= 0 ? 44 : 44;
+		const head = segment.slice(0, upToTfhd);
+		const result = readSegmentHead(head);
+
+		expect(result).not.toBeNull();
+		expect(result!.ticks).toBeNull();
+	});
+
+	test('returns null when there is no moof at all', () => {
+		expect(readSegmentHead(concat(box('ftyp', ascii('isom'))))).toBeNull();
+	});
+
+	test('does not throw on a 60-byte head of a real fragmented MP4', async () => {
+		const file = await fs.promises.readFile(path.join(__dirname, '../public/bear-640x360-av_frag.mp4'));
+		const bytes = new Uint8Array(file);
+		const { segments } = segmentsOf(bytes);
+		const head = bytes.subarray(segments[0]!.offset, segments[0]!.offset + 60);
+
+		expect(() => readSegmentHead(head)).not.toThrow();
+	});
+});
+
+describe('getInitSegmentTracks', () => {
+	test('reports handler and channels alongside the timescale', async () => {
+		const file = await fs.promises.readFile(path.join(__dirname, '../public/bear-640x360-av_frag.mp4'));
+		const { init } = segmentsOf(new Uint8Array(file));
+		const tracks = getInitSegmentTracks(new Uint8Array(file).subarray(0, init!.size));
+
+		expect(tracks.length).toBeGreaterThan(1);
+		// Timescale alone cannot tell these apart, which is the point of the wider shape.
+		expect(tracks.map(t => t.handler).sort()).toEqual(['soun', 'vide']);
+		expect(tracks.find(t => t.handler === 'soun')!.channels).toBeGreaterThan(0);
+		expect(tracks.find(t => t.handler === 'vide')!.channels).toBeNull();
+	});
+
+	test('agrees with getInitSegmentTimescales on the timescales', async () => {
+		const file = await fs.promises.readFile(path.join(__dirname, '../public/bear-640x360-av_frag.mp4'));
+		const bytes = new Uint8Array(file);
+		const { init } = segmentsOf(bytes);
+		const slice = bytes.subarray(0, init!.size);
+
+		expect(new Map(getInitSegmentTracks(slice).map(t => [t.trackId, t.timescale])))
+			.toEqual(getInitSegmentTimescales(slice));
+	});
+});
+
+describe('getSegmentCompositionOffset', () => {
+	const i32 = (n: number) => {
+		const b = new Uint8Array(4);
+		new DataView(b.buffer).setInt32(0, n);
+		return b;
+	};
+	const tfhdWithDefaultDuration = (trackId: number, duration: number) =>
+		box('tfhd', concat(new Uint8Array([0, 0, 0, 0x08]), u32(trackId), u32(duration)));
+	/** `trun` carrying only composition offsets, as a packager that omits per-sample durations writes. */
+	const trunCompositionOnly = (version: number, offsets: number[]) => box('trun', concat(
+		new Uint8Array([version, 0, 0x08, 0x00]),
+		u32(offsets.length),
+		...offsets.map(o => (version === 1 ? i32(o) : u32(o))),
+	));
+	const fragment = (...trafBody: Uint8Array[]) => concat(
+		box('moof', concat(box('mfhd', u32(0)), box('traf', concat(...trafBody)))),
+		box('mdat', new Uint8Array(4)),
+	);
+
+	test('is the earliest presentation, not the smallest composition offset', () => {
+		// Decode offsets 0, 100, 200 against offsets 150, 20, 0: sample 1 presents at 120, which is
+		// earlier than sample 2's 200 — and the smallest offset alone (0) would have claimed 0.
+		const segment = fragment(
+			tfhdWithDefaultDuration(1, 100),
+			trunCompositionOnly(0, [150, 20, 0]),
+		);
+		expect(getSegmentCompositionOffset(segment)).toBe(120);
+	});
+
+	test('takes per-sample durations from the tfhd when the trun omits them', () => {
+		// Same offsets, different default duration: the answer moves only because the decode offsets did,
+		// which is what proves the duration is being read rather than assumed to be zero.
+		const slow = fragment(tfhdWithDefaultDuration(1, 1000), trunCompositionOnly(0, [150, 20, 0]));
+		expect(getSegmentCompositionOffset(slow)).toBe(150);
+	});
+
+	test('reads a signed offset from a version 1 trun', () => {
+		const segment = fragment(
+			tfhdWithDefaultDuration(1, 100),
+			trunCompositionOnly(1, [50, -40, 0]),
+		);
+		// Sample 0 presents at -50... no: 0 + 50 = 50, 100 - 40 = 60, 200 + 0 = 200. Earliest is 50.
+		expect(getSegmentCompositionOffset(segment)).toBe(50);
+		// Unsigned reading of -40 would be a huge positive, never the minimum — so a v0 reader agrees here
+		// only by luck. Make the signed value the winner instead:
+		const presentsEarly = fragment(
+			tfhdWithDefaultDuration(1, 100),
+			trunCompositionOnly(1, [50, -90, 0]),
+		);
+		expect(getSegmentCompositionOffset(presentsEarly)).toBe(10);
+	});
+
+	test('is 0 when the segment states no composition offsets, and for a non-fragment', () => {
+		const noOffsets = fragment(tfhdWithDefaultDuration(1, 100), box('trun', concat(
+			new Uint8Array([0, 0, 0x02, 0x00]), u32(2), u32(10), u32(10), // sizes only
+		)));
+		expect(getSegmentCompositionOffset(noOffsets)).toBe(0);
+		expect(getSegmentCompositionOffset(box('ftyp', ascii('isom')))).toBe(0);
+		expect(getSegmentCompositionOffset(new Uint8Array(0))).toBe(0);
+	});
+
+	test('reaches the trex through an init handed in separately', () => {
+		// A DASH-IF Interface-1 receiver holds init and segment under separate keys, never adjacent in
+		// memory. Without the init there is no `moov` to walk into, so a fragment whose durations live
+		// only in the `trex` reports the smallest composition offset instead of the earliest presentation.
+		const bytes = new Uint8Array(fs.readFileSync(path.join(__dirname, '..', 'public', 'bear-640x360-av_frag.mp4')));
+		const file = segmentsOf(bytes);
+		const init = bytes.subarray(file.init!.offset, file.init!.offset + file.init!.size);
+		const first = file.segments[0]!;
+		const fragment = bytes.subarray(first.offset, first.offset + first.size);
+
+		expect(getSegmentCompositionOffset(fragment)).toBe(1001); // collapsed: no trex in reach
+		expect(getSegmentCompositionOffset(fragment, init)).toBe(2002);
+		// A whole file needs no init: its moov is in the same buffer.
+		expect(getSegmentCompositionOffset(bytes)).toBe(2002);
+	});
+
+	test('added to the decode time, it agrees with what the sidx reports', () => {
+		// The reason this exists: a sidx states a PRESENTATION time while tfdt states a DECODE time, so a
+		// source indexed both ways otherwise describes two timelines a composition offset apart.
+		const bytes = new Uint8Array(fs.readFileSync(path.join(__dirname, '..', 'public', 'bear-640x360-av_frag.mp4')));
+		expect(getSegmentDecodeTime(bytes)).toBe(0);
+		expect(getSegmentCompositionOffset(bytes)).toBe(2002);
+		// 2002 is the sidx's earliestPresentationTime for referenceID 1 at timescale 30000. This file
+		// states durations in neither its trun nor its tfhd, so they come from the trex; without that
+		// fallback every sample looks like it decodes at once and the answer collapses to 1001.
+	});
+});

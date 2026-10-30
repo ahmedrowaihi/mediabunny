@@ -597,6 +597,10 @@ class FlacAudioTrackBacking implements InputAudioTrackBacking {
 		return null;
 	}
 
+	getEncryptionInfo() {
+		return null;
+	}
+
 	getNumberOfChannels() {
 		assert(this.demuxer.audioInfo);
 		return this.demuxer.audioInfo.numberOfChannels;

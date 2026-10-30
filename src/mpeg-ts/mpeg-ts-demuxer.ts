@@ -46,6 +46,10 @@ import {
 	DTS_EXSS_HEADER_PREFIX_SIZE,
 	DTS_EXSS_MAX_HEADER_SIZE,
 } from '../codec-data';
+import {
+	extractSeiHdrMetadata,
+	type VideoDecoderConfigWithHdr,
+} from '../hdr-metadata';
 import { Demuxer } from '../demuxer';
 import { Input } from '../input';
 import { Logging } from '../logging';
@@ -96,10 +100,11 @@ import { Bitstream } from '../../shared/bitstream';
 // Resources:
 // ISO/IEC 13818-1
 
+const REGISTRATION_DESCRIPTOR_TAG = 0x05;
 const MISSING_PTS_ERROR_MESSAGE = 'PES packet is missing PTS where it was expected. PES packets without PTS are not'
 	+ ' currently supported. If you think this file should be supported, please report it.';
 
-const REGISTRATION_DESCRIPTOR_TAG = 0x05;
+const TAIL_WINDOW_SIZE = 256 * 1024;
 
 // The 'HDMV' and 'HDPR' format identifiers, which mark a program as Blu-ray-derived
 const HDMV_FORMAT_IDENTIFIER = 0x48444d56;
@@ -129,7 +134,7 @@ type ElementaryStream = {
 	info: {
 		type: 'video';
 		codec: VideoCodec;
-		decoderConfig: VideoDecoderConfig | null;
+		decoderConfig: VideoDecoderConfigWithHdr | null;
 		avcCodecInfo: AvcDecoderConfigurationRecord | null;
 		hevcCodecInfo: HevcDecoderConfigurationRecord | null;
 		colorSpace: VideoColorSpaceInit;
@@ -604,7 +609,9 @@ export class MpegTsDemuxer extends Demuxer {
 										matrix:
 											MATRIX_COEFFICIENTS_MAP_INVERSE[spsInfo.matrixCoefficients] as
 											VideoMatrixCoefficients | undefined,
-										fullRange: !!spsInfo.fullRangeFlag,
+										fullRange: spsInfo.fullRangeFlag === null
+											? undefined
+											: spsInfo.fullRangeFlag === 1,
 									};
 									elementaryStream.info.reorderSize = spsInfo.maxDecFrameBuffering;
 
@@ -662,7 +669,9 @@ export class MpegTsDemuxer extends Demuxer {
 										matrix:
 											MATRIX_COEFFICIENTS_MAP_INVERSE[spsInfo.matrixCoefficients] as
 											VideoMatrixCoefficients | undefined,
-										fullRange: !!spsInfo.fullRangeFlag,
+										fullRange: spsInfo.fullRangeFlag === null
+											? undefined
+											: spsInfo.fullRangeFlag === 1,
 									};
 									elementaryStream.info.reorderSize = spsInfo.maxDecFrameBuffering;
 
@@ -679,7 +688,10 @@ export class MpegTsDemuxer extends Demuxer {
 									codec: elementaryStream.info.codec,
 									codecDescription: null,
 									colorSpace: elementaryStream.info.colorSpace,
+									// MPEG-TS has no sample entry, so avc1/avc3 and hvc1/hev1 describe nothing
+									// here; these are the conventional strings, not a claim about storage.
 									avcType: 1,
+									hevcType: 'hev1',
 									avcCodecInfo: elementaryStream.info.avcCodecInfo,
 									hevcCodecInfo: elementaryStream.info.hevcCodecInfo,
 									vp9CodecInfo: null,
@@ -690,6 +702,19 @@ export class MpegTsDemuxer extends Demuxer {
 								codedHeight: elementaryStream.info.height,
 								colorSpace: elementaryStream.info.colorSpace,
 							};
+
+							// Not gated on the transfer as the ISOBMFF fallback is: here the SEI is the only source
+							if (elementaryStream.info.codec === 'avc' || elementaryStream.info.codec === 'hevc') {
+								const fromSei = extractSeiHdrMetadata(
+									context.suppliedPacket.data,
+									elementaryStream.info.decoderConfig,
+									elementaryStream.info.codec,
+								);
+
+								if (fromSei.masteringDisplay || fromSei.contentLight) {
+									elementaryStream.info.decoderConfig.hdrStaticMetadata = fromSei;
+								}
+							}
 
 							if (
 								elementaryStream.info.width !== elementaryStream.info.squarePixelWidth
@@ -862,7 +887,12 @@ export class MpegTsDemuxer extends Demuxer {
 		return buildMpegTsMimeType(codecStrings);
 	}
 
-	async readSection(startPos: number, full: boolean, contiguous = false): Promise<Section | null> {
+	async readSection(
+		startPos: number,
+		full: boolean,
+		contiguous = false,
+		scanEndPos = Infinity,
+	): Promise<Section | null> {
 		let endPos = startPos;
 		let currentPos = startPos;
 		const chunks: Uint8Array[] = [];
@@ -871,7 +901,7 @@ export class MpegTsDemuxer extends Demuxer {
 		let mustAddSectionEnd = true;
 		let randomAccessIndicator = 0;
 
-		while (true) {
+		while (currentPos < scanEndPos) {
 			const packet = await this.readPacket(currentPos);
 			currentPos += this.packetStride;
 
@@ -1055,6 +1085,8 @@ type PesPacketHeader = {
 	sectionStartPos: number;
 	sectionEndPos: number | null; // null if the section wasn't read fully
 	pts: number | null;
+	/** The PES decode time, present only for a reordered stream; `null` means it equals `pts`. */
+	dts: number | null;
 	randomAccessIndicator: number;
 };
 
@@ -1108,18 +1140,29 @@ const readPesPacketHeader = <T extends boolean>(
 
 	bitstream.skipBits(14);
 
-	let pts: number | null = null;
-	if (ptsDtsFlags === 0b10 || ptsDtsFlags === 0b11) {
-		pts = 0;
-
+	// 2.4.3.7: 33 bits in three runs, each followed by a marker bit — the trailing one must be read, or a
+	// DTS following a PTS starts one bit early
+	const readTimestamp = () => {
 		bitstream.skipBits(4);
-		pts += bitstream.readBits(3) * (1 << 30);
+		let value = bitstream.readBits(3) * (1 << 30);
 		bitstream.skipBits(1);
-		pts += bitstream.readBits(15) * (1 << 15);
+		value += bitstream.readBits(15) * (1 << 15);
 		bitstream.skipBits(1);
-		pts += bitstream.readBits(15);
+		value += bitstream.readBits(15);
+		bitstream.skipBits(1);
+		return demuxer.normalizeTimestamp(value);
+	};
 
-		pts = demuxer.normalizeTimestamp(pts);
+	let pts: number | null = null;
+	let dts: number | null = null;
+	if (ptsDtsFlags === 0b10 || ptsDtsFlags === 0b11) {
+		pts = readTimestamp();
+
+		// 0b11 means a DTS follows. Only a reordered stream sets it, and without it a B-frame's decode
+		// time is indistinguishable from its presentation time.
+		if (ptsDtsFlags === 0b11) {
+			dts = readTimestamp();
+		}
 	} else {
 		if (expectPts) {
 			throw new Error(MISSING_PTS_ERROR_MESSAGE);
@@ -1130,6 +1173,7 @@ const readPesPacketHeader = <T extends boolean>(
 		sectionStartPos: section.startPos,
 		sectionEndPos: section.endPos,
 		pts,
+		dts,
 		randomAccessIndicator: section.randomAccessIndicator,
 	} as T extends true ? TimestampedPesPacketHeader : PesPacketHeader;
 };
@@ -1217,6 +1261,10 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 		return this.elementaryStream.streamType;
 	}
 
+	getEncryptionInfo() {
+		return null;
+	}
+
 	getName() {
 		return null;
 	}
@@ -1289,6 +1337,8 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 			Math.max(duration / MPEG_TS_TIMESCALE, 0),
 			suppliedPacket.sequenceNumber,
 			suppliedPacket.data.byteLength,
+			undefined,
+			suppliedPacket.dts === null ? undefined : suppliedPacket.dts / MPEG_TS_TIMESCALE,
 		);
 	}
 
@@ -1455,6 +1505,8 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 		}
 
 		let scanStartPos: number;
+		// No packet of this track lies at or past this position
+		let scanEndPos = reader.fileSize ?? Infinity;
 
 		const referencePesPackets = this.elementaryStream.referencePesPackets;
 		const referencePointIndex = binarySearchLessOrEqual(referencePesPackets, searchPts, x => x.pts);
@@ -1462,6 +1514,81 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 		if (referencePoint && searchPts - referencePoint.pts < MPEG_TS_TIMESCALE / 2) {
 			// Reference point ain't too far away, prefer it over the chunk search
 			scanStartPos = referencePoint.sectionStartPos;
+		} else if (searchPts === Infinity && reader.fileSize !== null) {
+			// Searched back from the end: a binary search for the last packet only ever steps right, one
+			// sequential read each. Every byte past the last PES is scanned once and then bounds later scans.
+			const firstPos = firstPesPacketHeader.sectionStartPos;
+			const fileSize = reader.fileSize;
+			let lastPidPos = -1;
+
+			// Stops at the first PES packet unless `findLast` is set. A scan that finds no packet has read the whole
+			// range, so only then does it count towards the position of the track's last TS packet.
+			const scanWindow = async (startPos: number, endPos: number, findLast: boolean) => {
+				let pesHeader: TimestampedPesPacketHeader | null = null;
+				let pidPos = -1;
+
+				for (let pos = startPos; pos < endPos; pos += demuxer.packetStride) {
+					const packetHeader = await demuxer.readPacketHeader(pos);
+					if (!packetHeader) {
+						break;
+					}
+
+					if (packetHeader.pid !== pid) {
+						continue;
+					}
+
+					pidPos = pos;
+					if (packetHeader.payloadUnitStartIndicator === 1) {
+						const section = await demuxer.readSection(pos, false);
+						const header = section && readPesPacketHeader(demuxer, section, false);
+						if (header && header.pts !== null) {
+							pesHeader = header as TimestampedPesPacketHeader;
+							if (!findLast) {
+								break;
+							}
+						}
+					}
+				}
+
+				if (!pesHeader || findLast) {
+					lastPidPos = Math.max(lastPidPos, pidPos);
+				}
+
+				return pesHeader;
+			};
+
+			const alignBack = (pos: number) => floorToMultiple(pos - firstPos, demuxer.packetStride) + firstPos;
+
+			// 1. Grow windows back from the end until one holds a PES packet
+			let windowEnd = fileSize;
+			let windowSize = TAIL_WINDOW_SIZE;
+			let windowStart: number;
+			while (true) {
+				windowStart = alignBack(Math.max(fileSize - windowSize, firstPos));
+				if (windowStart === firstPos || await scanWindow(windowStart, windowEnd, false)) {
+					break;
+				}
+
+				windowEnd = windowStart;
+				windowSize *= 4;
+			}
+
+			// 2. Halve it, keeping the half the last PES packet is in. A half without one has been read in full and
+			// joins the region known to be free of this track.
+			while (windowEnd - windowStart > TAIL_WINDOW_SIZE) {
+				const mid = alignBack((windowStart + windowEnd) / 2);
+				if (await scanWindow(mid, windowEnd, false)) {
+					windowStart = mid;
+				} else {
+					windowEnd = mid;
+				}
+			}
+
+			// 3. Scan what's left in full
+			const lastPesHeader = await scanWindow(windowStart, windowEnd, true);
+
+			scanStartPos = (lastPesHeader ?? firstPesPacketHeader).sectionStartPos;
+			scanEndPos = Math.max(lastPidPos, scanStartPos) + demuxer.packetStride;
 		} else {
 			let startChunkIndex = 0;
 
@@ -1509,7 +1636,7 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 		// Find the first PES packet at or after scanStartPos
 		const result = await findFirstPesPacketHeaderInChunk(
 			scanStartPos,
-			reader.fileSize ?? Infinity,
+			scanEndPos,
 			false,
 		);
 
@@ -1526,13 +1653,14 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 			predicate: (packet: SuppliedPacket) => boolean,
 		) => {
 			// Load the relevant section in full
-			const section = await demuxer.readSection(sectionStartPos, true);
+			const section = await demuxer.readSection(sectionStartPos, true, false, scanEndPos);
 			assert(section);
 
 			const pesPacket = readPesPacket(demuxer, section, true);
 			assert(pesPacket);
 
 			const context = new PacketReadingContext(this.elementaryStream, pesPacket);
+			context.scanEndPos = scanEndPos;
 			const buffer = new PacketBuffer(this, context);
 
 			// Advance until the top-most presentation timestamp crosses or equals searchPts
@@ -1564,6 +1692,9 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 
 			const result = await buffer.readNext();
 			assert(result);
+			// The bound holds for the file as read during this lookup; iterating on from this buffer later must still
+			// see data appended to a source that grows
+			context.scanEndPos = Infinity;
 
 			const packet = this.createEncodedPacket(result.packet, result.duration, options);
 			this.packetBuffers.set(packet, buffer);
@@ -1583,6 +1714,10 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 				let currentPos = currentPesHeader.sectionStartPos + demuxer.packetStride;
 
 				while (true) {
+					if (currentPos >= scanEndPos) {
+						break outer;
+					}
+
 					const packetHeader = await demuxer.readPacketHeader(currentPos);
 					if (!packetHeader) {
 						break outer; // End of file
@@ -1954,6 +2089,7 @@ const maybeInsertReferencePacket = (
 		sectionStartPos: pesPacketHeader.sectionStartPos,
 		sectionEndPos: pesPacketHeader.sectionEndPos,
 		pts: pesPacketHeader.pts,
+		dts: pesPacketHeader.dts,
 		randomAccessIndicator: pesPacketHeader.randomAccessIndicator,
 	});
 	return true;
@@ -1961,6 +2097,8 @@ const maybeInsertReferencePacket = (
 
 type SuppliedPacket = {
 	pts: number;
+	/** The PES decode time, when the stream stated one for this access unit. */
+	dts: number | null;
 	data: Uint8Array;
 	sequenceNumber: number;
 	sectionStartPos: number;
@@ -1981,6 +2119,7 @@ class PacketReadingContext {
 	endPos = 0;
 	lastSuppliedPesPacket: PesPacket | null = null;
 	nextPts: number | null = null;
+	scanEndPos = Infinity;
 
 	suppliedPacket: SuppliedPacket | null = null;
 
@@ -2021,13 +2160,17 @@ class PacketReadingContext {
 				assert(currentPos !== null);
 
 				while (true) {
+					if (currentPos >= this.scanEndPos) {
+						return;
+					}
+
 					const packetHeader = await this.demuxer.readPacketHeader(currentPos);
 					if (!packetHeader) {
 						return;
 					}
 
 					if (packetHeader.pid === this.pid) {
-						const nextSection = await this.demuxer.readSection(currentPos, true);
+						const nextSection = await this.demuxer.readSection(currentPos, true, false, this.scanEndPos);
 						if (!nextSection) {
 							return;
 						}
@@ -2359,7 +2502,7 @@ class PacketReadingContext {
 							if (isThenable(remaining)) remaining = await remaining;
 
 							return this.supplyPacket(
-								remaining,
+								header.frameLength,
 								Math.round(
 									SAMPLES_PER_AAC_FRAME * MPEG_TS_TIMESCALE / elementaryStream.info.sampleRate,
 								),
@@ -2394,7 +2537,7 @@ class PacketReadingContext {
 
 							const duration = result.header.audioSamplesInFrame * MPEG_TS_TIMESCALE
 								/ elementaryStream.info.sampleRate;
-							return this.supplyPacket(remaining, Math.round(duration));
+							return this.supplyPacket(result.header.totalSize, Math.round(duration));
 						} else {
 							this.seekTo(possibleHeaderStartPos + 1);
 						}
@@ -2442,7 +2585,7 @@ class PacketReadingContext {
 						const duration = Math.round(
 							AC3_SAMPLES_PER_FRAME * MPEG_TS_TIMESCALE / elementaryStream.info.sampleRate,
 						);
-						return this.supplyPacket(remaining, duration);
+						return this.supplyPacket(frameSize, duration);
 					} else if (codec === 'eac3') {
 						if (byte !== 0x0b) {
 							continue;
@@ -2482,7 +2625,7 @@ class PacketReadingContext {
 						const duration = Math.round(
 							samplesPerFrame * MPEG_TS_TIMESCALE / elementaryStream.info.sampleRate,
 						);
-						return this.supplyPacket(remaining, duration);
+						return this.supplyPacket(frameSize, duration);
 					} else if (codec === 'dts') {
 						if (byte !== 0x7f && byte !== 0x64) {
 							continue;
@@ -2565,7 +2708,7 @@ class PacketReadingContext {
 						const duration = Math.round(
 							sampleCount * MPEG_TS_TIMESCALE / elementaryStream.info.sampleRate,
 						);
-						return this.supplyPacket(remaining, duration);
+						return this.supplyPacket(frameSize, duration);
 					} else {
 						throw new Error('Unhandled.');
 					}
@@ -2580,9 +2723,18 @@ class PacketReadingContext {
 
 	/** Supplies the context with a new encoded packet, beginning at the current position. */
 	supplyPacket(packetLength: number, intrinsicDuration: number) {
+		// A frame shorter than its own header declares is a feed that stopped inside it, not a sample: there
+		// is no later byte coming to complete it, and a decoder refuses what did arrive
+		if (this.endPos - this.currentPos < packetLength) {
+			return;
+		}
+
 		const currentPesPacket = this.getCurrentPesPacket();
 
 		let pts: number;
+		// Only the first access unit of a PES packet carries its timestamps; the rest are derived, so
+		// they have no stated decode time of their own.
+		let dts: number | null = null;
 		if (this.lastSuppliedPesPacket === currentPesPacket) {
 			assert(this.nextPts !== null);
 			pts = this.nextPts;
@@ -2592,6 +2744,7 @@ class PacketReadingContext {
 			}
 
 			pts = currentPesPacket.pts;
+			dts = currentPesPacket.dts;
 
 			maybeInsertReferencePacket(this.elementaryStream, currentPesPacket as TimestampedPesPacket);
 		}
@@ -2627,6 +2780,7 @@ class PacketReadingContext {
 
 		this.suppliedPacket = {
 			pts,
+			dts,
 			data,
 			sequenceNumber,
 			sectionStartPos,

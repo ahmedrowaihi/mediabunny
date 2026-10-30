@@ -338,8 +338,12 @@ test('MPEG-TS muxing with HEVC and MP3', async () => {
 	const videoDuration = await videoTrack.computeDuration();
 	const audioDuration = await audioTrack.computeDuration();
 
-	expect(videoDuration).toBeCloseTo(4.933333333333334, 1);
-	expect(audioDuration).toBeCloseTo(5, 1);
+	// video-h265.mp4's first packet presents at 0 but decodes at -0.0667, so the programme is moved
+	// forward by that much to keep DTS <= PTS on the wire, as ffmpeg's avoid_negative_ts does. Both
+	// tracks then begin at 0.0667, and MPEG-TS has no edit list to hide the gap, so both durations
+	// read that much longer than the media they carry.
+	expect(videoDuration).toBeCloseTo(5.033333333333333, 1);
+	expect(audioDuration).toBeCloseTo(5.084622222222222, 1);
 });
 
 test('MPEG-TS muxing with no data', async () => {

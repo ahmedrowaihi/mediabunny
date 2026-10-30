@@ -7,6 +7,13 @@
  */
 
 import {
+	type DoviConfig,
+	doviConfigBoxName,
+	doviSampleEntryFourCc,
+	serializeDoviConfigRecord,
+} from '../dovi';
+import { IsobmffOutputFormat, type OutputFormat } from '../output-format';
+import {
 	toUint8Array,
 	assert,
 	isI32,
@@ -38,7 +45,7 @@ import {
 	SubtitleCodec,
 	VideoCodec,
 } from '../codec';
-import { formatSubtitleTimestamp } from '../subtitles';
+import { formatSubtitleTimestamp, TTML_NAMESPACE } from '../subtitles';
 import { Writer } from '../writer';
 import {
 	getTrackMetadata,
@@ -63,6 +70,7 @@ import {
 import { MetadataTags, RichImageData } from '../metadata';
 import { Bitstream } from '../../shared/bitstream';
 import { VERSIONED_NAME } from '../version';
+import { buildContentLightPayload, buildMasteringDisplayPayload } from '../hdr-metadata';
 
 export class IsobmffBoxWriter {
 	private helper = new Uint8Array(8);
@@ -351,6 +359,41 @@ export const styp = () => box('styp', [
 	ascii('dash'),
 ]);
 
+export type SidxSubsegment = {
+	size: number;
+	duration: number;
+};
+
+/** Size in bytes of a {@link multiReferenceSidx} holding `subsegmentCount` references. */
+export const measureMultiReferenceSidx = (subsegmentCount: number) => 40 + 12 * subsegmentCount;
+
+/**
+ * Segment Index Box indexing every subsegment of the file, as opposed to {@link sidx}, which
+ * describes a single one. `firstOffset` is unsigned, so a box of this shape can only ever sit
+ * ahead of the subsegments it references.
+ */
+export const multiReferenceSidx = (options: {
+	referenceId: number;
+	timescale: number;
+	earliestPresentationTime: number;
+	firstOffset: number;
+	subsegments: SidxSubsegment[];
+}) => {
+	return fullBox('sidx', 1, 0, [
+		u32(options.referenceId),
+		u32(options.timescale),
+		u64(options.earliestPresentationTime),
+		u64(options.firstOffset),
+		u16(0), // Reserved
+		u16(options.subsegments.length),
+		options.subsegments.map(subsegment => [
+			u32(subsegment.size & 0x7fffffff), // Reference type (0, media) + referenced size
+			u32(subsegment.duration),
+			u32(0x90000000), // Starts with SAP, SAP type 1 — every fragment opens on a key frame
+		]),
+	]);
+};
+
 /** Segment Index Box */
 export const sidx = (muxer: IsobmffMuxer, referencedSize: number) => {
 	const earliestPresentationTime = Math.max(0, muxer.minWrittenTimestamp);
@@ -435,7 +478,8 @@ export const mvhd = (
  */
 export const trak = (trackData: IsobmffTrackData, creationTime: number) => {
 	const trackMetadata = getTrackMetadata(trackData);
-	const needsEditList = trackData.startTimestampOffset !== null && trackData.startTimestampOffset !== 0;
+	const needsEditList = trackData.startTimestampOffset !== null
+		&& (trackData.startTimestampOffset !== 0 || trackData.firstDecodeTimestamp !== 0);
 
 	return box('trak', undefined, [
 		tkhd(trackData, creationTime),
@@ -520,60 +564,43 @@ export const tkhd = (
 export const edts = (trackData: IsobmffTrackData) => {
 	const offset = trackData.startTimestampOffset;
 	assert(offset !== null);
+	assert(trackData.firstDecodeTimestamp !== null);
 
-	if (offset > 0) {
-		// Positive offset: empty segment at the start, then the full media afterwards
+	// Presentation begins at max(0, offset): a later start becomes an empty edit, an earlier one is trimmed off.
+	// The media timeline begins at the first sample's decode time, so the gap between the two - the reorder delay
+	// of a stream whose first decoded sample isn't its first presented one - is what the media time states.
+	const emptyDuration = Math.max(0, intoTimescale(offset, GLOBAL_TIMESCALE));
+	const mediaTime = intoTimescale(Math.max(0, offset) - trackData.firstDecodeTimestamp, trackData.timescale);
 
-		const startOffset = intoTimescale(offset, GLOBAL_TIMESCALE);
-		const mediaDuration = intoTimescale(presentationSpan(trackData), GLOBAL_TIMESCALE);
+	// For fragmented files this is zero, which simply means "unknown duration" in this case. Spec:
+	// "the segment_duration of this edit may be zero"
+	const mediaDuration = Math.max(
+		0,
+		intoTimescale(presentationSpan(trackData), GLOBAL_TIMESCALE)
+		+ Math.min(0, intoTimescale(offset, GLOBAL_TIMESCALE)),
+	);
 
-		const needs64Bits = !isU32(startOffset) || !isU32(mediaDuration);
-		const u32OrU64 = needs64Bits ? u64 : u32;
-		const i32OrI64 = needs64Bits ? i64 : i32;
+	const needs64Bits = !isU32(emptyDuration) || !isU32(mediaDuration) || !isI32(mediaTime);
+	const u32OrU64 = needs64Bits ? u64 : u32;
+	const i32OrI64 = needs64Bits ? i64 : i32;
 
-		return box('edts', undefined, [
-			fullBox('elst', needs64Bits ? 1 : 0, 0, [
-				u32(2), // Entry count
+	return box('edts', undefined, [
+		fullBox('elst', needs64Bits ? 1 : 0, 0, [
+			u32(emptyDuration > 0 ? 2 : 1), // Entry count
 
-				// #1
-				u32OrU64(startOffset), // Segment duration
-				i32OrI64(-1), // Media time
-				fixed_16_16(1), // Media rate
+			...emptyDuration > 0
+				? [
+						u32OrU64(emptyDuration), // Segment duration
+						i32OrI64(-1), // Media time
+						fixed_16_16(1), // Media rate
+					]
+				: [],
 
-				// #2
-				u32OrU64(mediaDuration), // Segment duration
-				i32OrI64(0), // Media time
-				fixed_16_16(1), // Media rate
-			]),
-		]);
-	} else {
-		// Negative offset: the negative section of the media is trimmed off
-
-		const mediaTime = intoTimescale(-offset, trackData.timescale);
-		// Not the entire media is visible.
-		// For fragmented files, this value is zero, which simply means "unknown duration" in this case. Spec:
-		// "the segment_duration of this edit may be zero"
-		const mediaDuration = Math.max(
-			0,
-			intoTimescale(presentationSpan(trackData), GLOBAL_TIMESCALE)
-			+ intoTimescale(offset, GLOBAL_TIMESCALE),
-		);
-
-		const needs64Bits = !isI32(mediaTime) || !isU32(mediaDuration);
-		const u32OrU64 = needs64Bits ? u64 : u32;
-		const i32OrI64 = needs64Bits ? i64 : i32;
-
-		return box('edts', undefined, [
-			fullBox('elst', needs64Bits ? 1 : 0, 0, [
-				u32(1), // Entry count
-
-				// #1
-				u32OrU64(mediaDuration), // Segment duration
-				i32OrI64(mediaTime), // Media time
-				fixed_16_16(1), // Media rate
-			]),
-		]);
-	}
+			u32OrU64(mediaDuration), // Segment duration
+			i32OrI64(mediaTime), // Media time
+			fixed_16_16(1), // Media rate
+		]),
+	]);
 };
 
 /** Media Box: Describes and define a track's media type and sample data. */
@@ -716,7 +743,12 @@ export const stsd = (trackData: IsobmffTrackData) => {
 
 	if (trackData.type === 'video') {
 		sampleDescription = videoSampleDescription(
-			videoCodecToBoxName(trackData.track.source._codec, trackData.info.decoderConfig.codec),
+			videoCodecToBoxName(
+				trackData.track.source._codec,
+				trackData.info.decoderConfig.codec,
+				trackData.info.inBandParameterSets,
+				trackData.info.decoderConfig.dolbyVision,
+			),
 			trackData,
 		);
 	} else if (trackData.type === 'audio') {
@@ -773,11 +805,14 @@ export const videoSampleDescription = (
 	i16(0xffff), // Pre-defined
 ], [
 	VIDEO_CODEC_TO_CONFIGURATION_BOX[trackData.track.source._codec]?.(trackData) ?? null,
+	dovi(trackData),
 	pasp(trackData),
 	colorSpaceIsEmpty(trackData.info.decoderConfig.colorSpace)
 		? null
 		: colr(trackData),
 	btrt(trackData),
+	mdcv(trackData),
+	clli(trackData),
 ]);
 
 /** Bit Rate Box: Signals the average and peak bitrate of the track. */
@@ -791,6 +826,36 @@ export const btrt = (trackData: IsobmffTrackData) => {
 		u32(trackData.maxBitrate), // Max bitrate
 		u32(trackData.avgBitrate), // Average bitrate
 	]);
+};
+
+/** Dolby Vision Configuration Box: the profile, level and layer flags a Dolby Vision track states. */
+export const dovi = (trackData: IsobmffVideoTrackData) => {
+	const config = trackData.info.decoderConfig.dolbyVision;
+	if (!config) {
+		return null;
+	}
+
+	return box(doviConfigBoxName(config), [...serializeDoviConfigRecord(config)]);
+};
+
+/** Mastering Display Colour Volume Box: HDR10 mastering-display static metadata (SMPTE ST 2086). */
+export const mdcv = (trackData: IsobmffVideoTrackData) => {
+	const masteringDisplay = trackData.info.decoderConfig.hdrStaticMetadata?.masteringDisplay;
+	if (!masteringDisplay) {
+		return null;
+	}
+
+	return box('mdcv', [...buildMasteringDisplayPayload(masteringDisplay)]);
+};
+
+/** Content Light Level Box: HDR10 content-light static metadata (MaxCLL / MaxFALL, CTA-861.3). */
+export const clli = (trackData: IsobmffVideoTrackData) => {
+	const contentLight = trackData.info.decoderConfig.hdrStaticMetadata?.contentLight;
+	if (!contentLight) {
+		return null;
+	}
+
+	return box('clli', [...buildContentLightPayload(contentLight)]);
 };
 
 /** Pixel Aspect Ratio Box: Specifies pixel width:height spacing for non-square pixels. */
@@ -1239,10 +1304,15 @@ export const subtitleSampleDescription = (
 ) => box(compressionType, [
 	Array(6).fill(0), // Reserved
 	u16(1), // Data reference index
+	SUBTITLE_CODEC_TO_SAMPLE_ENTRY_FIELDS[trackData.track.source._codec](),
 ], [
 	SUBTITLE_CODEC_TO_CONFIGURATION_BOX[trackData.track.source._codec](trackData),
 	btrt(trackData),
 ]);
+
+// XMLSubtitleSampleEntry (ISO/IEC 14496-12) states its three strings in the entry itself rather than in
+// a configuration box: namespace, schema location, auxiliary MIME types. The latter two are empty here.
+const stppSampleEntryFields = () => [...textEncoder.encode(TTML_NAMESPACE), 0, 0, 0];
 
 export const vttC = (trackData: IsobmffSubtitleTrackData) => box('vttC', [
 	...textEncoder.encode(trackData.info.config.description),
@@ -1544,11 +1614,31 @@ export const tfhd = (trackData: IsobmffTrackData) => {
  * Track Fragment Decode Time Box: Provides the absolute decode time of the first sample of the fragment. This is
  * useful for performing random access on the media file.
  */
+/**
+ * The chunk's lowest decode time, which is what `tfdt` states. Not its lowest presentation time: for a track
+ * that states its own decode timeline the two differ by the reorder delay, and `trun`'s composition offsets
+ * are relative to this, so stating the presentation time moves the whole fragment later by that delay.
+ *
+ * Read off the samples here rather than accumulated as they are added, because a sample joins its chunk
+ * before `processTimestamps` has settled the batch it belongs to.
+ */
+const baseMediaDecodeTime = (chunk: { samples: { decodeTimestamp: number }[] }) => {
+	let lowest = Infinity;
+	for (const sample of chunk.samples) {
+		lowest = Math.min(lowest, sample.decodeTimestamp);
+	}
+
+	// tfdt is unsigned, so a timeline reaching below zero would wrap rather than fail
+	assert(lowest >= 0);
+
+	return lowest;
+};
+
 export const tfdt = (trackData: IsobmffTrackData) => {
 	assert(trackData.currentChunk);
 
 	return fullBox('tfdt', 1, 0, [
-		u64(intoTimescale(trackData.currentChunk.startTimestamp, trackData.timescale)), // Base Media Decode Time
+		u64(intoTimescale(baseMediaDecodeTime(trackData.currentChunk), trackData.timescale)),
 	]);
 };
 
@@ -2002,15 +2092,61 @@ const dataStringBoxLong = (value: string) => {
 	]);
 };
 
-const videoCodecToBoxName = (codec: VideoCodec, fullCodecString: string) => {
+const videoCodecToBoxName = (
+	codec: VideoCodec,
+	fullCodecString: string,
+	inBandParameterSets: boolean,
+	doviConfig?: DoviConfig,
+) => {
+	if (doviConfig && (codec === 'avc' || codec === 'hevc')) {
+		return doviSampleEntryFourCc(codec, doviConfig, inBandParameterSets);
+	}
+
 	switch (codec) {
-		case 'avc': return fullCodecString.startsWith('avc3') ? 'avc3' : 'avc1';
-		case 'hevc': return 'hvc1';
+		// The name asserts where the parameter sets are (14496-15 §5.2), which CMAF §9.3.2 lets be both and the
+		// bitstream cannot distinguish — trustworthy for AVC, but not HEVC, where `hev1.` is always generated
+		case 'avc': return inBandParameterSets || fullCodecString.startsWith('avc3') ? 'avc3' : 'avc1';
+		case 'hevc': return inBandParameterSets ? 'hev1' : 'hvc1';
 		case 'vp8': return 'vp08';
 		case 'vp9': return 'vp09';
 		case 'av1': return 'av01';
 		case 'prores': return fullCodecString;
 	}
+};
+
+/**
+ * The codec string as the container describes it, rather than as the encoder reported it.
+ *
+ * The encoder's codec string says nothing about where the parameter sets ended up — mediabunny
+ * generates `hev1.` for every HEVC stream — so a manifest repeating it can advertise a codec the
+ * file is not. Players use `CODECS` for capability checks, and one supporting `hvc1` but not `hev1`
+ * refuses a stream it could have played. Derived from {@link videoCodecToBoxName} so the
+ * declaration cannot drift from the box.
+ *
+ * Distinct from `adjustHlsVideoCodec`, which is an unconditional Apple-compatibility policy applied
+ * to caller-supplied strings. This reports a fact about what was written.
+ *
+ * Only an ISOBMFF sample entry pins where parameter sets live; MPEG-TS carries them in the stream,
+ * so an in-band fourcc is the honest one there and the string passes through.
+ *
+ * @internal
+ */
+export const declaredVideoCodec = (
+	codec: VideoCodec,
+	codecString: string,
+	segmentFormat: OutputFormat,
+	inBandParameterSets: boolean,
+): string => {
+	if (!(segmentFormat instanceof IsobmffOutputFormat)) {
+		return codecString;
+	}
+
+	const fourcc = videoCodecToBoxName(codec, codecString, inBandParameterSets);
+	if (fourcc.length !== 4 || codecString.length < 4 || codecString.slice(0, 4) === fourcc) {
+		return codecString;
+	}
+
+	return fourcc + codecString.slice(4);
 };
 
 const VIDEO_CODEC_TO_CONFIGURATION_BOX: Record<
@@ -2117,6 +2253,7 @@ const audioCodecToConfigurationBox = (codec: AudioCodec, isQuickTime: boolean) =
 
 const SUBTITLE_CODEC_TO_BOX_NAME: Record<SubtitleCodec, string> = {
 	webvtt: 'wvtt',
+	ttml: 'stpp',
 };
 
 const SUBTITLE_CODEC_TO_CONFIGURATION_BOX: Record<
@@ -2124,6 +2261,12 @@ const SUBTITLE_CODEC_TO_CONFIGURATION_BOX: Record<
 	(trackData: IsobmffSubtitleTrackData) => Box | null
 > = {
 	webvtt: vttC,
+	ttml: () => null,
+};
+
+const SUBTITLE_CODEC_TO_SAMPLE_ENTRY_FIELDS: Record<SubtitleCodec, () => number[]> = {
+	webvtt: () => [],
+	ttml: stppSampleEntryFields,
 };
 
 const getLanguageCodeInt = (code: string) => {

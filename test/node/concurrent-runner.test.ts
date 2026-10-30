@@ -1,5 +1,5 @@
 import { expect, test } from 'vitest';
-import { ConcurrentRunner, promiseWithResolvers } from '../../src/misc.js';
+import { CallSerializer, ConcurrentRunner, promiseWithResolvers } from '../../src/misc.js';
 
 test('parallelism of 1 runs tasks strictly sequentially', async () => {
 	const runner = new ConcurrentRunner(1);
@@ -287,3 +287,41 @@ const flushMicrotasks = async (iterations = 10) => {
 		await Promise.resolve();
 	}
 };
+
+test('CallSerializer keeps running calls after one of them fails', async () => {
+	const serializer = new CallSerializer();
+	const ran: string[] = [];
+
+	const failing = serializer.call(() => {
+		ran.push('first');
+		throw new Error('nope');
+	});
+	const after = serializer.call(() => {
+		ran.push('second');
+	});
+
+	await expect(failing).rejects.toThrow('nope');
+
+	// A decoder close queued behind a failed decode must still close it
+	await after;
+	expect(ran).toEqual(['first', 'second']);
+});
+
+test('CallSerializer leaves no rejection for the chain itself', async () => {
+	const unhandled: unknown[] = [];
+	const record = (reason: unknown) => unhandled.push(reason);
+	process.on('unhandledRejection', record);
+
+	try {
+		const serializer = new CallSerializer();
+		void serializer.call(() => {
+			throw new Error('nope');
+		}).catch(() => {});
+		void serializer.call(() => {});
+
+		await new Promise(resolve => setTimeout(resolve, 100));
+		expect(unhandled).toEqual([]);
+	} finally {
+		process.off('unhandledRejection', record);
+	}
+});

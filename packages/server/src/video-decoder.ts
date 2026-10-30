@@ -11,6 +11,8 @@ import * as NodeAv from 'node-av';
 import { CODEC_TO_CODEC_ID, getHardwareDecoderCodec } from './misc';
 import { assert, binarySearchLessOrEqual, simplifyRational, toUint8Array } from '../../../src/misc';
 import { AvFrameVideoSampleResource } from './video-sample';
+import { parseClosedCaptionBytePairs } from '../../../src/closed-captions';
+import { dolbyVisionRpuNalUnit } from '../../../src/dovi';
 
 export class NodeAvVideoDecoder extends CustomVideoDecoder {
 	frame!: NodeAv.Frame;
@@ -81,6 +83,7 @@ export class NodeAvVideoDecoder extends CustomVideoDecoder {
 			? Buffer.from(toUint8Array(this.config.description))
 			: null;
 		codecContext.sampleAspectRatio = new NodeAv.Rational(this.pixelAspectRatio.num, this.pixelAspectRatio.den);
+		codecContext.threadCount = 0; // libavcodec defaults this to 1, unlike the ffmpeg CLI
 
 		// Honor inferred H.264 reorder buffering even when bitstream restrictions aren't explicitly signaled
 		// See https://github.com/Vanilagy/mediabunny/issues/488
@@ -194,9 +197,14 @@ export class NodeAvVideoDecoder extends CustomVideoDecoder {
 			throw new Error('Frame clone allocation failed.');
 		}
 
+		const ccData = this.frame.getSideData(NodeAv.AV_FRAME_DATA_A53_CC);
+		const rpuData = this.frame.getSideData(NodeAv.AV_FRAME_DATA_DOVI_RPU_BUFFER);
+
 		this.onSample(new VideoSample(new AvFrameVideoSampleResource(clone), {
 			timestamp,
 			duration,
+			closedCaptions: ccData ? parseClosedCaptionBytePairs(toUint8Array(ccData)) : null,
+			dolbyVisionRpu: rpuData ? dolbyVisionRpuNalUnit(toUint8Array(rpuData)) : null,
 		}));
 	}
 

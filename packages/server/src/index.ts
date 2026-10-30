@@ -115,6 +115,12 @@ export type { MediabunnyServerOptions };
 
 export { AvFrameVideoSampleResource } from './video-sample';
 export { AvFrameAudioSampleResource } from './audio-sample';
+export { NetworkSource } from './network-source';
+export type { NetworkSourceOptions } from './network-source';
+export { RtmpSource } from './rtmp-source';
+export type { RtmpSourceOptions } from './rtmp-source';
+export { DEFAULT_RIST_BUFFER_MS, RistSource } from './rist-source';
+export type { RistSourceOptions } from './rist-source';
 
 /**
  * Copies a `VideoSample` or `AudioSample` into the given NodeAV

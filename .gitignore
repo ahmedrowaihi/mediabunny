@@ -14,3 +14,5 @@ packages/aac-encoder/dist
 packages/flac-encoder/dist
 packages/server/dist
 packages/prores/dist
+# Captured HLS test media: 84 MB of third-party streams, rebuilt with `npm run capture-hls-fixtures`
+test/fixtures/hls/

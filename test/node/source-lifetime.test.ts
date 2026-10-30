@@ -1,5 +1,6 @@
 import { expect, test, vi } from 'vitest';
 import { CustomSource, FilePathSource } from '../../src/source.js';
+import { BufferSource, CustomPathedSource } from '../../src/source.js';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Input, InputDisposedError } from '../../src/input.js';
@@ -145,4 +146,22 @@ test('CustomSource releases stream readers after read errors', async () => {
 	});
 	await expect(input.getFormat()).rejects.toBe(error);
 	expect(stream.locked).toBe(false);
+});
+
+// Regression test for upstream #542.
+test('A source that resolves after dispose is freed, and the caller is told', async () => {
+	const { promise, resolve } = promiseWithResolvers<BufferSource>();
+	const root = new CustomPathedSource('root.m3u8', () => promise);
+
+	const input = new Input({ source: root, formats: ALL_FORMATS });
+	const inFlight = input._getSourceCached({ path: 'segment.ts', isRoot: false });
+
+	// Dispose while the request handler is still unresolved
+	input.dispose();
+
+	const resolved = new BufferSource(new Uint8Array(8));
+	resolve(resolved);
+
+	await expect(inFlight).rejects.toThrow(InputDisposedError);
+	expect(resolved._disposed).toBe(true);
 });

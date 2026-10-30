@@ -755,6 +755,7 @@ export const resync = async (reader: Reader, startPos: number, ids: EBMLId[], un
 
 export const CODEC_STRING_MAP: Partial<Record<MediaCodec, string>> = {
 	'avc': 'V_MPEG4/ISO/AVC',
+	'mpeg2': 'V_MPEG2',
 	'hevc': 'V_MPEGH/ISO/HEVC',
 	'vp8': 'V_VP8',
 	'vp9': 'V_VP9',
@@ -763,6 +764,7 @@ export const CODEC_STRING_MAP: Partial<Record<MediaCodec, string>> = {
 
 	'aac': 'A_AAC',
 	'mp3': 'A_MPEG/L3',
+	'mp2': 'A_MPEG/L2',
 	'opus': 'A_OPUS',
 	'vorbis': 'A_VORBIS',
 	'flac': 'A_FLAC',

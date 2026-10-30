@@ -189,6 +189,11 @@ test('MP4: stsc with alternating chunk indices', async () => {
 	})]));
 });
 
+// Bound widened from vitest's 5 s default: on CI these have been measured at 887 ms, 1326 ms, 2568 ms,
+// 2869 ms, 7755 ms and 15647 ms across six runs of the same tree - a 17x spread on a loaded arm64
+// runner, which red-flagged a release whose own A/B on an unloaded machine was 506 ms against 517 ms.
+// What they catch is quadratic behaviour, which is orders of magnitude rather than a doubling, so the
+// wider bound still fails on the regression it exists for.
 test('MP4: Single chunk with many samples', async () => {
 	// Computing a sample's offset in its chunk used to be linear, making iteration quadratic
 	const sampleCount = 100_000;
@@ -208,7 +213,7 @@ test('MP4: Single chunk with many samples', async () => {
 	}
 
 	expect(count).toBe(sampleCount);
-});
+}, 60_000);
 
 test('MP4: keys box with zero key size', async () => {
 	// A zero key size used to move the read position backwards, making no progress
@@ -318,7 +323,7 @@ test('MP4: Fragments with decreasing timestamps', async () => {
 	using input = new Input({ source: new BufferSource(mp4(fragmentedMoov(), moofs)), formats: ALL_FORMATS });
 
 	expect(await countPackets(input)).toBe(fragmentCount);
-});
+}, 60_000);
 
 test('MP4: Many tracks and trafs of an unknown track', async () => {
 	// Looking up the unknown track used to search through all tracks for every single traf
@@ -626,6 +631,33 @@ test('MP4: trak inside moof', async () => {
 		box('mdat', zeros(16)),
 	]));
 });
+
+test('MP4: Box claiming more bytes than its parent holds', async () => {
+	// Slicing the stated extent out of the parent threw a RangeError the reader labels an internal one
+	const file = mp4([trak({ handler: 'vide', stbl: singleChunkStbl(2, 0) })], [box('mdat', zeros(16))]);
+
+	for (const name of ['avc1', 'stsd', 'stbl', 'minf', 'mdia', 'trak']) {
+		await expectGracefulRead(growBox(file, name, 500));
+	}
+});
+
+/** The same file with one box's stated size raised, leaving its parents' sizes alone. */
+const growBox = (file: Uint8Array, name: string, by: number) => {
+	const out = file.slice();
+	const view = new DataView(out.buffer);
+	const fourCc = ascii(name);
+
+	for (let pos = 8; pos + 4 <= out.length; pos++) {
+		const stated = view.getUint32(pos - 4);
+		// A fourcc also appears among ftyp's compatible brands, so take the one with a plausible size
+		if (fourCc.every((byte, i) => out[pos + i] === byte) && stated >= 8 && pos - 4 + stated <= out.length) {
+			view.setUint32(pos - 4, stated + by);
+			return out;
+		}
+	}
+
+	throw new Error(`No ${name} box found.`);
+};
 
 const mp4 = (moovChildren: Bytes[], after: Bytes[] = []) => concat(
 	box('ftyp', ascii('isom'), u32(0), ascii('isom')),
@@ -1244,14 +1276,18 @@ test('MPEG-TS: Many streams and one that never shows up', async () => {
 		}
 	}
 
+	const file = mpegTs(streams, [], {}, concatList(packets));
 	using input = new Input({
-		source: new BufferSource(mpegTs(streams, [], {}, concatList(packets))),
+		source: new BufferSource(file),
 		formats: ALL_FORMATS,
 	});
-	const start = performance.now();
+	// Bytes read, not elapsed time: the regression was re-scanning the stream, which shows up as
+	// multiples of the file, and a clock bound fails under load instead.
+	let readBytes = 0;
+	input.source.on('read', ({ start: a, end: b }) => readBytes += b - a);
 	await input.getTracks();
 
-	expect(performance.now() - start).toBeLessThan(1500);
+	expect(readBytes).toBeLessThan(3 * file.byteLength);
 });
 
 test('MPEG-TS: PES packets without data', async () => {
@@ -1531,6 +1567,8 @@ test('Ogg: Seeking across a region full of fake page headers', async () => {
 		await sink.getPacket(timestamp);
 	}
 
+	// Still a clock bound: these seeks read nothing from the source, so there is no work to count.
+	// Runs in ~40ms, so the margin absorbs load.
 	expect(performance.now() - start).toBeLessThan(1000);
 });
 
@@ -2249,6 +2287,7 @@ const concatList = (parts: Bytes[]) => {
 const u64le = (value: number) => u64(value).reverse();
 const u64 = (value: number) => [...u32(Math.floor(value / 2 ** 32)), ...u32(value >>> 0)];
 const u32le = (value: number) => u32(value).reverse();
+
 const u32 = (value: number) => [(value >>> 24) & 0xff, (value >>> 16) & 0xff, (value >>> 8) & 0xff, value & 0xff];
 const u24 = (value: number) => [(value >>> 16) & 0xff, (value >>> 8) & 0xff, value & 0xff];
 const u16le = (value: number) => u16(value).reverse();

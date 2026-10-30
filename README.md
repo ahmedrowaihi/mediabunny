@@ -1,4 +1,6 @@
-# Mediabunny - JavaScript media toolkit
+# Mediabunny - JavaScript media toolkit — fork features
+
+> This is the [`@ahmedrowaihi/mediabunny`](https://www.npmjs.com/package/@ahmedrowaihi/mediabunny) fork of [Vanilagy/mediabunny](https://github.com/Vanilagy/mediabunny). It tracks upstream on `main` and ships additional features (DASH input, exported HLS / DASH parser AST, concat building blocks, output-side shaka-packager ports) as `-beta.N` releases ahead of upstream. See **[FORK.md](./FORK.md)** for the full feature list, and the [Releases page](https://github.com/ahmedrowaihi/mediabunny/releases) for per-publish notes. The rest of this README is the unmodified upstream document.
 
 [![](https://img.shields.io/npm/v/mediabunny)](https://www.npmjs.com/package/mediabunny)
 [![](https://img.shields.io/bundlephobia/minzip/mediabunny)](https://bundlephobia.com/package/mediabunny)
@@ -45,14 +47,6 @@ Mediabunny is a JavaScript library for reading, writing, and converting media (l
   &nbsp;&nbsp;&nbsp;&nbsp;
   <a href="https://www.tella.com/" target="_blank" rel="sponsored">
     <img src="./docs/public/sponsors/tella.svg" width="60" height="60" alt="Tella">
-  </a>
-</div>
-
-### Silver sponsors
-
-<div align="center">
-  <a href="https://jitter.video/" target="_blank" rel="sponsored">
-    <img src="./docs/public/sponsors/jitter.png" width="50" height="50" alt="Jitter">
   </a>
 </div>
 

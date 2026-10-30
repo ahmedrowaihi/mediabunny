@@ -18,7 +18,7 @@
 		},
 	},
 	"include": ["vitest.config.ts", "./test/**/*"],
-	"exclude": ["./test/public/**/*"],
+	"exclude": ["./test/public/**/*", "./test/fixtures/**/*"],
 	"references": [
 		{ "path": "./src" },
 		{ "path": "./tsconfig.packages.json" },

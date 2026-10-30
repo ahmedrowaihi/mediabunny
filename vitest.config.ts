@@ -2,6 +2,8 @@ import { defineConfig } from 'vitest/config';
 import { webdriverio } from '@vitest/browser-webdriverio';
 import path from 'node:path';
 
+const CHROME_PROFILE = 'node_modules/.cache/chrome-profile';
+
 export default defineConfig({
 	resolve: {
 		alias: {
@@ -65,6 +67,12 @@ export default defineConfig({
 								// somewhere persistent
 								'wdio:chromedriverOptions': {
 									cacheDir: path.resolve(__dirname, 'node_modules/.cache/webdriver'),
+								},
+								// Chrome leaks the profile directory it picks for itself when the run ends: 81 of
+								// them, 13 GB, filled this machine's disk and the suite then failed with ENOSPC
+								// rather than a test result. Naming one keeps it to a single reused directory.
+								'goog:chromeOptions': {
+									args: [`--user-data-dir=${path.resolve(__dirname, CHROME_PROFILE)}`],
 								},
 							},
 						}),

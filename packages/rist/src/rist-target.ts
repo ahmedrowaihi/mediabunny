@@ -168,7 +168,8 @@ class RistSink {
 		);
 
 		if (this.librist.start(this.ctx) !== 0) {
-			this.close();
+			// No grace here, unlike `close`: nothing has been handed over, so there is nothing to drain
+			this.destroyNow();
 			throw new Error(`librist could not start sending to ${this.url}.`);
 		}
 	}
@@ -252,6 +253,10 @@ class RistSink {
 			await new Promise(resolve => setTimeout(resolve, DRAIN_GRACE_MS));
 		}
 
+		this.destroyNow();
+	}
+
+	private destroyNow() {
 		// Stats first: the callback must not be able to fire into a destroyed context
 		this.stopStats?.();
 		this.stopStats = null;

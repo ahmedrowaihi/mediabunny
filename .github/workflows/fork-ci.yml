@@ -1,0 +1,106 @@
+# Upstream's lint, test and build-check workflows run on `main` and pull requests, so the branch this fork
+# publishes from is never checked by them. This runs the same gates the release is held to, on that branch.
+name: Fork CI
+
+on:
+  push:
+    branches:
+      - publish-ahmedrowaihi
+  workflow_dispatch:
+
+jobs:
+  gates:
+    name: Gates
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Add upstream remote
+        # `npm run check` compares the tree against upstream to catch an upstream line dropped by a rebase.
+        run: |
+          git remote add upstream https://github.com/Vanilagy/mediabunny.git
+          git fetch upstream main --depth=1000
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'npm'
+
+      - name: Install ffmpeg and librist
+        # ffmpeg: three rtmp tests and the resize comparisons need the binary itself, and skip without it.
+        #
+        # librist4 is the library only. Ubuntu packages no `librist-tools`, so `ristsender` and
+        # `ristreceiver` are absent and every interop test in test/node/rist-librist.test.ts still skips
+        # here - those run on a developer's machine with a Homebrew or source build. What this does gate
+        # is the load path and the `rist_data_block` size assertion against a distro build of a different
+        # version, which is the part most likely to differ from the one it was written against.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg librist4
+
+      - name: Install dependencies
+        # With scripts, unlike the publish job: the suite needs node-av's native binary. The lock must be
+        # written with default peer resolution or `npm ci` rejects it here — see FORK.md.
+        run: npm ci
+
+      - name: Check types, lint and the deletion guard
+        run: |
+          npm run check
+          npm run lint
+
+      - name: Build
+        run: npm run build
+
+      - name: Check the docs generate
+        run: npm run docs:generate -- --dry
+
+      - name: Run tests
+        # xvfb, as upstream's test workflow does: the browser project drives a real Chrome.
+        run: xvfb-run npm test
+
+  encoder-selection-arm64:
+    # `prefer-software` resolved through FFmpeg's default encoder for the codec, and on node-av's
+    # linux-arm64 prebuild that default is h264_rkmpp — a hardware wrapper. So the bug only existed on
+    # arm64, where no other job here runs, and it reached a release. A native arm64 runner (free and
+    # unlimited on a public repository) is enough to close that gap; the tests are seconds, so this runs
+    # the encoder-selection ones alone rather than the whole suite a second time.
+    name: Encoder selection (linux-arm64)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'npm'
+
+      - name: Install dependencies
+        # With scripts: the point of this job is node-av's linux-arm64 native binary and the encoders
+        # built into it.
+        run: npm ci
+
+      - name: Report the encoders this build actually has
+        # Logged whether or not the tests pass: which encoder FFmpeg defaults to here is the fact the
+        # whole job exists for, and a future failure is unreadable without it.
+        run: |
+          node --import tsx -e "
+            import * as NodeAv from 'node-av';
+            for (const [name, id] of [['avc', NodeAv.AV_CODEC_ID_H264], ['hevc', NodeAv.AV_CODEC_ID_HEVC]]) {
+              console.log(name, 'default:', NodeAv.Codec.findEncoder(id)?.name ?? 'none');
+            }
+            for (const n of ['libx264', 'libx265', 'h264_rkmpp', 'h264_v4l2m2m']) {
+              console.log(n, NodeAv.Codec.findEncoderByName(n) ? 'present' : 'absent');
+            }
+          "
+
+      - name: Run the encoder selection tests
+        # UV_THREADPOOL_SIZE as the `test` script sets it, since libuv reads it at process start and a
+        # bare vitest call would leave it at the default. No build and no `pre-test`: vitest aliases
+        # `@mediabunny/server` to its source, and these tests touch no bundle.
+        run: UV_THREADPOOL_SIZE=32 npx vitest --run --project node encoder-selection

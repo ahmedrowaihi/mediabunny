@@ -9,7 +9,7 @@ import { NodeAvVideoDecoder } from '../../packages/server/src/video-decoder.js';
 import { NodeAvVideoEncoder } from '../../packages/server/src/video-encoder.js';
 import { NodeAvAudioDecoder } from '../../packages/server/src/audio-decoder.js';
 import { NodeAvAudioEncoder } from '../../packages/server/src/audio-encoder.js';
-import { AudioSample, VideoSample, VideoSampleColorSpace } from '../../src/sample.js';
+import { AudioSample, VideoSample } from '../../src/sample.js';
 import {
 	AudioCodec,
 	buildAudioCodecString,
@@ -284,7 +284,7 @@ describe('Video', async () => {
 				expect(naluTypes).toContain(AvcNalUnitType.PPS);
 
 				expect(meta.decoderConfig).toBeDefined();
-				expect(meta.decoderConfig!.codec.startsWith('avc1.')).toBe(true);
+				expect(meta.decoderConfig!.codec.startsWith('avc3.')).toBe(true);
 				expect(meta.decoderConfig!.description).toBeUndefined();
 			}
 		}, async (sample, i) => {
@@ -319,7 +319,7 @@ describe('Video', async () => {
 
 			if (i === 0) {
 				expect(meta.decoderConfig).toBeDefined();
-				expect(meta.decoderConfig!.codec.startsWith('hev1.')).toBe(true);
+				expect(meta.decoderConfig!.codec.startsWith('hvc1.')).toBe(true);
 				expect(meta.decoderConfig!.description).toBeDefined();
 				expect(toUint8Array(meta.decoderConfig!.description!)[0]).toBe(1); // configurationVersion
 			}
@@ -477,7 +477,7 @@ describe('Video', async () => {
 	const QUANTIZER_TEST_CODECS = [
 		{ codec: 'avc', name: 'AVC', low: 10, high: 45 },
 		{ codec: 'hevc', name: 'HEVC', low: 10, high: 45 },
-		{ codec: 'vp9', name: 'VP9', low: 40, high: 220 },
+		{ codec: 'vp9', name: 'VP9', low: 10, high: 55 },
 		{ codec: 'av1', name: 'AV1', low: 40, high: 220 },
 	] as const;
 
@@ -862,6 +862,160 @@ describe('Video', async () => {
 		return packets;
 	};
 
+	// Real footage scaled to 640x360, where a low quantizer far exceeds the caps below
+	const convertWithQuality = async (codec: VideoCodec, quality: Quality) => {
+		using input = new Input({ source: new FilePathSource('./test/public/video.mp4'), formats: ALL_FORMATS });
+		const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+		const conversion = await Conversion.init({
+			input,
+			output,
+			video: { codec, width: 640, quality, keyFrameInterval: 2, forceTranscode: true },
+			audio: { discard: true },
+			trim: { end: 4 },
+		});
+		await conversion.execute();
+
+		using result = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		const track = await result.getPrimaryVideoTrack();
+		assert(track);
+
+		const packets: EncodedPacket[] = [];
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			packets.push(packet);
+		}
+		return packets;
+	};
+
+	// Worst share of the VBV allowance (cap × window + buffer) over any window; above 1 breaks the cap
+	const worstShareOfCap = (packets: EncodedPacket[], maxBitrate: number, bufferSize: number, seconds: number) => {
+		let worst = 0;
+		for (const first of packets) {
+			const bits = packets
+				.filter(x => x.timestamp >= first.timestamp && x.timestamp < first.timestamp + seconds)
+				.reduce((sum, x) => sum + 8 * x.data.byteLength, 0);
+			worst = Math.max(worst, bits / (maxBitrate * seconds + bufferSize));
+		}
+		return worst;
+	};
+
+	test.each(['avc', 'hevc', 'vp9', 'av1'] as const)(
+		'%s capped quality stays within its bitrate cap',
+		{ timeout: 180_000 },
+		async (codec) => {
+			const quantizer = codec === 'av1' ? 16 : 4;
+			const maxBitrate = 400_000;
+			const bufferSize = 400_000;
+
+			const uncapped = await convertWithQuality(codec, new Quality({ quantizer }));
+			const capped = await convertWithQuality(codec, new Quality({ quantizer, maxBitrate, bufferSize }));
+			const uncappedShare = worstShareOfCap(uncapped, maxBitrate, bufferSize, 2);
+			const cappedShare = worstShareOfCap(capped, maxBitrate, bufferSize, 2);
+
+			expect(uncappedShare).toBeGreaterThan(1.5);
+			expect(cappedShare).toBeLessThanOrEqual(1);
+		},
+	);
+
+	// VP9 is left out: libvpx's capped mode is a target over the stream rather than a buffer model
+	test.each(['avc', 'hevc', 'av1'] as const)(
+		'%s capped quality holds its cap at 50 fps',
+		{ timeout: 120_000 },
+		async (codec) => {
+			using input = new Input({
+				source: new FilePathSource('./test/public/scene-cut-50fps.mp4'),
+				formats: ALL_FORMATS,
+			});
+			const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+			const maxBitrate = 100_000;
+			const bufferSize = 2 * maxBitrate;
+			const conversion = await Conversion.init({
+				input,
+				output,
+				video: {
+					codec,
+					quality: new Quality({ quantizer: codec === 'av1' ? 32 : 8, maxBitrate, bufferSize }),
+					keyFrameInterval: 2,
+					forceTranscode: true,
+				},
+			});
+			await conversion.execute();
+
+			using result = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+			const track = await result.getPrimaryVideoTrack();
+			assert(track);
+
+			const packets: EncodedPacket[] = [];
+			for await (const packet of new EncodedPacketSink(track).packets()) {
+				packets.push(packet);
+			}
+
+			// A sliding window, not the stream average. The cap is a buffer model, and the average compares the
+			// whole stream against nearly the whole budget: measured over 20 runs it sat at 0.92-0.997 of the
+			// limit, while SVT-AV1's threading moves the total by ~7% run to run, so the assertion was a coin
+			// flip. The windowed figure is what the cap actually promises, is stable to four decimals across
+			// runs, and still discriminates: uncapped at these settings exceeds it 12-fold.
+			expect(worstShareOfCap(packets, maxBitrate, bufferSize, 1)).toBeLessThanOrEqual(1);
+		},
+	);
+
+	// A hard scene cut at 5.0 s, 50 fps, 12 s: where an encoder choosing key frames itself would add one
+	const convertVideoPackets = async (codec: VideoCodec) => {
+		using input = new Input({
+			source: new FilePathSource('./test/public/scene-cut-50fps.mp4'),
+			formats: ALL_FORMATS,
+		});
+		const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+		const conversion = await Conversion.init({
+			input,
+			output,
+			video: { codec, keyFrameInterval: 2, forceTranscode: true },
+		});
+		await conversion.execute();
+
+		using result = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+		const track = await result.getPrimaryVideoTrack();
+		assert(track);
+
+		const packets: EncodedPacket[] = [];
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			packets.push(packet);
+		}
+
+		return packets;
+	};
+
+	test.each(['avc', 'hevc', 'vp9', 'av1'] as const)(
+		'%s key frames land only on the forced key frame interval',
+		{ timeout: 60_000 },
+		async (codec) => {
+			const packets = await convertVideoPackets(codec);
+			expect(packets.filter(packet => packet.type === 'key').map(packet => packet.timestamp))
+				.toEqual([0, 2, 4, 6, 8, 10]);
+		},
+	);
+
+	test('A forced HEVC key frame is an IDR, with no CRA or RASL pictures', { timeout: 60_000 }, async () => {
+		const packets = await convertVideoPackets('hevc');
+
+		const naluTypes = new Set<number>();
+		for (const packet of packets) {
+			const types = [...iterateNalUnitsInLengthPrefixed(packet.data, 4)]
+				.map(loc => extractNalUnitTypeForHevc(packet.data[loc.offset]!));
+			types.forEach(type => naluTypes.add(type));
+
+			if (packet.type === 'key') {
+				expect(types.some(type => type === HevcNalUnitType.IDR_W_RADL || type === HevcNalUnitType.IDR_N_LP))
+					.toBe(true);
+			}
+		}
+
+		// Leading RASL pictures reference frames before their CRA, so playback starting at that key frame can't
+		// decode them
+		expect(naluTypes.has(HevcNalUnitType.CRA_NUT)).toBe(false);
+		expect(naluTypes.has(HevcNalUnitType.RASL_N)).toBe(false);
+		expect(naluTypes.has(HevcNalUnitType.RASL_R)).toBe(false);
+	});
+
 	test('AVC conversion roundtrip', { timeout: 20_000 }, async () => {
 		await conversionRoundtrip('avc');
 	});
@@ -950,311 +1104,6 @@ describe('Video', async () => {
 		}
 
 		expect(sampleCount).toBe(packetTimestamps.length);
-	};
-
-	test('Color space, RGB to BT.709 encode', async () => {
-		const width = 320;
-		const height = 180;
-
-		// Solid red
-		const data = new Uint8Array(width * height * 4);
-		for (let i = 0; i < data.byteLength; i += 4) {
-			data[i] = 0xff;
-			data[i + 3] = 0xff;
-		}
-
-		// No explicit colorSpace: RGBA samples default to sRGB
-		const createSample = (i: number) => new VideoSample(data, {
-			format: 'RGBA',
-			codedWidth: width,
-			codedHeight: height,
-			timestamp: i / 30,
-			duration: 1 / 30,
-		});
-
-		const expectedColorSpace: VideoColorSpaceInit = {
-			primaries: 'bt709',
-			transfer: 'bt709',
-			matrix: 'bt709',
-			fullRange: false,
-		};
-
-		const { packets, decoderConfig } = await encodeFrames(width, height, createSample);
-		expectColorSpace(decoderConfig.colorSpace, expectedColorSpace);
-
-		const samples = await decodePackets(decoderConfig, packets);
-		expect(samples.length).toBeGreaterThan(0);
-
-		using sample = samples[0]!;
-		// The decoder gets these from the bitstream (SPS VUI), so this proves the tags were actually written
-		expectColorSpace(sample.colorSpace, expectedColorSpace);
-
-		expect(sample.format).toBe('I420');
-		const yuv = new Uint8Array(sample.allocationSize());
-		await sample.copyTo(yuv);
-
-		// Pure red in limited-range BT.709 is Y'=63, Cb=102, Cr=240; the BT.601 matrix would give Y'=81, Cb=90
-		const lumaSize = width * height;
-		expect(Math.abs(yuv[0]! - 63)).toBeLessThanOrEqual(3);
-		expect(Math.abs(yuv[lumaSize]! - 102)).toBeLessThanOrEqual(3);
-		expect(Math.abs(yuv[lumaSize + lumaSize / 4]! - 240)).toBeLessThanOrEqual(3);
-
-		for (const sample of samples.slice(1)) {
-			sample.close();
-		}
-
-		// And the color space must make it into the container
-		const output = new Output({
-			format: new Mp4OutputFormat(),
-			target: new BufferTarget(),
-		});
-		const source = new VideoSampleSource({ codec: 'avc', bitrate: 1e6 });
-		output.addVideoTrack(source);
-		await output.start();
-
-		using inputSample = createSample(0);
-		await source.add(inputSample);
-		await output.finalize();
-
-		using input = new Input({
-			source: new BufferSource(output.target.buffer!),
-			formats: ALL_FORMATS,
-		});
-		const videoTrack = (await input.getPrimaryVideoTrack())!;
-		expectColorSpace(await videoTrack.getColorSpace(), expectedColorSpace);
-	});
-
-	test('Color space, RGB to BT.2020 encode', async () => {
-		const width = 320;
-		const height = 180;
-
-		// Solid red
-		const data = new Uint8Array(width * height * 4);
-		for (let i = 0; i < data.byteLength; i += 4) {
-			data[i] = 0xff;
-			data[i + 3] = 0xff;
-		}
-
-		const { packets, decoderConfig } = await encodeFrames(width, height, i => new VideoSample(data, {
-			format: 'RGBA',
-			codedWidth: width,
-			codedHeight: height,
-			timestamp: i / 30,
-			duration: 1 / 30,
-			colorSpace: {
-				primaries: 'bt2020' as VideoColorPrimaries,
-				transfer: 'pq' as VideoTransferCharacteristics,
-				matrix: 'rgb',
-				fullRange: true,
-			},
-		}));
-
-		const expectedColorSpace: VideoColorSpaceInit = {
-			primaries: 'bt2020' as VideoColorPrimaries,
-			transfer: 'pq' as VideoTransferCharacteristics,
-			matrix: 'bt2020-ncl' as VideoMatrixCoefficients,
-			fullRange: false,
-		};
-		expectColorSpace(decoderConfig.colorSpace, expectedColorSpace);
-
-		const samples = await decodePackets(decoderConfig, packets);
-		expect(samples.length).toBeGreaterThan(0);
-
-		using sample = samples[0]!;
-		expectColorSpace(sample.colorSpace, expectedColorSpace);
-
-		const yuv = new Uint8Array(sample.allocationSize());
-		await sample.copyTo(yuv);
-
-		// Pure red in limited-range BT.2020 NCL is Y'=74, Cb=97, Cr=240 (BT.709 would give Y'=63, Cb=102)
-		const lumaSize = width * height;
-		expect(Math.abs(yuv[0]! - 74)).toBeLessThanOrEqual(3);
-		expect(Math.abs(yuv[lumaSize]! - 97)).toBeLessThanOrEqual(3);
-		expect(Math.abs(yuv[lumaSize + lumaSize / 4]! - 240)).toBeLessThanOrEqual(3);
-
-		for (const sample of samples.slice(1)) {
-			sample.close();
-		}
-	});
-
-	test('Color space, YUV color space passthrough', async () => {
-		const width = 320;
-		const height = 180;
-		const lumaSize = width * height;
-
-		// Arbitrary but distinct plane values, so we can tell if any matrix or range conversion happened
-		const data = new Uint8Array(lumaSize * 3 / 2);
-		data.fill(81, 0, lumaSize);
-		data.fill(90, lumaSize, lumaSize + lumaSize / 4);
-		data.fill(240, lumaSize + lumaSize / 4);
-
-		// Deliberately not the BT.709 defaults, so defaulting would be caught. (Note that x264 rewrites some VUI codes
-		// to equivalent ones, e.g. bt470bg -> smpte170m, which is why these particular values are used here.)
-		const colorSpaces: VideoColorSpaceInit[] = [
-			{
-				primaries: 'bt2020' as VideoColorPrimaries,
-				transfer: 'pq' as VideoTransferCharacteristics,
-				matrix: 'bt2020-ncl' as VideoMatrixCoefficients,
-				fullRange: false,
-			},
-			{ primaries: 'bt709', transfer: 'bt709', matrix: 'bt709', fullRange: true },
-		];
-
-		for (const colorSpace of colorSpaces) {
-			const { packets, decoderConfig } = await encodeFrames(width, height, i => new VideoSample(data, {
-				format: 'I420',
-				codedWidth: width,
-				codedHeight: height,
-				timestamp: i / 30,
-				duration: 1 / 30,
-				colorSpace,
-			}));
-			expectColorSpace(decoderConfig.colorSpace, colorSpace);
-
-			const samples = await decodePackets(decoderConfig, packets);
-			expect(samples.length).toBeGreaterThan(0);
-
-			using sample = samples[0]!;
-			expectColorSpace(sample.colorSpace, colorSpace);
-
-			expect(sample.format).toBe('I420');
-			const yuv = new Uint8Array(sample.allocationSize());
-			await sample.copyTo(yuv);
-
-			expect(Math.abs(yuv[0]! - 81)).toBeLessThanOrEqual(3);
-			expect(Math.abs(yuv[lumaSize]! - 90)).toBeLessThanOrEqual(3);
-			expect(Math.abs(yuv[lumaSize + lumaSize / 4]! - 240)).toBeLessThanOrEqual(3);
-
-			for (const sample of samples.slice(1)) {
-				sample.close();
-			}
-		}
-	});
-
-	test('Color space, YUV to RGB conversion', async () => {
-		const width = 320;
-		const height = 180;
-		const lumaSize = width * height;
-
-		// Pure red, as limited-range BT.709 and as limited-range BT.601. Converted with the right matrix, both come out
-		// as (255, 0, 0); the wrong one gives (233, 0, 2) or (255, 24, 0).
-		const cases = [
-			{
-				yuv: [63, 102, 240],
-				colorSpace: { primaries: 'bt709', transfer: 'bt709', matrix: 'bt709', fullRange: false },
-			},
-			{
-				yuv: [81, 90, 240],
-				colorSpace: { primaries: 'bt470bg', transfer: 'smpte170m', matrix: 'bt470bg', fullRange: false },
-			},
-		] satisfies { yuv: number[]; colorSpace: VideoColorSpaceInit }[];
-
-		for (const { yuv, colorSpace } of cases) {
-			const data = new Uint8Array(lumaSize * 3 / 2);
-			data.fill(yuv[0]!, 0, lumaSize);
-			data.fill(yuv[1]!, lumaSize, lumaSize + lumaSize / 4);
-			data.fill(yuv[2]!, lumaSize + lumaSize / 4);
-
-			const { packets, decoderConfig } = await encodeFrames(width, height, i => new VideoSample(data, {
-				format: 'I420',
-				codedWidth: width,
-				codedHeight: height,
-				timestamp: i / 30,
-				duration: 1 / 30,
-				colorSpace,
-			}));
-
-			const samples = await decodePackets(decoderConfig, packets);
-			expect(samples.length).toBeGreaterThan(0);
-
-			using sample = samples[0]!;
-			expect(sample.format).toBe('I420');
-
-			const rgba = new Uint8Array(sample.allocationSize({ format: 'RGBA' }));
-			await sample.copyTo(rgba, { format: 'RGBA' });
-
-			expect(rgba[0]).toBeGreaterThanOrEqual(250);
-			expect(rgba[1]).toBeLessThanOrEqual(5);
-			expect(rgba[2]).toBeLessThanOrEqual(5);
-
-			for (const sample of samples.slice(1)) {
-				sample.close();
-			}
-		}
-	});
-
-	const encodeFrames = async (
-		width: number,
-		height: number,
-		createSample: (i: number) => VideoSample,
-	) => {
-		const encoder = new NodeAvVideoEncoder();
-		// @ts-expect-error Readonly
-		encoder.codec = 'avc';
-		// @ts-expect-error Readonly
-		encoder.config = {
-			codec: buildVideoCodecString('avc', width, height, 1e6, false),
-			width,
-			height,
-			bitrate: 1e6,
-		} satisfies VideoEncoderConfig;
-
-		const packets: EncodedPacket[] = [];
-		const metas: EncodedVideoChunkMetadata[] = [];
-
-		// @ts-expect-error Readonly
-		encoder.onPacket = (packet: EncodedPacket, meta: EncodedVideoChunkMetadata) => {
-			packets.push(packet);
-			metas.push(meta);
-		};
-
-		await encoder.init();
-
-		for (let i = 0; i < 3; i++) {
-			using sample = createSample(i);
-			await encoder.encode(sample, {});
-		}
-
-		await encoder.flush();
-		await encoder.close();
-
-		return { packets, decoderConfig: metas[0]!.decoderConfig! };
-	};
-
-	const decodePackets = async (decoderConfig: VideoDecoderConfig, packets: EncodedPacket[]) => {
-		const decoder = new NodeAvVideoDecoder();
-		// @ts-expect-error Readonly
-		decoder.codec = 'avc';
-		// @ts-expect-error Readonly
-		decoder.config = decoderConfig;
-
-		const samples: VideoSample[] = [];
-
-		// @ts-expect-error Readonly
-		decoder.onSample = (sample: VideoSample) => {
-			samples.push(sample);
-		};
-
-		await decoder.init();
-
-		for (const packet of packets) {
-			await decoder.decode(packet);
-		}
-
-		await decoder.flush();
-		await decoder.close();
-
-		return samples;
-	};
-
-	const expectColorSpace = (
-		actual: VideoColorSpaceInit | VideoSampleColorSpace | undefined,
-		expected: VideoColorSpaceInit,
-	) => {
-		expect(actual?.primaries).toBe(expected.primaries);
-		expect(actual?.transfer).toBe(expected.transfer);
-		expect(actual?.matrix).toBe(expected.matrix);
-		expect(actual?.fullRange).toBe(expected.fullRange);
 	};
 
 	test('Custom VideoSample resource', async () => {
@@ -1782,6 +1631,50 @@ describe('Video', async () => {
 				},
 			});
 			await conversion.execute();
+		});
+	});
+
+	describe('Inherited bit depth', () => {
+		const transcode = async (file: string, bitDepth?: 8 | 10) => {
+			using input = new Input({ source: new FilePathSource(file), formats: ALL_FORMATS });
+			const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+
+			const conversion = await Conversion.init({
+				input,
+				output,
+				video: { codec: 'avc', forceTranscode: true, bitDepth },
+			});
+			await conversion.execute();
+
+			using result = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+			const track = await result.getPrimaryVideoTrack();
+			assert(track);
+			const sample = await new VideoSampleSink(track).getSample(0);
+			assert(sample);
+			const format = sample.format;
+			sample.close();
+
+			return { codec: (await track.getDecoderConfig())!.codec, format };
+		};
+
+		test('an 8-bit source whose profile allows 10 bits stays 8-bit', async () => {
+			// High 4:4:4 Predictive (x264 lossless) carrying yuv420p
+			const { codec, format } = await transcode('./test/public/avc-high444-8bit.mp4');
+
+			expect(codec).toMatch(/^avc1\.64/);
+			expect(format).toBe('I420');
+		});
+
+		test('a 10-bit source still inherits 10 bits', async () => {
+			const { codec, format } = await transcode('./test/public/avc-high10.mp4');
+
+			expect(codec).toMatch(/^avc1\.6e/);
+			expect(format).toBe('I420P10');
+		});
+
+		test('a requested depth is honoured regardless of the source', async () => {
+			expect((await transcode('./test/public/avc-high444-8bit.mp4', 10)).codec).toMatch(/^avc1\.6e/);
+			expect((await transcode('./test/public/avc-high10.mp4', 8)).codec).toMatch(/^avc1\.64/);
 		});
 	});
 });

@@ -189,7 +189,9 @@ test('MP4: stsc with alternating chunk indices', async () => {
 	})]));
 });
 
-test('MP4: Single chunk with many samples', async () => {
+// Timeout, not the default 5s: quadratic here is minutes, so the bound only has to be far below that
+// while staying above what a loaded machine needs for 100k samples (~0.6s idle).
+test('MP4: Single chunk with many samples', { timeout: 30_000 }, async () => {
 	// Computing a sample's offset in its chunk used to be linear, making iteration quadratic
 	const sampleCount = 100_000;
 	const header = mp4([trak({ handler: 'vide', stbl: singleChunkStbl(sampleCount, 0) })]);
@@ -1244,14 +1246,18 @@ test('MPEG-TS: Many streams and one that never shows up', async () => {
 		}
 	}
 
+	const file = mpegTs(streams, [], {}, concatList(packets));
 	using input = new Input({
-		source: new BufferSource(mpegTs(streams, [], {}, concatList(packets))),
+		source: new BufferSource(file),
 		formats: ALL_FORMATS,
 	});
-	const start = performance.now();
+	// Bytes read, not elapsed time: the regression was re-scanning the stream, which shows up as
+	// multiples of the file, and a clock bound fails under load instead.
+	let readBytes = 0;
+	input.source.on('read', ({ start: a, end: b }) => readBytes += b - a);
 	await input.getTracks();
 
-	expect(performance.now() - start).toBeLessThan(1500);
+	expect(readBytes).toBeLessThan(3 * file.byteLength);
 });
 
 test('MPEG-TS: PES packets without data', async () => {
@@ -1531,6 +1537,8 @@ test('Ogg: Seeking across a region full of fake page headers', async () => {
 		await sink.getPacket(timestamp);
 	}
 
+	// Still a clock bound: these seeks read nothing from the source, so there is no work to count.
+	// Runs in ~40ms, so the margin absorbs load.
 	expect(performance.now() - start).toBeLessThan(1000);
 });
 

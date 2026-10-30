@@ -81,6 +81,7 @@ export class NodeAvVideoDecoder extends CustomVideoDecoder {
 			? Buffer.from(toUint8Array(this.config.description))
 			: null;
 		codecContext.sampleAspectRatio = new NodeAv.Rational(this.pixelAspectRatio.num, this.pixelAspectRatio.den);
+		codecContext.threadCount = 0; // libavcodec defaults this to 1, unlike the ffmpeg CLI
 
 		// Honor inferred H.264 reorder buffering even when bitstream restrictions aren't explicitly signaled
 		// See https://github.com/Vanilagy/mediabunny/issues/488

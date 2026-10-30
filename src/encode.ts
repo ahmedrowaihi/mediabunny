@@ -18,11 +18,28 @@ import {
 	PCM_AUDIO_CODECS,
 	SUBTITLE_CODECS,
 	SubtitleCodec,
+	validateBitDepthCarriesTransfer,
+	validateHdrStaticMetadata,
+	validateTransferCarriesHdrStaticMetadata,
+	validateVideoColorSpaceInit,
+	VIDEO_BIT_DEPTHS,
 	VIDEO_CODECS,
+	VideoBitDepth,
 	VideoCodec,
 } from './codec';
 import { customAudioEncoders, customVideoEncoders } from './custom-coder';
-import { assert, clamp, getChromiumVersion, isFirefox, lerp, MaybePromise, Rotation } from './misc';
+import { type HdrStaticMetadata } from './hdr-metadata';
+import {
+	assert,
+	clamp,
+	getChromiumVersion,
+	isFirefox,
+	isNumber,
+	isRecordStringString,
+	lerp,
+	MaybePromise,
+	Rotation,
+} from './misc';
 import { EncodedPacket } from './packet';
 import { AudioSample, CropRectangle, validateCropRectangle, VideoSample, VideoSampleResource } from './sample';
 
@@ -78,7 +95,122 @@ export type VideoEncodingConfig = {
 	onEncoderConfig?: (config: VideoEncoderConfig) => unknown;
 	/** Called right before a sample is passed to the encoder. */
 	onEncodedSample?: (sample: VideoSample) => unknown;
+
+	// A config alone cannot say whether these were demanded or inherited, and only what was inherited may
+	// be dropped where the samples reaching the encoder do not back it
+	/** @internal */
+	_bitDepthIsInherited?: boolean;
+	/** @internal */
+	_colorSpaceIsInherited?: boolean;
+	/** @internal */
+	_hdrStaticMetadataIsInherited?: boolean;
 } & VideoEncodingAdditionalOptions;
+
+/**
+ * A caller's function run over the video frames on their way to the encoder. It returns a
+ * {@link VideoSample}, a {@link VideoSampleResource} or a `CanvasImageSource`, an array of them for a frame
+ * that becomes several, or `null` to drop the frame. Non-timestamped data takes the input frame's timestamp
+ * and duration.
+ *
+ * @group Encoding
+ * @public
+ */
+export type VideoSampleProcessor = (sample: VideoSample) => MaybePromise<
+	CanvasImageSource | VideoSample | VideoSampleResource
+	| (CanvasImageSource | VideoSample | VideoSampleResource)[] | null
+>;
+
+/**
+ * A caller's function that hands back the video samples a stateful {@link VideoSampleProcessor} is still
+ * holding. It is called once, after the track's last sample has passed through that hook, so a filter whose
+ * output lags its input - a deinterlacer that emits frame N when handed frame N+1 - can emit what it held
+ * and tear its graph down. The samples are encoded in the order returned, and closed afterwards. Each must
+ * carry its own timestamp, since there is no input frame to take one from.
+ *
+ * @group Encoding
+ * @public
+ */
+export type VideoSampleFlusher = () => MaybePromise<VideoSample[]>;
+
+/**
+ * Encoder-level controls, as distinct from the stream properties the rest of {@link VideoEncodingConfig}
+ * states. Each is honoured only by the encoders that have it; a control the selected encoder cannot deliver
+ * is an error, because silently encoding without it produces a stream that is not what was asked for.
+ *
+ * @group Encoding
+ * @public
+ */
+export type VideoEncoderControls = {
+	/**
+	 * The codec profile to encode, named as the encoder names it: `'high'`, `'main'`, `'main10'`, `'baseline'`
+	 * for AVC and HEVC, `'main'` for AV1. A profile named by the codec string (`avc1.640028`) is honoured
+	 * without stating this; use it to state one the codec string does not carry.
+	 */
+	profile?: string;
+	/**
+	 * The codec level to encode, as its decimal form: `4.1`, `5.1`. Like `profile`, a level the codec string
+	 * names is honoured without stating this. A level the picture exceeds is the encoder's to refuse.
+	 */
+	level?: number;
+	/**
+	 * The speed/efficiency preset, as the encoder names it: `'ultrafast'`…`'veryslow'` for x264 and x265, a
+	 * number as a string for SVT-AV1. Left unset, a realtime config uses the fastest preset and everything
+	 * else uses the encoder's own default.
+	 */
+	preset?: string;
+	/** The encoder's tuning, as it names it: `'film'`, `'animation'`, `'grain'`, `'zerolatency'`. */
+	tune?: string;
+	/**
+	 * The maximum number of consecutive B-frames, `0` for none. B-frames reorder the decode timeline, so a
+	 * stream that must decode in presentation order wants `0`.
+	 */
+	maxBFrames?: number;
+	/**
+	 * Whether each GOP is closed, meaning no frame references one in another GOP. The default is closed for
+	 * HEVC, where a forced key frame would otherwise be written as a CRA whose leading pictures cannot be
+	 * decoded when playback starts there. Opening the GOP costs that property for a little efficiency.
+	 */
+	closedGop?: boolean;
+	/**
+	 * Enables scene-cut detection at the given threshold, as x264 and x265 count it (1 to 100, where a lower
+	 * number cuts more readily), or `false` - the default - to leave it off. With it off the output is exactly
+	 * as before.
+	 *
+	 * A detected cut becomes an **intra frame that is not a sync sample**, so the pictures either side of it
+	 * stop being predicted across; the sync samples stay only where `keyFrameInterval` forces them, which is
+	 * what keeps the rungs of a ladder aligned and keeps a segment from starting at a cut. Measured: without
+	 * the internal pin this control applies, x264 and x265 promote a cut past their own minimum interval to a
+	 * full IDR, which would do exactly that.
+	 *
+	 * SVT-AV1 takes its own scene-change detection here, which was measured to leave the forced key frames
+	 * alone; whether it codes the frame at the cut as intra was not verified. Hardware encoders refuse it.
+	 */
+	sceneCut?: number | false;
+	/**
+	 * Two-pass encoding. The first pass measures the video and writes its statistics to `statsPath`; the
+	 * second reads them back and spends the bitrate where the first pass found it was needed. The caller runs
+	 * two encodes, feeding the same samples through each, and keeps `statsPath` between them.
+	 *
+	 * Only bitrate-based rate control has anything to gain: a constant quantizer already spends what each
+	 * frame needs, so there is nothing for a first pass to measure.
+	 */
+	pass?: {
+		/** Which of the two passes this encode is. */
+		index: 1 | 2;
+		/** Where the first pass writes its statistics and the second reads them; the caller's file to keep. */
+		statsPath: string;
+	};
+	/**
+	 * Options passed straight to the codec context, by the name FFmpeg gives them. The escape hatch for
+	 * anything the fields above do not cover.
+	 *
+	 * For x264 and x265 these merge into `x264-params`/`x265-params` alongside the parameters this library
+	 * sets for key frame alignment, and a key that would overwrite one of those is refused rather than
+	 * silently dropping it. Note that an option FFmpeg does not recognise is ignored by FFmpeg itself, so a
+	 * misspelled name leaves the default in place without reporting anything.
+	 */
+	options?: Record<string, string>;
+};
 
 /**
  * Options for transforming video frames before encoding.
@@ -132,18 +264,37 @@ export type VideoTransformOptions = {
 	 */
 	frameRate?: number;
 	/**
+	 * Like {@link VideoTransformOptions.process}, but called for each video frame *before* any
+	 * transformation, frame rate correction or size check, on the frame as it was handed over. Use it for work
+	 * that must see the original frame: deinterlacing belongs here, since a resize applied first would
+	 * interpolate across the two interleaved fields.
+	 *
+	 * Returns what {@link VideoSampleProcessor} describes, and what it returns is what the size check and the
+	 * transformation then see.
+	 */
+	preProcess?: VideoSampleProcessor;
+	/**
 	 * Allows for custom user-defined processing of video frames, e.g. for applying overlays, color transformations,
 	 * or timestamp modifications. Will be called for each video frame after transformations and frame rate
 	 * corrections.
 	 *
-	 * Must return a {@link VideoSample}, a {@link VideoSampleResource} or a `CanvasImageSource`, an array of them, or
-	 * `null` for dropping the frame. When non-timestamped data is returned, the timestamp and duration from the input
-	 * sample will be used.
+	 * Returns what {@link VideoSampleProcessor} describes.
 	 */
-	process?: (sample: VideoSample) => MaybePromise<
-		CanvasImageSource | VideoSample | VideoSampleResource
-		| (CanvasImageSource | VideoSample | VideoSampleResource)[] | null
-	>;
+	process?: VideoSampleProcessor;
+	/**
+	 * Drains {@link VideoTransformOptions.preProcess}, if it holds frames back. What it returns goes through
+	 * the size check, the transformation and the frame rate correction as the hook's own output does.
+	 *
+	 * Returns what {@link VideoSampleFlusher} describes.
+	 */
+	preProcessFlush?: VideoSampleFlusher;
+	/**
+	 * Drains {@link VideoTransformOptions.process}, if it holds frames back. What it returns goes straight to
+	 * the encoder, after the last frame rate padding frame.
+	 *
+	 * Returns what {@link VideoSampleFlusher} describes.
+	 */
+	processFlush?: VideoSampleFlusher;
 	/**
 	 * Forces every video frame through the transformation step even if no transformation properties are defined.
 	 * This can be used, for example, to bake rotation and flip into the encoded video frames.
@@ -186,6 +337,53 @@ export const validateVideoEncodingConfig = (config: VideoEncodingConfig) => {
 			'config.sizeChangeBehavior, when provided, must be \'deny\', \'passThrough\', \'fill\', \'contain\''
 			+ ' or \'cover\'.',
 		);
+	}
+	if (config.encoderControls !== undefined) {
+		const controls = config.encoderControls;
+		if (typeof controls !== 'object' || !controls) {
+			throw new TypeError('config.encoderControls, when provided, must be an object.');
+		}
+		for (const field of ['profile', 'preset', 'tune'] as const) {
+			if (controls[field] !== undefined && typeof controls[field] !== 'string') {
+				throw new TypeError(`config.encoderControls.${field}, when provided, must be a string.`);
+			}
+		}
+		if (controls.level !== undefined && (!isNumber(controls.level) || controls.level <= 0)) {
+			throw new TypeError('config.encoderControls.level, when provided, must be a positive number.');
+		}
+		if (
+			controls.maxBFrames !== undefined
+			&& (!Number.isInteger(controls.maxBFrames) || controls.maxBFrames < 0)
+		) {
+			throw new TypeError(
+				'config.encoderControls.maxBFrames, when provided, must be a non-negative integer.',
+			);
+		}
+		if (controls.closedGop !== undefined && typeof controls.closedGop !== 'boolean') {
+			throw new TypeError('config.encoderControls.closedGop, when provided, must be a boolean.');
+		}
+		if (
+			controls.sceneCut !== undefined && controls.sceneCut !== false
+			&& (!Number.isInteger(controls.sceneCut) || controls.sceneCut < 1 || controls.sceneCut > 100)
+		) {
+			throw new TypeError(
+				'config.encoderControls.sceneCut, when provided, must be false or an integer from 1 to 100.',
+			);
+		}
+		if (controls.pass !== undefined) {
+			if (typeof controls.pass !== 'object' || !controls.pass) {
+				throw new TypeError('config.encoderControls.pass, when provided, must be an object.');
+			}
+			if (controls.pass.index !== 1 && controls.pass.index !== 2) {
+				throw new TypeError('config.encoderControls.pass.index must be 1 or 2.');
+			}
+			if (typeof controls.pass.statsPath !== 'string' || controls.pass.statsPath.length === 0) {
+				throw new TypeError('config.encoderControls.pass.statsPath must be a non-empty string.');
+			}
+		}
+		if (controls.options !== undefined && !isRecordStringString(controls.options)) {
+			throw new TypeError('config.encoderControls.options, when provided, must be an object of strings.');
+		}
 	}
 	if (config.transform !== undefined) {
 		if (typeof config.transform !== 'object' || !config.transform) {
@@ -240,6 +438,12 @@ export const validateVideoEncodingConfig = (config: VideoEncodingConfig) => {
 		if (config.transform.process !== undefined && typeof config.transform.process !== 'function') {
 			throw new TypeError('config.transform.process, when provided, must be a function.');
 		}
+		if (config.transform.preProcessFlush !== undefined && typeof config.transform.preProcessFlush !== 'function') {
+			throw new TypeError('config.transform.preProcessFlush, when provided, must be a function.');
+		}
+		if (config.transform.processFlush !== undefined && typeof config.transform.processFlush !== 'function') {
+			throw new TypeError('config.transform.processFlush, when provided, must be a function.');
+		}
 		if (
 			config.transform.frameRate !== undefined
 			&& (!Number.isFinite(config.transform.frameRate) || config.transform.frameRate <= 0)
@@ -270,6 +474,11 @@ export const validateVideoEncodingConfig = (config: VideoEncodingConfig) => {
  */
 export type VideoEncodingAdditionalOptions = {
 	/**
+	 * Encoder-level controls for the encoders in `@mediabunny/server`. WebCodecs exposes none of them, so a
+	 * selected encoder that cannot honour a stated control refuses the config instead of dropping it.
+	 */
+	encoderControls?: VideoEncoderControls;
+	/**
 	 * What to do with alpha data contained in the video samples.
 	 *
 	 * - `'discard'` (default): Only the samples' color data is kept; the video is opaque.
@@ -293,6 +502,41 @@ export type VideoEncodingAdditionalOptions = {
 	 */
 	latencyMode?: 'quality' | 'realtime';
 	/**
+	 * Where the AVC or HEVC parameter sets (SPS/PPS, plus VPS) are carried. Ignored by all other codecs.
+	 *
+	 * - `'outOfBand'` (default): They are kept solely in the sample entry, signalled as `avc1`/`hvc1`.
+	 * - `'inBand'`: They are also repeated throughout the bitstream, signalled as `avc3`/`hev1`, which lets a
+	 * player join mid-stream without the sample entry.
+	 */
+	parameterSets?: 'inBand' | 'outOfBand';
+	/**
+	 * The bit depth per color component to encode at, which selects the codec profile (for example AVC High 10 or
+	 * HEVC Main 10 instead of their 8-bit counterparts). Defaults to each codec's 8-bit profile. ProRes rejects this
+	 * field, as its bit depth follows from the profile picked by `alpha` and the bitrate.
+	 *
+	 * WebCodecs support for depths above 8 varies by browser and build; when the environment cannot encode the
+	 * requested profile, encoding fails with an unsupported-configuration error instead of falling back to 8 bits.
+	 */
+	bitDepth?: VideoBitDepth;
+	/**
+	 * The color space of the samples handed to the encoder. When set, it is written to the output track's decoder
+	 * configuration, and therefore to the container's color signalling. Defaults to whatever the encoder reports.
+	 *
+	 * The first sample reaching the encoder is checked against this field and a contradiction is rejected, so that
+	 * the output cannot claim a color space its samples don't have.
+	 */
+	colorSpace?: VideoColorSpaceInit;
+	/**
+	 * The HDR10 static metadata (mastering display colour volume and content light level) to signal on the output
+	 * track, written to the container next to the color signalling. It describes how the content was graded, not how
+	 * it was encoded, so it survives a re-encode of the same grade.
+	 *
+	 * It may only be set alongside a `colorSpace` whose transfer function is PQ or HLG, since that is the signal it
+	 * describes. It is dropped from the output wherever that transfer function is dropped, such as when the output
+	 * is encoded at a bit depth too shallow to carry it.
+	 */
+	hdrStaticMetadata?: HdrStaticMetadata;
+	/**
 	 * The full codec string as specified in the Mediabunny Codec Registry. This string must match the codec
 	 * specified in `codec`. When not set, a fitting codec string will be constructed automatically by the library.
 	 */
@@ -314,7 +558,13 @@ export type VideoEncodingAdditionalOptions = {
 	contentHint?: string;
 };
 
-export const validateVideoEncodingAdditionalOptions = (codec: VideoCodec, options: VideoEncodingAdditionalOptions) => {
+export const validateVideoEncodingAdditionalOptions = (
+	codec: VideoCodec,
+	options: VideoEncodingAdditionalOptions & {
+		_colorSpaceIsInherited?: boolean;
+		_hdrStaticMetadataIsInherited?: boolean;
+	},
+) => {
 	if (!options || typeof options !== 'object') {
 		throw new TypeError('Encoding options must be an object.');
 	}
@@ -329,8 +579,33 @@ export const validateVideoEncodingAdditionalOptions = (codec: VideoCodec, option
 	if (options.latencyMode !== undefined && !['quality', 'realtime'].includes(options.latencyMode)) {
 		throw new TypeError('latencyMode, when provided, must be \'quality\' or \'realtime\'.');
 	}
+	if (options.parameterSets !== undefined && !['inBand', 'outOfBand'].includes(options.parameterSets)) {
+		throw new TypeError('parameterSets, when provided, must be \'inBand\' or \'outOfBand\'.');
+	}
+	if (options.bitDepth !== undefined && !(VIDEO_BIT_DEPTHS as readonly number[]).includes(options.bitDepth)) {
+		throw new TypeError(`bitDepth, when provided, must be one of ${VIDEO_BIT_DEPTHS.join(', ')}.`);
+	}
+	if (options.colorSpace !== undefined) {
+		validateVideoColorSpaceInit(options.colorSpace, 'colorSpace');
+	}
+	if (options.hdrStaticMetadata !== undefined) {
+		validateHdrStaticMetadata(options.hdrStaticMetadata, 'hdrStaticMetadata');
+	}
+	// An inherited color is not a claim the caller made, so a depth that cannot carry it drops the transfer
+	// at encode time rather than failing here.
+	if (!options._colorSpaceIsInherited) {
+		validateBitDepthCarriesTransfer(options.bitDepth, options.colorSpace, '');
+	}
+	if (!options._hdrStaticMetadataIsInherited) {
+		validateTransferCarriesHdrStaticMetadata(options.hdrStaticMetadata, options.colorSpace, '');
+	}
 	if (options.fullCodecString !== undefined && typeof options.fullCodecString !== 'string') {
 		throw new TypeError('fullCodecString, when provided, must be a string.');
+	}
+	if (options.fullCodecString !== undefined && options.bitDepth !== undefined) {
+		throw new TypeError(
+			'fullCodecString and bitDepth cannot both be provided, as the codec string already states the profile.',
+		);
 	}
 	if (options.fullCodecString !== undefined && inferCodecFromCodecString(options.fullCodecString) !== codec) {
 		throw new TypeError(
@@ -363,6 +638,19 @@ export type VideoRateControl = {
 	quantizer: number | null;
 	bitrate: number;
 	bitrateMode: 'constant' | 'variable' | 'quantizer';
+	cap: { maxBitrate: number; bufferSize: number } | null;
+};
+
+// WebCodecs configs can't carry a cap, so custom encoders receive it in these fields
+export type QualityCappedVideoEncoderConfig = VideoEncoderConfig & {
+	_maxBitrate?: number;
+	_bufferSize?: number;
+	_encoderControls?: VideoEncoderControls;
+	/**
+	 * Whether `codec` is a string this library derived rather than one the caller stated. A derived string's
+	 * profile and level are a guess from the size and bit depth, so they are a label and not a request.
+	 */
+	_codecStringIsDerived?: boolean;
 };
 
 /**
@@ -392,14 +680,16 @@ export const buildVideoEncoderConfigs = (options: {
 		bitrate: number | undefined,
 		bitrateMode: 'constant' | 'variable' | 'quantizer',
 		bitrateEstimate: number,
-	): VideoEncoderConfig => ({
+	): QualityCappedVideoEncoderConfig => ({
 		codec: options.fullCodecString ?? buildVideoCodecString(
 			options.codec,
 			options.width,
 			options.height,
 			bitrateEstimate,
 			options.alpha === 'keep',
+			options.bitDepth,
 		),
+		_codecStringIsDerived: options.fullCodecString === undefined,
 		width: options.width,
 		height: options.height,
 		displayWidth: options.squarePixelWidth,
@@ -412,16 +702,19 @@ export const buildVideoEncoderConfigs = (options: {
 		hardwareAcceleration: options.hardwareAcceleration,
 		scalabilityMode: options.scalabilityMode,
 		contentHint: options.contentHint,
-		...getVideoEncoderConfigExtension(options.codec),
+		...getVideoEncoderConfigExtension(options.codec, options.parameterSets === 'inBand'),
+		_encoderControls: options.encoderControls,
 	});
 
 	const candidates: VideoEncoderConfigCandidate[] = [];
 
 	if (rateControl.quantizer !== null) {
-		candidates.push({
-			config: buildConfig(undefined, 'quantizer', rateControl.bitrate),
-			quantizer: rateControl.quantizer,
-		});
+		const config: QualityCappedVideoEncoderConfig = buildConfig(undefined, 'quantizer', rateControl.bitrate);
+		if (rateControl.cap) {
+			config._maxBitrate = rateControl.cap.maxBitrate;
+			config._bufferSize = rateControl.cap.bufferSize;
+		}
+		candidates.push({ config, quantizer: rateControl.quantizer });
 	}
 
 	if (rateControl.bitrateMode !== 'quantizer') {
@@ -686,7 +979,21 @@ export type QuantitativeQualityOptions = {
  * @group Encoding
  * @public
  */
-export type QualityOptions = QualitativeQualityOptions | QuantitativeQualityOptions;
+export type QualityOptions = (QualitativeQualityOptions | QuantitativeQualityOptions) & QualityCapOptions;
+
+/**
+ * Caps quality-driven encoding at a peak bitrate (capped CRF). Needs `quality` or `quantizer` and an encoder that
+ * supports it, such as those of `@mediabunny/server`. Elsewhere, `bitrate` is the fallback; without one, a
+ * qualitative `quality` falls back to bitrate-based encoding at up to `maxBitrate`, and a `quantizer` throws.
+ * @group Encoding
+ * @public
+ */
+export type QualityCapOptions = {
+	/** The peak bitrate in bits per second. */
+	maxBitrate?: number;
+	/** The rate-control (VBV) buffer size in bits; defaults to twice `maxBitrate`. Requires `maxBitrate`. */
+	bufferSize?: number;
+};
 
 /**
  * Represents a desired encoding quality. Can express a qualitative quality level, an explicit bitrate, an explicit
@@ -705,6 +1012,10 @@ export class Quality {
 	_quantizer: number | undefined;
 	/** @internal */
 	_bitrateMode: 'constant' | 'variable' | undefined;
+	/** @internal */
+	_maxBitrate: number | undefined;
+	/** @internal */
+	_bufferSize: number | undefined;
 
 	constructor(options: QualityOptions | number | QualityLevel) {
 		if (typeof options === 'number' || typeof options === 'string') {
@@ -763,6 +1074,69 @@ export class Quality {
 		}
 
 		this._bitrateMode = options.bitrateMode;
+
+		if (options.maxBitrate !== undefined) {
+			if (!Number.isInteger(options.maxBitrate) || options.maxBitrate <= 0) {
+				throw new TypeError('options.maxBitrate, when provided, must be a positive integer.');
+			}
+			if (this._quality === undefined && this._quantizer === undefined) {
+				throw new TypeError('options.maxBitrate requires options.quality or options.quantizer.');
+			}
+		}
+		if (options.bufferSize !== undefined) {
+			if (options.maxBitrate === undefined) {
+				throw new TypeError('options.bufferSize requires options.maxBitrate.');
+			}
+			if (!Number.isInteger(options.bufferSize) || options.bufferSize <= 0) {
+				throw new TypeError('options.bufferSize, when provided, must be a positive integer.');
+			}
+		}
+		this._maxBitrate = options.maxBitrate;
+		this._bufferSize = options.bufferSize;
+	}
+
+	/**
+	 * The qualitative quality level, normalized to a number where 0 is the worst and 1 the best, or `undefined`
+	 * when a bitrate or quantizer was given instead. A level outside 0 to 1 is permitted and is not clamped
+	 * here, only where it is mapped onto a codec's own range.
+	 */
+	get level() {
+		return this._quality;
+	}
+
+	/**
+	 * The bitrate in bits per second, or `undefined` when none was given. Note that a `Quality` may state both
+	 * a bitrate and a quantizer: the quantizer is then what is demanded and the bitrate is the fallback for a
+	 * codec that cannot encode by quantizer, so test this field on its own rather than inferring one from the
+	 * absence of the other.
+	 */
+	get bitrate() {
+		return this._bitrate;
+	}
+
+	/** The quantizer, on the scale the codec uses, or `undefined` when none was given. */
+	get quantizer() {
+		return this._quantizer;
+	}
+
+	/** The peak bitrate the quality is held under, in bits per second, or `undefined` for no cap. */
+	get maxBitrate() {
+		return this._maxBitrate;
+	}
+
+	/** The buffer the peak bitrate is measured over, in bits, or `undefined` when it defaults. */
+	get bufferSize() {
+		return this._bufferSize;
+	}
+
+	/** The demanded bitrate mode, or `undefined` when the encoder's own default stands. */
+	get bitrateMode() {
+		return this._bitrateMode;
+	}
+
+	/** Whether a qualitative level asks for bitrate-based encoding over a codec's quantizer mode. */
+	get preferBitrate() {
+		return this._preferBitrate;
 	}
 
 	/**
@@ -830,9 +1204,17 @@ export class Quality {
 			}
 
 			bitrate = computeVideoBitrate(codec, width, height, qualityToBitrateFactor(quality));
+			if (this._maxBitrate !== undefined) {
+				// A derived bitrate is also the fallback where the cap can't be enforced, so it must respect the cap
+				bitrate = Math.min(bitrate, this._maxBitrate);
+			}
 		}
 
-		return { quantizer, bitrate, bitrateMode };
+		const cap = quantizer !== null && this._maxBitrate !== undefined
+			? { maxBitrate: this._maxBitrate, bufferSize: this._bufferSize ?? 2 * this._maxBitrate }
+			: null;
+
+		return { quantizer, bitrate, bitrateMode, cap };
 	}
 
 	/** @internal */
@@ -868,6 +1250,7 @@ export class Quality {
 			aac: 128000, // 128kbps base for AAC
 			opus: 64000, // 64kbps base for Opus
 			mp3: 160000, // 160kbps base for MP3
+			mp2: 256000, // 256kbps base for MP2; Layer II is less efficient than Layer III
 			vorbis: 64000, // 64kbps base for Vorbis
 			ac3: 384000, // 384kbps base for AC-3
 			eac3: 192000, // 192kbps base for E-AC-3
@@ -920,10 +1303,11 @@ const VIDEO_CODEC_QUANTIZER_SUPPORT: Partial<Record<VideoCodec, {
 }>> = {
 	avc: { min: 0, max: 51, worst: 41, best: 16 },
 	hevc: { min: 0, max: 51, worst: 41, best: 16 },
-	// Chromium used the 0-63 scale before v145, see https://github.com/Vanilagy/mediabunny/issues/566
-	vp9: (getChromiumVersion() ?? Infinity) < 145
-		? { min: 0, max: 63, worst: 52, best: 20 }
-		: { min: 0, max: 255, worst: 208, best: 80 },
+	// Chromium moved VP9's quantizer to 0-255 in v145 (mediabunny#566); libvpx kept 0-63 and refuses to
+	// open above it, and this fork drives libvpx directly, so an unknown environment gets the narrow scale
+	vp9: (getChromiumVersion() ?? 0) >= 145
+		? { min: 0, max: 255, worst: 208, best: 80 }
+		: { min: 0, max: 63, worst: 52, best: 20 },
 	av1: { min: 0, max: 255, worst: 208, best: 80 },
 };
 
@@ -947,6 +1331,12 @@ const computeVideoBitrate = (codec: VideoCodec, width: number, height: number, f
 		av1: 0.4, // ~60% more efficient than AVC
 		vp8: 1.2, // Slightly less efficient than AVC
 		prores: 220_000_000 / referenceBitrate, // Apple ProRes white paper claims 220 Mbps for 1080p 422 HQ @30Hz
+		mpeg2: 2.5, // Roughly 2.5x the bitrate of AVC for comparable quality
+		// Neither has an encoder here, so these are only ever a size estimate for a track being copied.
+		// 8-bit RGBA at 1080p30 is 1.99 Gbps uncompressed; QuickTime RLE barely moves that on camera
+		// content, and PNG's filters and deflate take roughly half.
+		qtrle: 1_990_000_000 / referenceBitrate,
+		png: 995_000_000 / referenceBitrate,
 	};
 
 	const codecAdjustedBitrate = baseBitrate * codecEfficiencyFactors[codec];
@@ -1365,7 +1755,7 @@ export const getEncodableVideoCodecs = async (
 		bitrate?: number | Quality;
 		/** The expected frame rate in frames per second, if known. */
 		frameRate?: number;
-	},
+	} & VideoEncodingAdditionalOptions,
 ): Promise<VideoCodec[]> => {
 	const bools = await Promise.all(checkedCodecs.map(codec => canEncodeVideo(codec, options)));
 	return checkedCodecs.filter((_, i) => bools[i]);
@@ -1431,7 +1821,7 @@ export const getFirstEncodableVideoCodec = async (
 		bitrate?: number | Quality;
 		/** The expected frame rate in frames per second, if known. */
 		frameRate?: number;
-	},
+	} & VideoEncodingAdditionalOptions,
 ): Promise<VideoCodec | null> => {
 	for (const codec of checkedCodecs) {
 		if (await canEncodeVideo(codec, options)) {

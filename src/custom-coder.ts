@@ -6,6 +6,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
+import { type VideoDecoderConfigWithHdr } from './hdr-metadata';
 import { AudioCodec, VideoCodec } from './codec';
 import { canDecodeAudioMemo, canDecodeVideoMemo } from './decode';
 import { canEncodeAudioMemo, canEncodeVideoMemo } from './encode';
@@ -23,8 +24,8 @@ import { AudioSample, VideoSample } from './sample';
 export abstract class CustomVideoDecoder {
 	/** The input video's codec. */
 	readonly codec!: VideoCodec;
-	/** The input video's decoder config. */
-	readonly config!: VideoDecoderConfig;
+	/** The input video's decoder config, plus what the container states beside it. */
+	readonly config!: VideoDecoderConfigWithHdr;
 	/** The callback to call when a decoded VideoSample is available. */
 	readonly onSample!: (sample: VideoSample) => unknown;
 	/** The callback to call to surface out-of-band errors that can't be surfaced through the main methods. */

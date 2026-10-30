@@ -58,6 +58,7 @@ export class AdtsDemuxer extends Demuxer {
 	lastSampleLoaded = false;
 	lastLoadedPos = 0;
 	nextTimestampInSamples = 0;
+	firstTimestamp = 0;
 
 	constructor(input: Input) {
 		super(input);
@@ -97,6 +98,13 @@ export class AdtsDemuxer extends Demuxer {
 					break;
 				}
 
+				let tagSlice = this.reader.requestSlice(slice.filePos, id3V2Header.size);
+				if (isThenable(tagSlice)) {
+					tagSlice = await tagSlice;
+				}
+				// The PRIV timestamp (RFC 8216 §3.4) is the HLS layer's to apply when placing a segment; applying it
+				// here too put it on twice and read a 354 s segment back at 708 s
+
 				this.lastLoadedPos = slice.filePos + id3V2Header.size;
 			}
 		}
@@ -133,7 +141,7 @@ export class AdtsDemuxer extends Demuxer {
 		const sampleDuration = SAMPLES_PER_AAC_FRAME / sampleRate;
 
 		const sample: Sample = {
-			timestamp: this.nextTimestampInSamples / sampleRate,
+			timestamp: this.firstTimestamp + this.nextTimestampInSamples / sampleRate,
 			duration: sampleDuration,
 			dataStart: header.startPos,
 			dataSize: header.frameLength,
@@ -255,6 +263,10 @@ class AdtsAudioTrackBacking implements InputAudioTrackBacking {
 		assert(this.demuxer.firstFrameHeader);
 
 		return this.demuxer.firstFrameHeader.objectType;
+	}
+
+	getEncryptionInfo() {
+		return null;
 	}
 
 	getNumberOfChannels() {

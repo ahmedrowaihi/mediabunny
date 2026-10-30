@@ -1,0 +1,48 @@
+{
+  "name": "@ahmedrowaihi/mediabunny-rist",
+  "author": "Vanilagy",
+  "version": "1.65.2",
+  "description": "RIST simple and main profile transport for Mediabunny, over librist.",
+  "main": "./dist/bundles/mediabunny-rist.cjs",
+  "module": "./dist/bundles/mediabunny-rist.mjs",
+  "types": "./dist/modules/src/index.d.ts",
+  "exports": {
+    "types": "./dist/modules/src/index.d.ts",
+    "import": "./dist/bundles/mediabunny-rist.mjs",
+    "require": "./dist/bundles/mediabunny-rist.cjs"
+  },
+  "files": [
+    "README.md",
+    "package.json",
+    "LICENSE",
+    "dist",
+    "src"
+  ],
+  "sideEffects": false,
+  "license": "MPL-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ahmedrowaihi/mediabunny.git",
+    "directory": "packages/rist"
+  },
+  "bugs": {
+    "url": "https://github.com/Vanilagy/mediabunny/issues"
+  },
+  "dependencies": {
+    "koffi": "^3.3.7"
+  },
+  "peerDependencies": {
+    "mediabunny": "^1.45.0"
+  },
+  "keywords": [
+    "rist",
+    "librist",
+    "vsf",
+    "transport",
+    "udp",
+    "live",
+    "streaming",
+    "mediabunny",
+    "node"
+  ]
+}

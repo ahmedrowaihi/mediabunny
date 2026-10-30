@@ -15,6 +15,7 @@
 			"@mediabunny/mp3-encoder": ["./packages/mp3-encoder/src/index.ts"],
 			"@mediabunny/prores": ["./packages/prores/src/index.ts"],
 			"@mediabunny/server": ["./packages/server/src/index.ts"],
+			"@mediabunny/rist": ["./packages/rist/src/index.ts"],
 		},
 	},
 	"include": ["vitest.config.ts", "./test/**/*"],

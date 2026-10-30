@@ -58,6 +58,9 @@ export enum HevcNalUnitType {
 	RASL_N = 8,
 	RASL_R = 9,
 	BLA_W_LP = 16,
+	IDR_W_RADL = 19,
+	IDR_N_LP = 20,
+	CRA_NUT = 21,
 	RSV_IRAP_VCL23 = 23,
 	VPS_NUT = 32,
 	SPS_NUT = 33,
@@ -146,9 +149,11 @@ export const iterateNalUnitsInLengthPrefixed = function* (
 
 		offset += lengthSize;
 
+		// A length prefix is publisher-controlled: all-0xFF claims a 4 GiB NAL, and a consumer sizing buffers
+		// from it (the CENC subsample generator) would turn KiB of input into MB of output
 		yield {
 			offset,
-			length: nalUnitLength,
+			length: Math.min(nalUnitLength, packetData.length - offset),
 		};
 
 		offset += nalUnitLength;
@@ -171,7 +176,8 @@ export const extractNalUnitTypeForAvc = (byte: number) => {
 	return byte & 0x1F;
 };
 
-const removeEmulationPreventionBytes = (data: Uint8Array) => {
+/** @internal */
+export const removeEmulationPreventionBytes = (data: Uint8Array) => {
 	const result = new Uint8Array(data.length); // The result can only be shorter
 	const len = data.length;
 	let resultLength = 0;
@@ -529,10 +535,14 @@ export type AvcSpsInfo = {
 	colourPrimaries: number;
 	transferCharacteristics: number;
 	matrixCoefficients: number;
-	fullRangeFlag: number;
+	fullRangeFlag: number | null;
 	numReorderFrames: number;
 	maxDecFrameBuffering: number;
 	vuiParametersFlagBitOffset: number;
+	/** VUI `pic_struct_present_flag`: without it a `pic_timing` SEI carries no clock timestamp. */
+	picStructPresentFlag: boolean;
+	/** The `pic_timing` field widths the HRD parameters state, or null when the VUI declares no HRD. */
+	hrd: { cpbRemovalDelayLength: number; dpbOutputDelayLength: number; timeOffsetLength: number } | null;
 	bitstreamRestrictionFlagBitOffset: number | null;
 	bitstreamRestrictionFlag: number | null;
 };
@@ -692,13 +702,16 @@ export const parseAvcSps = (sps: Uint8Array): AvcSpsInfo | null => {
 		let colourPrimaries = 2;
 		let transferCharacteristics = 2;
 		let matrixCoefficients = 2;
-		let fullRangeFlag = 0;
+		let fullRangeFlag: number | null = null;
 		let pixelAspectRatio: Rational = { num: 1, den: 1 };
 
 		let numReorderFrames: number | null = null;
 		let maxDecFrameBuffering: number | null = null;
 		let bitstreamRestrictionFlagBitOffset: number | null = null;
 		let bitstreamRestrictionFlag: number | null = null;
+		let picStructPresentFlag = false;
+		let hrd: { cpbRemovalDelayLength: number; dpbOutputDelayLength: number; timeOffsetLength: number } | null
+			= null;
 
 		const vuiParametersFlagBitOffset = bitstream.pos;
 		const vuiParametersPresentFlag = bitstream.readBits(1);
@@ -752,19 +765,19 @@ export const parseAvcSps = (sps: Uint8Array): AvcSpsInfo | null => {
 
 			const nalHrdParametersPresentFlag = bitstream.readBits(1);
 			if (nalHrdParametersPresentFlag) {
-				skipAvcHrdParameters(bitstream);
+				hrd = readAvcHrdParameters(bitstream);
 			}
 
 			const vclHrdParametersPresentFlag = bitstream.readBits(1);
 			if (vclHrdParametersPresentFlag) {
-				skipAvcHrdParameters(bitstream);
+				hrd = readAvcHrdParameters(bitstream);
 			}
 
 			if (nalHrdParametersPresentFlag || vclHrdParametersPresentFlag) {
 				bitstream.skipBits(1); // low_delay_hrd_flag
 			}
 
-			bitstream.skipBits(1); // pic_struct_present_flag
+			picStructPresentFlag = bitstream.readBits(1) === 1;
 
 			bitstreamRestrictionFlagBitOffset = bitstream.pos;
 			bitstreamRestrictionFlag = bitstream.readBits(1);
@@ -841,6 +854,8 @@ export const parseAvcSps = (sps: Uint8Array): AvcSpsInfo | null => {
 			vuiParametersFlagBitOffset,
 			bitstreamRestrictionFlagBitOffset,
 			bitstreamRestrictionFlag,
+			picStructPresentFlag,
+			hrd,
 		};
 	} catch (error) {
 		Logging._error('Error parsing AVC SPS:', error);
@@ -848,7 +863,11 @@ export const parseAvcSps = (sps: Uint8Array): AvcSpsInfo | null => {
 	}
 };
 
-const skipAvcHrdParameters = (bitstream: Bitstream) => {
+/**
+ * The three field widths a `pic_timing` SEI needs to be parsable at all; H.264 7.3.2.1.1 states them
+ * here and nowhere else, which is why that SEI cannot be read without its SPS.
+ */
+const readAvcHrdParameters = (bitstream: Bitstream) => {
 	const cpb_cnt_minus1 = readExpGolomb(bitstream);
 	bitstream.skipBits(4); // bit_rate_scale
 	bitstream.skipBits(4); // cpb_size_scale
@@ -860,9 +879,12 @@ const skipAvcHrdParameters = (bitstream: Bitstream) => {
 	}
 
 	bitstream.skipBits(5); // initial_cpb_removal_delay_length_minus1
-	bitstream.skipBits(5); // cpb_removal_delay_length_minus1
-	bitstream.skipBits(5); // dpb_output_delay_length_minus1
-	bitstream.skipBits(5); // time_offset_length
+
+	return {
+		cpbRemovalDelayLength: bitstream.readBits(5) + 1,
+		dpbOutputDelayLength: bitstream.readBits(5) + 1,
+		timeOffsetLength: bitstream.readBits(5),
+	};
 };
 
 /**
@@ -949,7 +971,8 @@ export type HevcSpsInfo = {
 	colourPrimaries: number;
 	transferCharacteristics: number;
 	matrixCoefficients: number;
-	fullRangeFlag: number;
+	fullRangeFlag: number | null;
+	numReorderFrames: number;
 	maxDecFrameBuffering: number;
 	spsMaxSubLayersMinus1: number;
 	spsTemporalIdNestingFlag: number;
@@ -968,25 +991,22 @@ export type HevcSpsInfo = {
 export const concatHevcNalUnits = (nalUnits: Uint8Array[], decoderConfig: VideoDecoderConfig) => {
 	if (decoderConfig.description) {
 		// Stream is length-prefixed. Let's extract the size of the length prefix from the decoder config
-
-		const bytes = toUint8Array(decoderConfig.description);
-		const lengthSizeMinusOne = bytes[21]! & 0b11;
-		const lengthSize = (lengthSizeMinusOne + 1) as 1 | 2 | 3 | 4;
-
-		return concatNalUnitsInLengthPrefixed(nalUnits, lengthSize);
+		return concatNalUnitsInLengthPrefixed(nalUnits, hevcNalUnitLengthSize(decoderConfig.description));
 	} else {
 		// Stream is in Annex B format
 		return concatNalUnitsInAnnexB(nalUnits);
 	}
 };
 
+/** The NAL unit length prefix size declared by an HEVCDecoderConfigurationRecord. @internal */
+export const hevcNalUnitLengthSize = (description: AllowSharedBufferSource): 1 | 2 | 3 | 4 => {
+	const bytes = toUint8Array(description);
+	return ((bytes[21]! & 0b11) + 1) as 1 | 2 | 3 | 4;
+};
+
 export const iterateHevcNalUnits = (packetData: Uint8Array, decoderConfig: VideoDecoderConfig) => {
 	if (decoderConfig.description) {
-		const bytes = toUint8Array(decoderConfig.description);
-		const lengthSizeMinusOne = bytes[21]! & 0b11;
-		const lengthSize = (lengthSizeMinusOne + 1) as 1 | 2 | 3 | 4;
-
-		return iterateNalUnitsInLengthPrefixed(packetData, lengthSize);
+		return iterateNalUnitsInLengthPrefixed(packetData, hevcNalUnitLengthSize(decoderConfig.description));
 	} else {
 		return iterateNalUnitsInAnnexB(packetData);
 	}
@@ -994,6 +1014,26 @@ export const iterateHevcNalUnits = (packetData: Uint8Array, decoderConfig: Video
 
 export const extractNalUnitTypeForHevc = (byte: number) => {
 	return (byte >> 1) & 0x3F;
+};
+
+/**
+ * Whether a NAL unit belongs in the sample entry rather than in the sample, for `parameterSets:
+ * 'outOfBand'`. The parameter sets are the ones {@link extractAvcDecoderConfigurationRecord} and
+ * {@link extractHevcDecoderConfigurationRecord} put in the record, plus the access unit delimiter,
+ * which Annex B needs to mark a boundary that a length prefix already states.
+ *
+ * @internal
+ */
+export const belongsInSampleEntry = (codec: 'avc' | 'hevc', firstByte: number) => {
+	if (codec === 'avc') {
+		const type = extractNalUnitTypeForAvc(firstByte);
+		return type === AvcNalUnitType.SPS || type === AvcNalUnitType.PPS
+			|| type === AvcNalUnitType.SPS_EXT || type === AvcNalUnitType.AUD;
+	}
+
+	const type = extractNalUnitTypeForHevc(firstByte);
+	return type === HevcNalUnitType.VPS_NUT || type === HevcNalUnitType.SPS_NUT
+		|| type === HevcNalUnitType.PPS_NUT || type === HevcNalUnitType.AUD_NUT;
 };
 
 /** Parses an HEVC SPS (Sequence Parameter Set) to extract video information. */
@@ -1110,7 +1150,7 @@ export const parseHevcSps = (sps: Uint8Array): HevcSpsInfo | null => {
 		let colourPrimaries = 2;
 		let transferCharacteristics = 2;
 		let matrixCoefficients = 2;
-		let fullRangeFlag = 0;
+		let fullRangeFlag: number | null = null;
 		let minSpatialSegmentationIdc = 0;
 		let pixelAspectRatio: Rational = { num: 1, den: 1 };
 
@@ -1135,6 +1175,7 @@ export const parseHevcSps = (sps: Uint8Array): HevcSpsInfo | null => {
 			// Can't exceed MaxDpbSize, which is at most 16. Bigger values would make us buffer absurd amounts of
 			// frames
 			maxDecFrameBuffering: Math.min(spsMaxNumReorderPics + 1, 16),
+			numReorderFrames: Math.min(spsMaxNumReorderPics, 16),
 			spsMaxSubLayersMinus1,
 			spsTemporalIdNestingFlag,
 			generalProfileSpace: general_profile_space,
@@ -1292,7 +1333,8 @@ export const extractHevcDecoderConfigurationRecord = (packetData: Uint8Array) =>
 	}
 };
 
-const parseProfileTierLevel = (
+/** @internal */
+export const parseProfileTierLevel = (
 	bitstream: Bitstream,
 	maxNumSubLayersMinus1: number,
 ) => {
@@ -1364,7 +1406,8 @@ const skipAllStRefPicSets = (bitstream: Bitstream, num_short_term_ref_pic_sets: 
 	}
 };
 
-const skipStRefPicSet = (
+/** @internal */
+export const skipStRefPicSet = (
 	bitstream: Bitstream,
 	stRpsIdx: number,
 	num_short_term_ref_pic_sets: number,
@@ -1418,7 +1461,7 @@ const parseHevcVui = (bitstream: Bitstream, sps_max_sub_layers_minus1: number) =
 	let colourPrimaries = 2;
 	let transferCharacteristics = 2;
 	let matrixCoefficients = 2;
-	let fullRangeFlag = 0;
+	let fullRangeFlag: number | null = null;
 	let minSpatialSegmentationIdc = 0;
 	let pixelAspectRatio: Rational = { num: 1, den: 1 };
 
@@ -2347,6 +2390,244 @@ export const extractProresCodecInfoFromPacket = (packet: Uint8Array): ProresCode
 	};
 };
 
+/**
+ * The AVC-Intra and XAVC sample entry four-character codes, keyed the way the format keys them: the class
+ * (50 or 100, which is the chroma format), the raster, and then the scan type with the frame rate.
+ *
+ * Taken from FFmpeg's `ff_codec_movvideo_tags` comments and confirmed against what its mov muxer actually
+ * picks — it selects these itself from the intra profile, chroma format, raster and rate, and overrides an
+ * explicit `-tag:v`, so matching it is the whole contract. AVC-Intra 50 is 4:2:0 on a subsampled raster
+ * (1440x1080, 960x720) and 100 is 4:2:2 at full raster, which is why the two families differ by more than
+ * a number.
+ */
+const AVC_INTRA_CODES = [
+	// AVC-Intra 50: 4:2:0
+	{ chromaFormatIdc: 1, width: 960, height: 720, interlaced: false, slow: 'ai5p', fast: 'ai5q' },
+	{ chromaFormatIdc: 1, width: 1440, height: 1080, interlaced: false, slow: 'ai53', fast: 'ai52' },
+	{ chromaFormatIdc: 1, width: 1440, height: 1080, interlaced: true, slow: 'ai56', fast: 'ai55' },
+	// AVC-Intra 100: 4:2:2
+	{ chromaFormatIdc: 2, width: 1280, height: 720, interlaced: false, slow: 'ai1p', fast: 'ai1q' },
+	{ chromaFormatIdc: 2, width: 1920, height: 1080, interlaced: false, slow: 'ai13', fast: 'ai12' },
+	{ chromaFormatIdc: 2, width: 1920, height: 1080, interlaced: true, slow: 'ai16', fast: 'ai15' },
+] as const;
+
+/** `constraint_set3_flag`, which an intra-only profile sets (14496-10 A.2.8 onwards). */
+const AVC_CONSTRAINT_SET3 = 1 << 4;
+
+/**
+ * Whether an SPS describes an intra-only High profile, which is what AVC-Intra and XAVC are. 110 is
+ * High 10 and 122 is High 4:2:2; both become their Intra profile with `constraint_set3_flag` set.
+ */
+const isAvcIntraProfile = (sps: AvcSpsInfo) =>
+	(sps.profileIdc === 110 || sps.profileIdc === 122)
+	&& (sps.constraintFlags & AVC_CONSTRAINT_SET3) !== 0;
+
+/**
+ * The first SPS inside a serialized AVCDecoderConfigurationRecord (an `avcC` payload), or null.
+ *
+ * 14496-15 5.2.4.1: version, profile, compatibility, level, then `lengthSizeMinusOne` in the low two bits,
+ * then the SPS count in the low five, then each SPS as a 16-bit length and its bytes.
+ *
+ * @internal
+ */
+export const firstSpsFromAvcRecord = (record: Uint8Array): Uint8Array | null => {
+	if (record.byteLength < 7 || (record[5]! & 0x1f) === 0) {
+		return null;
+	}
+
+	const length = (record[6]! << 8) | record[7]!;
+	if (length === 0 || 8 + length > record.byteLength) {
+		return null;
+	}
+
+	return record.subarray(8, 8 + length);
+};
+
+/**
+ * Every SPS and PPS inside a serialized AVCDecoderConfigurationRecord, in the order the record lists
+ * them, for splicing into a sample whose carriage keeps its parameter sets in band.
+ *
+ * @internal
+ */
+export const parameterSetsFromAvcRecord = (record: Uint8Array): Uint8Array[] => {
+	const units: Uint8Array[] = [];
+	let at = 5;
+
+	// The SPS list, then the PPS list. Each is a count followed by length-prefixed units; only the SPS
+	// count is masked, the PPS count using the whole byte (14496-15 5.2.4.1).
+	for (const mask of [0x1f, 0xff]) {
+		if (at >= record.byteLength) {
+			break;
+		}
+
+		const count = record[at]! & mask;
+		at++;
+
+		for (let i = 0; i < count; i++) {
+			if (at + 2 > record.byteLength) {
+				return units;
+			}
+
+			const length = (record[at]! << 8) | record[at + 1]!;
+			at += 2;
+			if (at + length > record.byteLength) {
+				return units;
+			}
+
+			units.push(record.subarray(at, at + length));
+			at += length;
+		}
+	}
+
+	return units;
+};
+
+/**
+ * The AVC-Intra sample entry for a stream, or null when it is not one of the shapes the format names.
+ *
+ * `frameRate` decides between the two codes of a pair: the 25/50 family and the 24/30/60 one. An NTSC rate
+ * is matched on its nominal value, so 29.97 counts as 30.
+ *
+ * @internal
+ */
+export const avcIntraSampleEntry = (sps: AvcSpsInfo, frameRate: number | null): string | null => {
+	if (!isAvcIntraProfile(sps) || frameRate === null || !(frameRate > 0)) {
+		return null;
+	}
+
+	const interlaced = sps.frameMbsOnlyFlag === 0;
+	// The *display* size, not the coded one: H.264 codes 1080 as 1088 - seventeen macroblock rows - and
+	// crops it, so a 1080 stream states codedHeight 1088. ffmpeg keys on the cropped height too.
+	const match = AVC_INTRA_CODES.find(candidate =>
+		candidate.chromaFormatIdc === sps.chromaFormatIdc
+		&& candidate.width === sps.displayWidth
+		&& candidate.height === sps.displayHeight
+		&& candidate.interlaced === interlaced);
+
+	if (!match) {
+		return null;
+	}
+
+	// Nominal rate, so 30000/1001 is a 30 and 60000/1001 a 60
+	const nominal = Math.round(frameRate * 1001 / 1000) === Math.round(frameRate)
+		? Math.round(frameRate)
+		: Math.round(frameRate * 1001 / 1000);
+
+	if (interlaced) {
+		// The interlaced pair is keyed on 50 against 60 rather than on the progressive split
+		return nominal >= 55 ? match.slow : match.fast;
+	}
+
+	return nominal === 25 || nominal === 50 ? match.fast : match.slow;
+};
+
+/** MPEG-2 video start codes, ISO/IEC 13818-2 table 6-1. */
+/** @internal */
+export const MPEG2_PICTURE_START_CODE = 0x00;
+/** @internal */
+export const MPEG2_SEQUENCE_HEADER_CODE = 0xb3;
+const MPEG2_EXTENSION_START_CODE = 0xb5;
+/** @internal */
+export const MPEG2_GROUP_START_CODE = 0xb8;
+/** `extension_start_code_identifier` for the sequence extension, 13818-2 table 6-2. */
+const MPEG2_SEQUENCE_EXTENSION_ID = 1;
+
+/**
+ * What a sequence header and its sequence extension state about an MPEG-2 video stream.
+ *
+ * `profileAndLevelIndication` and `chromaFormat` come from the sequence extension, which MPEG-1 streams
+ * do not carry — a stream with only a sequence header is MPEG-1, and those fields are null for it.
+ */
+export type Mpeg2CodecInfo = {
+	width: number;
+	height: number;
+	/** 13818-2 8.2: profile in the high nibble, level in the low. Null without a sequence extension. */
+	profileAndLevelIndication: number | null;
+	/** 1 is 4:2:0, 2 is 4:2:2, 3 is 4:4:4. Null without a sequence extension, where 4:2:0 is implied. */
+	chromaFormat: 1 | 2 | 3 | null;
+	progressiveSequence: boolean | null;
+	/** 13818-2 table 6-4; 4 is 30000/1001, 3 is 25. */
+	frameRateCode: number;
+};
+
+/** Byte offset of the next `00 00 01 <code>` start code at or after `from`, or -1. */
+const findMpeg2StartCode = (bytes: Uint8Array, code: number, from = 0): number => {
+	for (let at = from; at + 3 < bytes.length; at++) {
+		if (bytes[at] === 0 && bytes[at + 1] === 0 && bytes[at + 2] === 1 && bytes[at + 3] === code) {
+			return at;
+		}
+	}
+
+	return -1;
+};
+
+/**
+ * Reads an MPEG-2 stream's dimensions, profile and chroma format out of the first sequence header in
+ * these bytes. Null when there is none, which is what makes it safe to run over any packet.
+ *
+ * The size is split across the two headers: 12 bits in the sequence header and two more significant bits
+ * in the extension, so a 1920-wide stream states 1920 only once both are read.
+ */
+export const extractMpeg2CodecInfoFromPacket = (packet: Uint8Array): Mpeg2CodecInfo | null => {
+	const sequenceHeaderAt = findMpeg2StartCode(packet, MPEG2_SEQUENCE_HEADER_CODE);
+	if (sequenceHeaderAt === -1) {
+		return null;
+	}
+
+	const bitstream = new Bitstream(packet);
+	bitstream.seekToByte(sequenceHeaderAt + 4);
+
+	const horizontalSize = bitstream.readBits(12);
+	const verticalSize = bitstream.readBits(12);
+	if (horizontalSize === 0 || verticalSize === 0) {
+		return null;
+	}
+
+	bitstream.skipBits(4); // aspect_ratio_information
+	const frameRateCode = bitstream.readBits(4);
+	bitstream.skipBits(18 + 1 + 10 + 1); // bit_rate_value, marker, vbv_buffer_size_value, constrained flag
+
+	// Either quantiser matrix, when loaded, is 64 bytes between here and the next start code
+	if (bitstream.readBits(1)) {
+		bitstream.skipBits(64 * 8);
+	}
+	if (bitstream.readBits(1)) {
+		bitstream.skipBits(64 * 8);
+	}
+
+	const info: Mpeg2CodecInfo = {
+		width: horizontalSize,
+		height: verticalSize,
+		profileAndLevelIndication: null,
+		chromaFormat: null,
+		progressiveSequence: null,
+		frameRateCode,
+	};
+
+	// The sequence extension follows the sequence header directly when there is one; an MPEG-1 stream
+	// has none, which is the difference that matters here
+	const extensionAt = findMpeg2StartCode(packet, MPEG2_EXTENSION_START_CODE, sequenceHeaderAt + 4);
+	if (extensionAt === -1) {
+		return info;
+	}
+
+	bitstream.seekToByte(extensionAt + 4);
+	if (bitstream.readBits(4) !== MPEG2_SEQUENCE_EXTENSION_ID) {
+		return info;
+	}
+
+	info.profileAndLevelIndication = bitstream.readBits(8);
+	info.progressiveSequence = bitstream.readBits(1) === 1;
+
+	const chromaFormat = bitstream.readBits(2);
+	info.chromaFormat = chromaFormat === 1 || chromaFormat === 2 || chromaFormat === 3 ? chromaFormat : null;
+
+	info.width |= bitstream.readBits(2) << 12;
+	info.height |= bitstream.readBits(2) << 12;
+
+	return info;
+};
+
 export const parseOpusIdentificationHeader = (bytes: Uint8Array) => {
 	if (bytes.byteLength < 19) {
 		throw new Error('Invalid Opus identification header: too short.');
@@ -2660,6 +2941,32 @@ export const determineVideoPacketType = (
 
 		case 'prores': {
 			return 'key';
+		};
+
+		case 'png': {
+			// Every frame is a whole image
+			return 'key';
+		};
+
+		case 'qtrle': {
+			// A QuickTime RLE frame carries no flag saying whether it replaces the frame or updates it, so
+			// only the container knows
+			return null;
+		};
+
+		case 'mpeg2': {
+			// 13818-2 6.2.3: the picture header's `picture_coding_type` follows a 10-bit temporal
+			// reference. 1 is an I-picture, which is the only one that starts a decode.
+			const pictureHeaderAt = findMpeg2StartCode(packetData, MPEG2_PICTURE_START_CODE);
+			if (pictureHeaderAt === -1) {
+				return null;
+			}
+
+			const bitstream = new Bitstream(packetData);
+			bitstream.seekToByte(pictureHeaderAt + 4);
+			bitstream.skipBits(10);
+
+			return bitstream.readBits(3) === 1 ? 'key' : 'delta';
 		};
 
 		default: {
@@ -3196,6 +3503,9 @@ export const AC3_REGISTRATION_DESCRIPTOR = new Uint8Array([0x05, 0x04, 0x41, 0x4
 
 /** E-AC-3 registration_descriptor for MPEG-TS/ */
 export const EAC3_REGISTRATION_DESCRIPTOR = new Uint8Array([0x05, 0x04, 0x45, 0x41, 0x43, 0x33]);
+
+/** 'CUEI', the registration that tells an SCTE-35 cue stream from the Blu-ray meaning of type 0x86. */
+export const CUEI_REGISTRATION_DESCRIPTOR = new Uint8Array([0x05, 0x04, 0x43, 0x55, 0x45, 0x49]);
 
 /** Number of audio blocks per syncframe, indexed by numblkscod */
 export const EAC3_NUMBLKS_TABLE = [1, 2, 3, 6];

@@ -1,10 +1,12 @@
 import { expect, test } from 'vitest';
 import path from 'node:path';
+import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import {
 	ALL_FORMATS,
 	BufferSource,
 	BufferTarget,
+	Conversion,
 	EncodedPacket,
 	EncodedPacketSink,
 	EncodedVideoPacketSource,
@@ -143,6 +145,38 @@ test('QuickTime nclc color information', async () => {
 	expect(await track.hasHighDynamicRange()).toBe(true);
 });
 
+test('H.264 video range is reported only where the stream signals it', async () => {
+	const open = (name: string) => new Input({
+		source: new FilePathSource(path.join(__dirname, `../public/${name}`)),
+		formats: ALL_FORMATS,
+	});
+	const colorSpaceOf = async (name: string) => {
+		using input = open(name);
+		const track = await input.getPrimaryVideoTrack();
+		assert(track);
+		return track.getColorSpace();
+	};
+	const remuxedHasColr = async (name: string) => {
+		using input = open(name);
+		const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+		const conversion = await Conversion.init({ input, output });
+		await conversion.execute();
+		return String.fromCharCode(...new Uint8Array(output.target.buffer!)).includes('colr');
+	};
+
+	expect((await colorSpaceOf('avc-range-unsignalled.mp4')).fullRange).toBeUndefined();
+	expect(await colorSpaceOf('avc-range-limited.mp4')).toEqual({
+		primaries: 'bt709',
+		transfer: 'bt709',
+		matrix: 'bt709',
+		fullRange: false,
+	});
+	expect((await colorSpaceOf('avc-range-full.mp4')).fullRange).toBe(true);
+
+	expect(await remuxedHasColr('avc-range-unsignalled.mp4')).toBe(false);
+	expect(await remuxedHasColr('avc-range-limited.mp4')).toBe(true);
+});
+
 // Annex B isn't supposed to exist in MP4, but some files have it anyway, with an empty avcC box
 test('Annex B', async () => {
 	const filePath = path.join(__dirname, '..', 'public/annex-b.mp4');
@@ -272,3 +306,303 @@ test('Key packet lookup after reading fragments without key frames', async () =>
 
 	expect((await sink.getKeyPacket(1.2))?.timestamp).toBe(1);
 });
+
+// bear-640x360-av_frag.mp4 states neither `base_data_offset` nor `default-base-is-moof` on either traf,
+// which by ISO/IEC 14496-12 section 8.8.7 bases the audio traf on the end of the video traf's data. Read
+// that way its samples land past the end of the fragment's own mdat, in the fragment after it; measured
+// from the moof they fill it exactly, and the test asserts that fill before trusting it. So the boxes
+// themselves say which reading the file meant, and the demuxer has to return those bytes.
+test('a fragment\'s samples are read from its own mdat, whatever base its tfhd left unstated', async () => {
+	const filePath = path.join(__dirname, '..', 'public/bear-640x360-av_frag.mp4');
+	const bytes = new Uint8Array(readFileSync(filePath));
+	const buffer = Buffer.from(bytes);
+	const u32 = (offset: number) => buffer.readUInt32BE(offset);
+	const typeAt = (offset: number) => buffer.toString('latin1', offset + 4, offset + 8);
+
+	/** Every sample of one traf, as byte ranges measured from `base`. */
+	const samplesOfTraf = (trafStart: number, trafEnd: number, base: number) => {
+		let defaultSampleSize = 0;
+		const ranges: { start: number; size: number }[] = [];
+		let trackId = 0;
+		let cursor = base;
+
+		for (let offset = trafStart; offset + 8 <= trafEnd;) {
+			const size = u32(offset);
+			const type = typeAt(offset);
+			if (type === 'tfhd') {
+				const flags = u32(offset + 8) & 0xffffff;
+				trackId = u32(offset + 12);
+				let field = offset + 16;
+				if (flags & 0x1) {
+					field += 8;
+				}
+				if (flags & 0x2) {
+					field += 4;
+				}
+				if (flags & 0x8) {
+					field += 4;
+				}
+				defaultSampleSize = (flags & 0x10) ? u32(field) : 0;
+			} else if (type === 'trun') {
+				const flags = u32(offset + 8) & 0xffffff;
+				const count = u32(offset + 12);
+				let field = offset + 16;
+				if (flags & 0x1) {
+					cursor = base + (u32(field) | 0);
+					field += 4;
+				}
+				if (flags & 0x4) {
+					field += 4;
+				}
+				for (let i = 0; i < count; i++) {
+					if (flags & 0x100) {
+						field += 4;
+					}
+					const sampleSize = (flags & 0x200) ? u32(field) : defaultSampleSize;
+					if (flags & 0x200) {
+						field += 4;
+					}
+					if (flags & 0x400) {
+						field += 4;
+					}
+					if (flags & 0x800) {
+						field += 4;
+					}
+					ranges.push({ start: cursor, size: sampleSize });
+					cursor += sampleSize;
+				}
+			}
+			offset += size;
+		}
+
+		return { trackId, ranges };
+	};
+
+	// Expected bytes per track, in file order, with every traf measured from its moof
+	const expected = new Map<number, string[]>();
+	for (let offset = 0; offset + 8 <= bytes.length;) {
+		const size = u32(offset);
+		assert(size >= 8);
+		if (typeAt(offset) === 'moof') {
+			const mdatStart = offset + size;
+			assert(typeAt(mdatStart) === 'mdat');
+			const payloadStart = mdatStart + 8;
+			const payloadEnd = mdatStart + u32(mdatStart);
+			let accounted = 0;
+
+			for (let child = offset + 8; child + 8 <= offset + size;) {
+				const childSize = u32(child);
+				if (typeAt(child) === 'traf') {
+					const { trackId, ranges } = samplesOfTraf(child + 8, child + childSize, offset);
+					const list = expected.get(trackId) ?? [];
+					for (const range of ranges) {
+						expect(range.start).toBeGreaterThanOrEqual(payloadStart);
+						expect(range.start + range.size).toBeLessThanOrEqual(payloadEnd);
+						list.push(buffer.toString('hex', range.start, range.start + range.size));
+						accounted += range.size;
+					}
+					expected.set(trackId, list);
+				}
+				child += childSize;
+			}
+
+			// Measured from the moof the trafs fill the mdat exactly, which is what makes them the truth
+			expect(accounted, 'the trafs do not account for every mdat byte').toBe(payloadEnd - payloadStart);
+		}
+		offset += size;
+	}
+	expect(expected.size).toBe(2);
+
+	using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+	for (const track of await input.getTracks()) {
+		const got: string[] = [];
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			got.push(Buffer.from(packet.data).toString('hex'));
+		}
+		expect(got, `track ${track.id} read different bytes than its trafs name`).toEqual(expected.get(track.id));
+	}
+}, 60_000);
+
+/** Every fragment of a file, as the boxes themselves name it: which track, how many samples, what sizes. */
+const fragmentsOf = (buffer: Buffer) => {
+	const u32 = (offset: number) => buffer.readUInt32BE(offset);
+	const typeAt = (offset: number) => buffer.toString('latin1', offset + 4, offset + 8);
+
+	const fragments: {
+		mdat: { start: number; end: number };
+		trafs: { trackId: number; sizes: number[] }[];
+	}[] = [];
+
+	for (let offset = 0; offset + 8 <= buffer.length;) {
+		const size = u32(offset);
+		if (size < 8) {
+			break;
+		}
+		if (typeAt(offset) !== 'moof') {
+			offset += size;
+			continue;
+		}
+
+		const mdatOffset = offset + size;
+		if (mdatOffset + 8 > buffer.length || typeAt(mdatOffset) !== 'mdat') {
+			offset += size;
+			continue; // Not the moof/mdat pairing this check is about
+		}
+
+		const trafs: { trackId: number; sizes: number[] }[] = [];
+		for (let child = offset + 8; child + 8 <= offset + size;) {
+			const childSize = u32(child);
+			if (childSize < 8) {
+				break;
+			}
+			if (typeAt(child) === 'traf') {
+				let trackId = 0;
+				let defaultSampleSize = 0;
+				const sizes: number[] = [];
+
+				for (let box = child + 8; box + 8 <= child + childSize;) {
+					const boxSize = u32(box);
+					if (boxSize < 8) {
+						break;
+					}
+					const type = typeAt(box);
+					if (type === 'tfhd') {
+						const flags = u32(box + 8) & 0xffffff;
+						trackId = u32(box + 12);
+						let field = box + 16;
+						if (flags & 0x1) {
+							field += 8;
+						}
+						if (flags & 0x2) {
+							field += 4;
+						}
+						if (flags & 0x8) {
+							field += 4;
+						}
+						defaultSampleSize = (flags & 0x10) ? u32(field) : 0;
+					} else if (type === 'trun') {
+						const flags = u32(box + 8) & 0xffffff;
+						const count = u32(box + 12);
+						let field = box + 16;
+						if (flags & 0x1) {
+							field += 4;
+						}
+						if (flags & 0x4) {
+							field += 4;
+						}
+						for (let i = 0; i < count; i++) {
+							if (flags & 0x100) {
+								field += 4;
+							}
+							sizes.push((flags & 0x200) ? u32(field) : defaultSampleSize);
+							if (flags & 0x200) {
+								field += 4;
+							}
+							if (flags & 0x400) {
+								field += 4;
+							}
+							if (flags & 0x800) {
+								field += 4;
+							}
+						}
+					}
+					box += boxSize;
+				}
+
+				trafs.push({ trackId, sizes });
+			}
+			child += childSize;
+		}
+
+		fragments.push({ mdat: { start: mdatOffset + 8, end: mdatOffset + u32(mdatOffset) }, trafs });
+		offset += size;
+	}
+
+	return fragments;
+};
+
+// The demuxer resolving a traf's base differently from the rest of the library is silent: the offsets
+// stay in range, the samples decode, and only a comparison against the boxes sees it. It read one
+// fixture's audio out of the *following* fragment's mdat, and the only thing that catches that is which
+// mdat a sample came from - so this asks it of every fragmented file in the corpus. The traf sample
+// counts partition each track's packets by fragment, which is what says where a packet is allowed to be.
+test.each([
+	'bear-640x360-av_frag.mp4',
+	'bear-av1.mp4',
+	'encoder-push-aac.mp4',
+	'encoder-push-negative-ctts.mp4',
+	'encoder-push-trun-v0.mp4',
+	'fragments-without-keyframes.mp4',
+	'missing-tfdt.mp4',
+	'rotate-buck-bunny.mp4',
+	'639955605-b752f7ad-7ce8-43c2-8ae9-88e74c6ae696.mp4',
+])('%s reads every sample out of the fragment that names it', async (name) => {
+	const bytes = new Uint8Array(readFileSync(path.join(__dirname, '..', 'public', name)));
+	const buffer = Buffer.from(bytes);
+	const fragments = fragmentsOf(buffer);
+	expect(fragments.length).toBeGreaterThan(0);
+
+	using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+	const packets = new Map<number, Uint8Array[]>();
+	for (const track of await input.getTracks()) {
+		const got: Uint8Array[] = [];
+		try {
+			for await (const packet of new EncodedPacketSink(track).packets()) {
+				got.push(packet.data);
+			}
+		} catch (error) {
+			// An encrypted track hands back plaintext, which is not what its mdat holds, so placement
+			// cannot be asked of it. Checked rather than assumed: the file has to actually carry CENC.
+			if (!(error instanceof Error) || !/Encrypted media samples/.test(error.message)) {
+				throw error;
+			}
+			expect(
+				buffer.includes('senc') || buffer.includes('pssh') || buffer.includes('encv'),
+				`${name}: refused to decrypt but carries no CENC boxes`,
+			).toBe(true);
+			return;
+		}
+		packets.set(track.id, got);
+	}
+
+	const consumed = new Map<number, number>();
+	let checked = 0;
+
+	for (const fragment of fragments) {
+		for (const traf of fragment.trafs) {
+			const got = packets.get(traf.trackId);
+			if (got === undefined) {
+				continue; // A track the demuxer does not expose has no packets to place
+			}
+
+			const from = consumed.get(traf.trackId) ?? 0;
+			consumed.set(traf.trackId, from + traf.sizes.length);
+
+			// Hoisted, and the search resumes where the last sample was found: a traf's samples are laid
+			// out in order, so this is one pass over the mdat rather than one pass per sample
+			const within = buffer.subarray(fragment.mdat.start, fragment.mdat.end);
+			let searchFrom = 0;
+
+			for (let i = 0; i < traf.sizes.length; i++) {
+				const packet = got[from + i];
+				if (packet === undefined) {
+					continue; // Reported by the count assertion below rather than as a missing byte range
+				}
+
+				// Searched inside this fragment's mdat only, so a hit elsewhere cannot stand in for it
+				const at = within.indexOf(packet, searchFrom);
+				expect(
+					at,
+					`${name}: track ${traf.trackId} sample ${from + i} is not in the mdat that names it`,
+				).not.toBe(-1);
+				searchFrom = at + packet.byteLength;
+				checked++;
+			}
+		}
+	}
+
+	expect(checked).toBeGreaterThan(0);
+	for (const [trackId, count] of consumed) {
+		expect(packets.get(trackId)!.length, `${name}: track ${trackId} packet count`).toBe(count);
+	}
+}, 120_000);

@@ -612,11 +612,11 @@ test('the URL handed to librist carries the resolved peer', () => {
 		aesType: 128,
 		bandwidthKbps: 6000,
 	}))).toEqual({
-		buffer: '250',
-		profile: '0',
-		secret: 'hunter2',
+		'buffer': '250',
+		'profile': '0',
+		'secret': 'hunter2',
 		'aes-type': '128',
-		bandwidth: '6000',
+		'bandwidth': '6000',
 	});
 
 	// A listener binds the URL's ports instead of sending to them, which librist spells with a leading @

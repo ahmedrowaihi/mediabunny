@@ -303,10 +303,32 @@ const proresVariants = await createVariants(
 	},
 );
 
+// `turbores` is ESM-only - its `exports` states no `require` - so leaving it external made the CJS
+// bundle emit a `__require("turbores")` that no CommonJS consumer could resolve. It carries no native
+// addon, so it is inlined instead; `node-av` stays external because it does.
+const SERVER_EXTERNALS = ['mediabunny', 'node-av', 'node-av/*'];
+
 const serverVariants = await createVariants(
 	'packages/server/src/index.ts',
 	'MediabunnyServer',
 	'packages/server/dist/bundles/mediabunny-server',
+	'cjs',
+	{
+		platform: 'node',
+		external: SERVER_EXTERNALS,
+	},
+	{
+		platform: 'node',
+		external: SERVER_EXTERNALS,
+	},
+);
+
+// `packages: 'external'` keeps koffi out of the bundle: it loads a native addon at runtime, so inlining
+// it would break the platform-specific binary resolution it does for itself.
+const ristVariants = await createVariants(
+	'packages/rist/src/index.ts',
+	'MediabunnyRist',
+	'packages/rist/dist/bundles/mediabunny-rist',
 	'cjs',
 	{
 		platform: 'node',
@@ -330,6 +352,7 @@ const contexts = [
 	...flacEncoderVariants,
 	...proresVariants,
 	...serverVariants,
+	...ristVariants,
 ];
 
 if (process.argv[2] === '--watch') {

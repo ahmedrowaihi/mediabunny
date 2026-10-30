@@ -1244,14 +1244,18 @@ test('MPEG-TS: Many streams and one that never shows up', async () => {
 		}
 	}
 
+	const file = mpegTs(streams, [], {}, concatList(packets));
 	using input = new Input({
-		source: new BufferSource(mpegTs(streams, [], {}, concatList(packets))),
+		source: new BufferSource(file),
 		formats: ALL_FORMATS,
 	});
-	const start = performance.now();
+	// Bytes read, not elapsed time: the regression was re-scanning the stream, which shows up as
+	// multiples of the file, and a clock bound fails under load instead.
+	let readBytes = 0;
+	input.source.on('read', ({ start: a, end: b }) => readBytes += b - a);
 	await input.getTracks();
 
-	expect(performance.now() - start).toBeLessThan(1500);
+	expect(readBytes).toBeLessThan(3 * file.byteLength);
 });
 
 test('MPEG-TS: PES packets without data', async () => {
@@ -1531,6 +1535,8 @@ test('Ogg: Seeking across a region full of fake page headers', async () => {
 		await sink.getPacket(timestamp);
 	}
 
+	// Still a clock bound: these seeks read nothing from the source, so there is no work to count.
+	// Runs in ~40ms, so the margin absorbs load.
 	expect(performance.now() - start).toBeLessThan(1000);
 });
 
@@ -2249,6 +2255,7 @@ const concatList = (parts: Bytes[]) => {
 const u64le = (value: number) => u64(value).reverse();
 const u64 = (value: number) => [...u32(Math.floor(value / 2 ** 32)), ...u32(value >>> 0)];
 const u32le = (value: number) => u32(value).reverse();
+
 const u32 = (value: number) => [(value >>> 24) & 0xff, (value >>> 16) & 0xff, (value >>> 8) & 0xff, value & 0xff];
 const u24 = (value: number) => [(value >>> 16) & 0xff, (value >>> 8) & 0xff, value & 0xff];
 const u16le = (value: number) => u16(value).reverse();

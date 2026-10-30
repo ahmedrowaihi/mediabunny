@@ -8,7 +8,32 @@
 
 import { VideoSamplePixelFormat, MediaCodec } from 'mediabunny';
 import * as NodeAv from 'node-av';
+import { IOContext } from 'node-av';
+import { AVIO_FLAG_WRITE } from 'node-av/constants';
 import { _serverOptions } from './index';
+
+/**
+ * Satisfies a listening socket's parked accept by dialling it, which is the only way to end one: a native
+ * accept cannot be interrupted, so closing the context under it aborts the process. See FORK.md.
+ *
+ * @internal
+ */
+export const wakePendingAccept = async (url: string) => {
+	const target = new URL(url);
+	target.search = '';
+	if (target.hostname === '0.0.0.0' || target.hostname === '::' || target.hostname === '[::]') {
+		target.hostname = '127.0.0.1';
+	}
+
+	const peer = new IOContext();
+	try {
+		await peer.open2(target.toString(), AVIO_FLAG_WRITE);
+	} catch {
+		// The accept may have already failed or been satisfied; either way there is nothing to wake.
+	}
+
+	await peer.closep().catch(() => {});
+};
 
 export const CODEC_TO_CODEC_ID: Partial<Record<MediaCodec, NodeAv.AVCodecID>> = {
 	avc: NodeAv.AV_CODEC_ID_H264,

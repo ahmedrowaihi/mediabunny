@@ -5,6 +5,7 @@ import {
 	ALL_FORMATS,
 	BufferSource,
 	BufferTarget,
+	Conversion,
 	EncodedPacket,
 	EncodedPacketSink,
 	EncodedVideoPacketSource,
@@ -141,6 +142,38 @@ test('QuickTime nclc color information', async () => {
 		fullRange: undefined,
 	});
 	expect(await track.hasHighDynamicRange()).toBe(true);
+});
+
+test('H.264 video range is reported only where the stream signals it', async () => {
+	const open = (name: string) => new Input({
+		source: new FilePathSource(path.join(__dirname, `../public/${name}`)),
+		formats: ALL_FORMATS,
+	});
+	const colorSpaceOf = async (name: string) => {
+		using input = open(name);
+		const track = await input.getPrimaryVideoTrack();
+		assert(track);
+		return track.getColorSpace();
+	};
+	const remuxedHasColr = async (name: string) => {
+		using input = open(name);
+		const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+		const conversion = await Conversion.init({ input, output });
+		await conversion.execute();
+		return String.fromCharCode(...new Uint8Array(output.target.buffer!)).includes('colr');
+	};
+
+	expect((await colorSpaceOf('avc-range-unsignalled.mp4')).fullRange).toBeUndefined();
+	expect(await colorSpaceOf('avc-range-limited.mp4')).toEqual({
+		primaries: 'bt709',
+		transfer: 'bt709',
+		matrix: 'bt709',
+		fullRange: false,
+	});
+	expect((await colorSpaceOf('avc-range-full.mp4')).fullRange).toBe(true);
+
+	expect(await remuxedHasColr('avc-range-unsignalled.mp4')).toBe(false);
+	expect(await remuxedHasColr('avc-range-limited.mp4')).toBe(true);
 });
 
 // Annex B isn't supposed to exist in MP4, but some files have it anyway, with an empty avcC box

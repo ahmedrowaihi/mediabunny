@@ -10,6 +10,14 @@ import {
 	OggOutputFormat,
 	WavOutputFormat,
 } from '../../src/output-format.js';
+import {
+	CmafOutputFormat,
+	DashOutputFormat,
+	HlsOutputFormat,
+	WebMOutputFormat,
+} from '../../src/output-format.js';
+import { PathedTarget } from '../../src/target.js';
+import { EncodedVideoPacketSource } from '../../src/media-source.js';
 import { BufferTarget } from '../../src/target.js';
 import { EncodedAudioPacketSource } from '../../src/media-source.js';
 import { EncodedPacket } from '../../src/packet.js';
@@ -1085,4 +1093,190 @@ test('Creation time override in conversion', async () => {
 	const nullReadTags = await nullInput.getMetadataTags();
 
 	expect(nullReadTags.creationTime).toBeUndefined();
+});
+
+const SEGMENTED_MATRIX = [
+	{ name: 'HLS + CMAF', segmented: 'hls', segment: 'cmaf' },
+	{ name: 'HLS + WebM', segmented: 'hls', segment: 'webm' },
+	{ name: 'DASH + CMAF', segmented: 'dash', segment: 'cmaf' },
+	{ name: 'DASH + WebM', segmented: 'dash', segment: 'webm' },
+] as const;
+
+const writeSegmented = async (
+	segmented: 'hls' | 'dash',
+	segment: 'cmaf' | 'webm',
+	singleFilePerPlaylist: boolean,
+	setTags: ((output: Output) => void) | null,
+) => {
+	const files = new Map<string, Uint8Array>();
+	const output = new Output({
+		format: segmented === 'hls'
+			? new HlsOutputFormat({
+				segmentFormat: segment === 'cmaf' ? new CmafOutputFormat() : new WebMOutputFormat(),
+				singleFilePerPlaylist,
+			})
+			: new DashOutputFormat({
+				mpdPath: 'manifest.mpd',
+				segmentFormat: segment === 'cmaf' ? new CmafOutputFormat() : new WebMOutputFormat(),
+				singleFilePerPlaylist,
+			}),
+		target: new PathedTarget('manifest', (request) => {
+			const target = new BufferTarget();
+			target.on('finalized', () => files.set(request.path, new Uint8Array(target.buffer!)));
+			return target;
+		}),
+	});
+
+	setTags?.(output);
+
+	const codec = segment === 'cmaf' ? 'avc' : 'vp9';
+	const source = new EncodedVideoPacketSource(codec);
+	output.addVideoTrack(source, { frameRate: 10 });
+	await output.start();
+
+	const decoderConfig = {
+		codec: segment === 'cmaf' ? 'avc1.42001f' : 'vp09.00.10.08',
+		codedWidth: 320,
+		codedHeight: 240,
+		description: segment === 'cmaf'
+			? new Uint8Array([1, 66, 0, 31, 255, 225, 0, 4, 103, 66, 0, 31, 1, 0, 4, 104,
+				206, 60, 128])
+			: undefined,
+	};
+	for (let i = 0; i < 20; i++) {
+		await source.add(
+			new EncodedPacket(new Uint8Array(256).fill(i), i % 10 === 0 ? 'key' : 'delta', i * 0.1, 0.1),
+			i === 0 ? { decoderConfig } : undefined,
+		);
+	}
+	await output.finalize();
+
+	// The manifest carries its own generation timestamp in some profiles, so compare only the media.
+	return new Map([...files].filter(([p]) => !p.endsWith('.m3u8') && !p.endsWith('.mpd')));
+};
+
+// mvhd is the first box inside moov, so its payload starts 8 bytes in; creation_time follows the
+// version/flags word, 32-bit in version 0 and 64-bit in version 1.
+const mvhdCreationTimes = (bytes: Uint8Array) => {
+	const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+	const found: number[] = [];
+	for (let i = 0; i + 20 < bytes.length; i++) {
+		if (view.getUint32(i) !== 0x6d766864) { // 'mvhd'
+			continue;
+		}
+		const version = bytes[i + 4]!;
+		found.push(version === 1 ? Number(view.getBigUint64(i + 8)) : view.getUint32(i + 8));
+	}
+	return found;
+};
+
+const mapsEqual = (a: Map<string, Uint8Array>, b: Map<string, Uint8Array>) => {
+	expect([...b.keys()]).toEqual([...a.keys()]);
+	for (const [path, bytes] of a) {
+		expect({ path, bytes }).toEqual({ path, bytes: b.get(path) });
+	}
+};
+
+// Regression: every inner Output the segment pipeline opens writes its own init, and they used to get no
+// tags at all — so creationTime fell back to `new Date()` per segment and the same input never produced
+// the same bytes twice. The 1.1s gap is what makes an unfixed run differ, since mvhd has 1s resolution.
+for (const { name, segmented, segment } of SEGMENTED_MATRIX) {
+	for (const singleFile of [false, true]) {
+		// Rejected at construction, with its own test below.
+		if (singleFile && segmented === 'dash' && segment === 'webm') {
+			continue;
+		}
+
+		const label = `${name}, singleFilePerPlaylist: ${singleFile}`;
+
+		test(`${label} is byte-reproducible with a stated creationTime`, { timeout: 30_000 }, async () => {
+			const first = await writeSegmented(segmented, segment, singleFile,
+				output => output.setMetadataTags({ creationTime: new Date(0) }));
+			await new Promise(resolve => setTimeout(resolve, 1100));
+			const second = await writeSegmented(segmented, segment, singleFile,
+				output => output.setMetadataTags({ creationTime: new Date(0) }));
+
+			expect(first.size).toBeGreaterThan(0);
+			mapsEqual(first, second);
+
+			if (segment === 'cmaf') {
+				const times = [...first.values()].flatMap(bytes => mvhdCreationTimes(bytes));
+				expect(times.length).toBeGreaterThan(0);
+				expect([...new Set(times)]).toEqual([2082844800]); // 1970-01-01 in the MP4 epoch
+			}
+		});
+
+		// The control for the test above: without the tag the clock still reaches the file, so a run that
+		// cannot tell the two apart is not testing anything.
+		test(`${label} differs between writes without a creationTime`, { timeout: 30_000 }, async () => {
+			const first = await writeSegmented(segmented, segment, singleFile, null);
+			await new Promise(resolve => setTimeout(resolve, 1100));
+			const second = await writeSegmented(segmented, segment, singleFile, null);
+
+			expect([...second.keys()]).toEqual([...first.keys()]);
+			const differing = [...first].filter(([path, bytes]) => !bytes.every(
+				(byte, i) => byte === second.get(path)![i],
+			));
+			expect(differing.length).toBeGreaterThan(0);
+		});
+
+		test(`${label} writes a zero creation time for creationTime: null`, { timeout: 30_000 }, async () => {
+			const files = await writeSegmented(segmented, segment, singleFile,
+				output => output.setMetadataTags({ creationTime: null }));
+
+			if (segment === 'cmaf') {
+				const times = [...files.values()].flatMap(bytes => mvhdCreationTimes(bytes));
+				expect(times.length).toBeGreaterThan(0);
+				expect([...new Set(times)]).toEqual([0]);
+			} else {
+				// Matroska writes no DateUTC element at all, so a second write must still match byte for byte.
+				await new Promise(resolve => setTimeout(resolve, 1100));
+				mapsEqual(files, await writeSegmented(segmented, segment, singleFile,
+					output => output.setMetadataTags({ creationTime: null })));
+			}
+		});
+	}
+}
+
+// The combination used to reach `buildSingleFileBase`, whose `assert(playlist.initSegment)` surfaced to
+// the caller as a bare 'Assertion failed.'
+test('DASH rejects singleFilePerPlaylist with segments that write no initialization range', () => {
+	expect(() => new DashOutputFormat({
+		mpdPath: 'manifest.mpd',
+		segmentFormat: new WebMOutputFormat(),
+		singleFilePerPlaylist: true,
+	})).toThrow(/singleFilePerPlaylist is not supported with WebM segments/);
+
+	// Mixed with a supported one, the unsupported member still has to be named.
+	expect(() => new DashOutputFormat({
+		mpdPath: 'manifest.mpd',
+		segmentFormat: [new CmafOutputFormat(), new WebMOutputFormat()],
+		singleFilePerPlaylist: true,
+	})).toThrow(TypeError);
+
+	// A plain MP4 is ISOBMFF but writes no separate init, and used to reach the same assertion.
+	expect(() => new DashOutputFormat({
+		mpdPath: 'manifest.mpd',
+		segmentFormat: new Mp4OutputFormat({}),
+		singleFilePerPlaylist: true,
+	})).toThrow(/not supported with MP4 segments/);
+
+	// Fragmented MP4 does write one, so it stays allowed.
+	expect(() => new DashOutputFormat({
+		mpdPath: 'manifest.mpd',
+		segmentFormat: new Mp4OutputFormat({ fastStart: 'fragmented' }),
+		singleFilePerPlaylist: true,
+	})).not.toThrow();
+
+	// Still allowed where an init range exists, and where there is no single file to address into.
+	expect(() => new DashOutputFormat({
+		mpdPath: 'manifest.mpd',
+		segmentFormat: new CmafOutputFormat(),
+		singleFilePerPlaylist: true,
+	})).not.toThrow();
+	expect(() => new DashOutputFormat({
+		mpdPath: 'manifest.mpd',
+		segmentFormat: new WebMOutputFormat(),
+		singleFilePerPlaylist: false,
+	})).not.toThrow();
 });

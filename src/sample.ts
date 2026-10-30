@@ -34,6 +34,7 @@ import {
 	DeepReadonly,
 } from './misc';
 import { Logging } from './logging';
+import { type ClosedCaptionBytePair, validateClosedCaptionBytePairs } from './closed-captions';
 
 polyfillSymbolDispose();
 
@@ -239,9 +240,28 @@ export type VideoSampleInit = {
 	displayHeight?: number | undefined;
 	/** The encode options to use when this sample is passed to an encoder. */
 	encodeOptions?: DeepReadonly<VideoEncoderEncodeOptions>;
+	/**
+	 * The closed-caption byte pairs this frame carries. An encoder writes them into the encoded packet as an
+	 * ATSC A/53 SEI message; a decoder states the ones it found in the bitstream — which needs a decoder that
+	 * surfaces them, so `@mediabunny/server`'s does and WebCodecs, which exposes no A/53 side data, does not.
+	 */
+	closedCaptions?: DeepReadonly<ClosedCaptionBytePair[]> | null;
+	/**
+	 * The Dolby Vision RPU NAL unit this frame carries, complete with its NAL header and
+	 * emulation-prevention bytes, and without a start code or length prefix — what reading a NAL of type
+	 * 62 out of an HEVC access unit gives. An encoder writes it back ahead of the frame's VCL NAL units.
+	 */
+	dolbyVisionRpu?: Uint8Array | null;
 
 	/** @internal */
 	_doNotCopy?: boolean;
+};
+
+// A transformer is free to carry over part of the source's color (FFmpeg's filter graph keeps transfer and matrix
+// but loses primaries), so state nothing rather than a half-stale claim about re-rendered pixels.
+const dropColorSpace = (sample: VideoSample) => {
+	(sample as { colorSpace: VideoSampleColorSpace }).colorSpace = new VideoSampleColorSpace();
+	return sample;
 };
 
 /**
@@ -297,6 +317,16 @@ export class VideoSample implements Disposable {
 	readonly colorSpace!: VideoSampleColorSpace;
 	/** The encode options to use when this sample is passed to an encoder. */
 	readonly encodeOptions!: DeepReadonly<VideoEncoderEncodeOptions>;
+	/**
+	 * The closed-caption byte pairs this frame carries, or `null` when it carries none. Captions ride in the
+	 * video bitstream rather than in a track of their own, so they belong to the frame.
+	 */
+	readonly closedCaptions!: DeepReadonly<ClosedCaptionBytePair[]> | null;
+	/**
+	 * The Dolby Vision RPU NAL unit this frame carries, or `null` when it carries none. Like the captions,
+	 * it rides in the video bitstream rather than in a track of its own, so it belongs to the frame.
+	 */
+	readonly dolbyVisionRpu!: Uint8Array | null;
 
 	/** The width of the frame in pixels. */
 	get codedWidth() {
@@ -698,6 +728,15 @@ export class VideoSample implements Disposable {
 
 		this.encodeOptions = init?.encodeOptions ?? {};
 
+		if (init?.closedCaptions !== undefined && init.closedCaptions !== null) {
+			validateClosedCaptionBytePairs(init.closedCaptions, 'init.closedCaptions');
+		}
+		this.closedCaptions = init?.closedCaptions ?? null;
+		if (init?.dolbyVisionRpu != null && !(init.dolbyVisionRpu instanceof Uint8Array)) {
+			throw new TypeError('init.dolbyVisionRpu, when provided, must be a Uint8Array or null.');
+		}
+		this.dolbyVisionRpu = init?.dolbyVisionRpu ?? null;
+
 		this.pixelAspectRatio = simplifyRational({
 			num: this.squarePixelWidth * this.codedHeight,
 			den: this.squarePixelHeight * this.codedWidth,
@@ -720,6 +759,8 @@ export class VideoSample implements Disposable {
 				rotation: this.rotation,
 				flip: this.flip,
 				encodeOptions: this.encodeOptions,
+				closedCaptions: this.closedCaptions,
+				dolbyVisionRpu: this.dolbyVisionRpu,
 			});
 		} else if (isVideoFrame(this._data)) {
 			return new VideoSample(this._data.clone(), {
@@ -728,6 +769,8 @@ export class VideoSample implements Disposable {
 				rotation: this.rotation,
 				flip: this.flip,
 				encodeOptions: this.encodeOptions,
+				closedCaptions: this.closedCaptions,
+				dolbyVisionRpu: this.dolbyVisionRpu,
 			});
 		} else if (this._data instanceof Uint8Array) {
 			assert(this._layout);
@@ -746,6 +789,8 @@ export class VideoSample implements Disposable {
 				displayWidth: this.displayWidth,
 				displayHeight: this.displayHeight,
 				encodeOptions: this.encodeOptions,
+				closedCaptions: this.closedCaptions,
+				dolbyVisionRpu: this.dolbyVisionRpu,
 
 				// It's already been copied, if we copy it again we make the clone unnecessarily expensive
 				_doNotCopy: true,
@@ -764,6 +809,8 @@ export class VideoSample implements Disposable {
 				displayWidth: this.displayWidth,
 				displayHeight: this.displayHeight,
 				encodeOptions: this.encodeOptions,
+				closedCaptions: this.closedCaptions,
+				dolbyVisionRpu: this.dolbyVisionRpu,
 			});
 		}
 	}
@@ -1561,6 +1608,9 @@ export class VideoSample implements Disposable {
 	 * Transform this video sample to a new video sample given the options. Can be used to resize, rotate, flip, and
 	 * crop the sample.
 	 *
+	 * The returned sample has an empty color space: its pixels have been re-rendered, so this sample's color space no
+	 * longer describes them.
+	 *
 	 * In non-browser environments, this method will not work by default. To make it work, register a custom
 	 * transformer function via {@link registerVideoSampleTransformer}.
 	 */
@@ -1666,7 +1716,10 @@ export class VideoSample implements Disposable {
 			if (isThenable(result)) result = await result;
 
 			if (result !== null) {
-				return result;
+				// A transformer builds its own sample, so the invariant holds here rather than in each of them
+				result.setClosedCaptions(this.closedCaptions);
+				result.setDolbyVisionRpu(this.dolbyVisionRpu);
+				return dropColorSpace(result);
 			}
 		}
 
@@ -1683,13 +1736,16 @@ export class VideoSample implements Disposable {
 			fillBlack: description.alpha === 'discard',
 		});
 
-		return new VideoSample(canvas, {
+		return dropColorSpace(new VideoSample(canvas, {
 			timestamp: this.timestamp,
 			duration: this.duration,
 			// Any previous rotation and flip are now baked in
 			rotation: 0,
 			flip: false,
-		});
+			// A geometric transform does not change what is in the picture
+			closedCaptions: this.closedCaptions,
+			dolbyVisionRpu: this.dolbyVisionRpu,
+		}));
 	}
 
 	/** Sets the rotation metadata of this video sample. */
@@ -1740,6 +1796,26 @@ export class VideoSample implements Disposable {
 
 		// eslint-disable-next-line @typescript-eslint/no-unnecessary-type-assertion
 		(this.encodeOptions as DeepReadonly<VideoEncoderEncodeOptions>) = newEncodeOptions;
+	}
+
+	/** Sets the Dolby Vision RPU NAL unit this frame carries. */
+	setDolbyVisionRpu(newRpu: Uint8Array | null) {
+		if (newRpu !== null && !(newRpu instanceof Uint8Array)) {
+			throw new TypeError('newRpu must be a Uint8Array or null.');
+		}
+
+		// eslint-disable-next-line @typescript-eslint/no-unnecessary-type-assertion
+		(this.dolbyVisionRpu as Uint8Array | null) = newRpu;
+	}
+
+	/** Sets the closed-caption byte pairs this frame carries. */
+	setClosedCaptions(newClosedCaptions: DeepReadonly<ClosedCaptionBytePair[]> | null) {
+		if (newClosedCaptions !== null) {
+			validateClosedCaptionBytePairs(newClosedCaptions, 'newClosedCaptions');
+		}
+
+		// eslint-disable-next-line @typescript-eslint/no-unnecessary-type-assertion
+		(this.closedCaptions as DeepReadonly<ClosedCaptionBytePair[]> | null) = newClosedCaptions;
 	}
 
 	/** Calls `.close()`. */

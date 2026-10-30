@@ -58,6 +58,9 @@ export enum HevcNalUnitType {
 	RASL_N = 8,
 	RASL_R = 9,
 	BLA_W_LP = 16,
+	IDR_W_RADL = 19,
+	IDR_N_LP = 20,
+	CRA_NUT = 21,
 	RSV_IRAP_VCL23 = 23,
 	VPS_NUT = 32,
 	SPS_NUT = 33,
@@ -146,9 +149,12 @@ export const iterateNalUnitsInLengthPrefixed = function* (
 
 		offset += lengthSize;
 
+		// A length prefix is publisher-controlled and need not describe bytes that are there: all-0xFF data
+		// claims a 4 GiB NAL. Consumers that size buffers from this (the CENC subsample generator) would
+		// turn a few KiB of input into megabytes of output, so never promise more than the packet holds.
 		yield {
 			offset,
-			length: nalUnitLength,
+			length: Math.min(nalUnitLength, packetData.length - offset),
 		};
 
 		offset += nalUnitLength;
@@ -171,7 +177,8 @@ export const extractNalUnitTypeForAvc = (byte: number) => {
 	return byte & 0x1F;
 };
 
-const removeEmulationPreventionBytes = (data: Uint8Array) => {
+/** @internal */
+export const removeEmulationPreventionBytes = (data: Uint8Array) => {
 	const result = new Uint8Array(data.length); // The result can only be shorter
 	const len = data.length;
 	let resultLength = 0;
@@ -529,7 +536,7 @@ export type AvcSpsInfo = {
 	colourPrimaries: number;
 	transferCharacteristics: number;
 	matrixCoefficients: number;
-	fullRangeFlag: number;
+	fullRangeFlag: number | null;
 	numReorderFrames: number;
 	maxDecFrameBuffering: number;
 	vuiParametersFlagBitOffset: number;
@@ -692,7 +699,7 @@ export const parseAvcSps = (sps: Uint8Array): AvcSpsInfo | null => {
 		let colourPrimaries = 2;
 		let transferCharacteristics = 2;
 		let matrixCoefficients = 2;
-		let fullRangeFlag = 0;
+		let fullRangeFlag: number | null = null;
 		let pixelAspectRatio: Rational = { num: 1, den: 1 };
 
 		let numReorderFrames: number | null = null;
@@ -949,7 +956,8 @@ export type HevcSpsInfo = {
 	colourPrimaries: number;
 	transferCharacteristics: number;
 	matrixCoefficients: number;
-	fullRangeFlag: number;
+	fullRangeFlag: number | null;
+	numReorderFrames: number;
 	maxDecFrameBuffering: number;
 	spsMaxSubLayersMinus1: number;
 	spsTemporalIdNestingFlag: number;
@@ -968,25 +976,22 @@ export type HevcSpsInfo = {
 export const concatHevcNalUnits = (nalUnits: Uint8Array[], decoderConfig: VideoDecoderConfig) => {
 	if (decoderConfig.description) {
 		// Stream is length-prefixed. Let's extract the size of the length prefix from the decoder config
-
-		const bytes = toUint8Array(decoderConfig.description);
-		const lengthSizeMinusOne = bytes[21]! & 0b11;
-		const lengthSize = (lengthSizeMinusOne + 1) as 1 | 2 | 3 | 4;
-
-		return concatNalUnitsInLengthPrefixed(nalUnits, lengthSize);
+		return concatNalUnitsInLengthPrefixed(nalUnits, hevcNalUnitLengthSize(decoderConfig.description));
 	} else {
 		// Stream is in Annex B format
 		return concatNalUnitsInAnnexB(nalUnits);
 	}
 };
 
+/** The NAL unit length prefix size declared by an HEVCDecoderConfigurationRecord. @internal */
+export const hevcNalUnitLengthSize = (description: AllowSharedBufferSource): 1 | 2 | 3 | 4 => {
+	const bytes = toUint8Array(description);
+	return ((bytes[21]! & 0b11) + 1) as 1 | 2 | 3 | 4;
+};
+
 export const iterateHevcNalUnits = (packetData: Uint8Array, decoderConfig: VideoDecoderConfig) => {
 	if (decoderConfig.description) {
-		const bytes = toUint8Array(decoderConfig.description);
-		const lengthSizeMinusOne = bytes[21]! & 0b11;
-		const lengthSize = (lengthSizeMinusOne + 1) as 1 | 2 | 3 | 4;
-
-		return iterateNalUnitsInLengthPrefixed(packetData, lengthSize);
+		return iterateNalUnitsInLengthPrefixed(packetData, hevcNalUnitLengthSize(decoderConfig.description));
 	} else {
 		return iterateNalUnitsInAnnexB(packetData);
 	}
@@ -1110,7 +1115,7 @@ export const parseHevcSps = (sps: Uint8Array): HevcSpsInfo | null => {
 		let colourPrimaries = 2;
 		let transferCharacteristics = 2;
 		let matrixCoefficients = 2;
-		let fullRangeFlag = 0;
+		let fullRangeFlag: number | null = null;
 		let minSpatialSegmentationIdc = 0;
 		let pixelAspectRatio: Rational = { num: 1, den: 1 };
 
@@ -1135,6 +1140,7 @@ export const parseHevcSps = (sps: Uint8Array): HevcSpsInfo | null => {
 			// Can't exceed MaxDpbSize, which is at most 16. Bigger values would make us buffer absurd amounts of
 			// frames
 			maxDecFrameBuffering: Math.min(spsMaxNumReorderPics + 1, 16),
+			numReorderFrames: Math.min(spsMaxNumReorderPics, 16),
 			spsMaxSubLayersMinus1,
 			spsTemporalIdNestingFlag,
 			generalProfileSpace: general_profile_space,
@@ -1292,7 +1298,8 @@ export const extractHevcDecoderConfigurationRecord = (packetData: Uint8Array) =>
 	}
 };
 
-const parseProfileTierLevel = (
+/** @internal */
+export const parseProfileTierLevel = (
 	bitstream: Bitstream,
 	maxNumSubLayersMinus1: number,
 ) => {
@@ -1364,7 +1371,8 @@ const skipAllStRefPicSets = (bitstream: Bitstream, num_short_term_ref_pic_sets: 
 	}
 };
 
-const skipStRefPicSet = (
+/** @internal */
+export const skipStRefPicSet = (
 	bitstream: Bitstream,
 	stRpsIdx: number,
 	num_short_term_ref_pic_sets: number,
@@ -1418,7 +1426,7 @@ const parseHevcVui = (bitstream: Bitstream, sps_max_sub_layers_minus1: number) =
 	let colourPrimaries = 2;
 	let transferCharacteristics = 2;
 	let matrixCoefficients = 2;
-	let fullRangeFlag = 0;
+	let fullRangeFlag: number | null = null;
 	let minSpatialSegmentationIdc = 0;
 	let pixelAspectRatio: Rational = { num: 1, den: 1 };
 

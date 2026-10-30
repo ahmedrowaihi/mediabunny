@@ -14,6 +14,7 @@ import {
 	Input,
 	Logging,
 	LogLevel,
+	RetryTimeoutError,
 	UrlSource,
 } from '../../src/index.js';
 
@@ -299,6 +300,46 @@ test('UrlSource reads the full decoded body of a compressed 206 response', async
 	}
 });
 
+test('UrlSource prefetches growing blocks when a file is read back to front', async () => {
+	const fileSize = 16 * 2 ** 20;
+	let requestCount = 0;
+
+	const server = http.createServer((req, res) => {
+		requestCount++;
+
+		const match = /bytes=(\d+)-(\d*)/.exec(req.headers.range ?? '');
+		assert(match);
+		const start = Number(match[1]);
+		const end = match[2] ? Math.min(Number(match[2]) + 1, fileSize) : fileSize;
+
+		res.on('error', () => {}); // The client may abort the connection at any time
+		res.writeHead(206, {
+			'Content-Length': end - start,
+			'Content-Range': `bytes ${start}-${end - 1}/${fileSize}`,
+		});
+		res.end(Buffer.alloc(end - start));
+	});
+	await new Promise<void>(resolve => server.listen(0, resolve));
+
+	try {
+		const address = server.address();
+		assert(address && typeof address !== 'string');
+		const source = new UrlSource(`http://localhost:${address.port}/file`);
+		using ref = source.ref();
+		const reader = new Reader(ref.source);
+
+		// Like a demuxer rewinding packet by packet, 8 MiB back from the end
+		for (let pos = fileSize - 188; pos >= fileSize - 8 * 2 ** 20; pos -= 188) {
+			await reader.requestSlice(pos, 4);
+		}
+
+		expect(requestCount).toBeLessThanOrEqual(20);
+	} finally {
+		server.closeAllConnections();
+		server.close();
+	}
+});
+
 const startRangelessServer = async (
 	options: { responseByteLimits?: number[]; trailingPaddingSize?: number } = {},
 ) => {
@@ -417,3 +458,123 @@ const captureLogs = () => {
 		},
 	};
 };
+
+/** A port nothing listens on, so a connect is refused at once rather than hanging. */
+const closedPort = async () => {
+	const server = http.createServer();
+	await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+	const { port } = server.address() as { port: number };
+	await new Promise<void>(resolve => server.close(() => resolve()));
+	return port;
+};
+
+test('a read against a closed port rejects instead of retrying forever', async () => {
+	// The default getRetryDelay returns a delay for every failure and never null, so without a budget
+	// this read never settles and a caller has no rejection to handle.
+	using input = new Input({
+		source: new UrlSource(`http://127.0.0.1:${await closedPort()}/video.mp4`, { retryTimeout: 1 }),
+		formats: ALL_FORMATS,
+	});
+
+	const startedAt = Date.now();
+	await expect(input.getFormat()).rejects.toThrow(RetryTimeoutError);
+	expect(Date.now() - startedAt).toBeLessThan(20_000);
+});
+
+test('the rejection carries the failure that ended it', async () => {
+	using input = new Input({
+		source: new UrlSource(`http://127.0.0.1:${await closedPort()}/video.mp4`, { retryTimeout: 0 }),
+		formats: ALL_FORMATS,
+	});
+
+	const error = await input.getFormat().then(() => null, (thrown: unknown) => thrown);
+	assert(error instanceof RetryTimeoutError);
+	expect((error as { cause?: unknown }).cause).toBeInstanceOf(Error);
+});
+
+test('retryTimeout: null still retries, and disposing stops it', async () => {
+	let calls = 0;
+	const fetchFn = () => {
+		calls++;
+		return Promise.reject(new TypeError('fetch failed'));
+	};
+
+	const input = new Input({
+		source: new UrlSource('http://127.0.0.1:1/video.mp4', { fetchFn, retryTimeout: null }),
+		formats: ALL_FORMATS,
+	});
+
+	const settled = input.getFormat().then(() => 'resolved', () => 'rejected');
+	while (calls < 2) {
+		await new Promise(resolve => setTimeout(resolve, 50));
+	}
+
+	const callsAtDispose = calls;
+	input.dispose();
+	expect(await settled).toBe('rejected');
+
+	// The loop is over, not merely abandoned: nothing fetches after the dispose
+	await new Promise(resolve => setTimeout(resolve, 2500));
+	expect(calls).toBe(callsAtDispose);
+});
+
+test('a retry loop ends when the last holder lets go, and not before', async () => {
+	// free() is the documented lifecycle handle, so it has to end an in-flight retry — a read that
+	// outlives its source is a socket and a timer per abandoned request on a server. But Input takes a
+	// ref of its own, so an extra ref going away must *not* stop a read the Input is still waiting on.
+	let calls = 0;
+	const fetchFn = () => {
+		calls++;
+		return Promise.reject(new TypeError('fetch failed'));
+	};
+
+	const source = new UrlSource('http://127.0.0.1:1/video.mp4', { fetchFn, retryTimeout: null });
+	const extraRef = source.ref();
+	const input = new Input({ source, formats: ALL_FORMATS });
+
+	const settled = input.getFormat().then(() => 'resolved', () => 'rejected');
+	while (calls < 2) {
+		await new Promise(resolve => setTimeout(resolve, 50));
+	}
+
+	// Input still holds its own ref, so this one going away changes nothing
+	const callsAtFree = calls;
+	extraRef.free();
+	expect(source._disposed).toBe(false);
+	await new Promise(resolve => setTimeout(resolve, 1500));
+	expect(calls).toBeGreaterThan(callsAtFree);
+
+	// The last ref goes with the Input, and now the loop is over rather than abandoned
+	input.dispose();
+	expect(await settled).toBe('rejected');
+	expect(source._disposed).toBe(true);
+
+	const callsAtDispose = calls;
+	await new Promise(resolve => setTimeout(resolve, 2500));
+	expect(calls).toBe(callsAtDispose);
+});
+
+test('a request that is accepted and never answered is abandoned, not waited on', async () => {
+	// retryTimeout bounds failing requests; this one never fails, so without a per-request deadline
+	// the read hangs for as long as the socket stays open.
+	const hanging = http.createServer(() => { /* accept, never respond */ });
+	await new Promise<void>(resolve => hanging.listen(0, '127.0.0.1', resolve));
+	const { port } = hanging.address() as { port: number };
+
+	try {
+		using input = new Input({
+			source: new UrlSource(`http://127.0.0.1:${port}/video.mp4`, {
+				requestTimeout: 1,
+				retryTimeout: 3,
+			}),
+			formats: ALL_FORMATS,
+		});
+
+		const startedAt = Date.now();
+		await expect(input.getFormat()).rejects.toThrow(RetryTimeoutError);
+		expect(Date.now() - startedAt).toBeLessThan(30_000);
+	} finally {
+		hanging.closeAllConnections();
+		await new Promise<void>(resolve => hanging.close(() => resolve()));
+	}
+});

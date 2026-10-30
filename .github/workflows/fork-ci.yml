@@ -1,0 +1,55 @@
+# Upstream's lint, test and build-check workflows run on `main` and pull requests, so the branch this fork
+# publishes from is never checked by them. This runs the same gates the release is held to, on that branch.
+name: Fork CI
+
+on:
+  push:
+    branches:
+      - publish-ahmedrowaihi
+  workflow_dispatch:
+
+jobs:
+  gates:
+    name: Gates
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Add upstream remote
+        # `npm run check` compares the tree against upstream to catch an upstream line dropped by a rebase.
+        run: |
+          git remote add upstream https://github.com/Vanilagy/mediabunny.git
+          git fetch upstream main --depth=1000
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'npm'
+
+      - name: Install ffmpeg
+        # Three rtmp tests need the binary itself, and skip without it
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+
+      - name: Install dependencies
+        # With scripts, unlike the publish job: the suite needs node-av's native binary. The lock must be
+        # written with default peer resolution or `npm ci` rejects it here — see FORK.md.
+        run: npm ci
+
+      - name: Check types, lint and the deletion guard
+        run: |
+          npm run check
+          npm run lint
+
+      - name: Build
+        run: npm run build
+
+      - name: Check the docs generate
+        run: npm run docs:generate -- --dry
+
+      - name: Run tests
+        # xvfb, as upstream's test workflow does: the browser project drives a real Chrome.
+        run: xvfb-run npm test

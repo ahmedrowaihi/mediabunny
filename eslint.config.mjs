@@ -56,6 +56,7 @@ export default tseslint.config(
 			'eslint.config.mjs',
 			'docs/.vitepress/cache',
 			'test/public',
+			'test/fixtures',
 			'testfiles_temp'
 		]
 	}

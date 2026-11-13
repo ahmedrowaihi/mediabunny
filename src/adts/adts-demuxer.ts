@@ -68,6 +68,7 @@ export class AdtsDemuxer extends Demuxer {
 	lastSampleLoaded = false;
 	lastLoadedPos = 0;
 	nextTimestampInSamples = 0;
+	firstTimestamp = 0;
 
 	constructor(input: Input) {
 		super(input);
@@ -167,7 +168,8 @@ export class AdtsDemuxer extends Demuxer {
 		}
 
 		const sample: Sample = {
-			timestamp: this.nextTimestampInSamples / sampleRate,
+			// Zero unless the file's leading ID3 PRIV frame stated a transport-stream timestamp
+			timestamp: this.firstTimestamp + this.nextTimestampInSamples / sampleRate,
 			duration: SAMPLES_PER_AAC_FRAME / sampleRate,
 			dataStart: header.startPos,
 			dataSize: header.frameLength,
@@ -285,6 +287,10 @@ class AdtsAudioTrackBacking implements InputAudioTrackBacking {
 		assert(this.demuxer.firstFrameHeader);
 
 		return this.demuxer.firstFrameHeader.objectType;
+	}
+
+	getEncryptionInfo() {
+		return null;
 	}
 
 	getNumberOfChannels() {

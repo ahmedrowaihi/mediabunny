@@ -3,7 +3,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ALL_FORMATS, Input, FilePathSource, EncodedPacketSink } from '../../src/index.js';
 import { findUnderlyingFrameRate } from '../../src/input-track.js';
-import { assert } from '../../src/misc.js';
+import { assert, floorToDivisor } from '../../src/misc.js';
 
 test('findUnderlyingFrameRate with 30 FPS at 30 Hz time resolution', () => {
 	const ticks = makeTicks(30, 30);
@@ -193,3 +193,82 @@ const getSortedTrackTicks = async (filePath: string) => {
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const publicPath = (file: string) => path.join(__dirname, '../public', file);
+
+// Frame rate decimation. `transform.frameRate` assigns each incoming sample an output slot with
+// `floorToDivisor(timestamp, frameRate)` and encodes the first sample of each new slot, so the slot a
+// sample lands in is the whole of the frame selection. Timestamps are floats in seconds - a sample
+// carries no ticks by the time it reaches the encoder - and 1/25 is not exact in binary, so a time
+// mathematically on a slot boundary can land ulps below it and floor into the previous slot. That makes
+// the slot's opener source frame 2k + 1 rather than 2k, for 37 of 750 outputs on a 50 -> 25 minute.
+//
+// Which parity opens the slots depends on the source's own phase, so it is only 2k when the first
+// timestamp sits on the output grid. What must hold for every source is that the phase is constant and
+// that each slot is opened exactly once: a selection that wanders between 2k and 2k + 1 is the defect.
+
+/** Source frame `n`'s presentation time, as a demuxer computes it: integer ticks over the time base. */
+const frameTime = (startTicks: number, n: number, inRate: number, timeBase: number) =>
+	(startTicks + Math.round(n * timeBase / inRate)) / timeBase;
+
+/** Replays the selector: the source frames that open a new output slot, and the slots they opened. */
+const selectFrames = (
+	{ inRate, outRate, timeBase, start, frames }:
+	{ inRate: number; outRate: number; timeBase: number; start: number; frames: number },
+) => {
+	const startTicks = Math.round(start * timeBase);
+	const openers: number[] = [];
+	const slots: number[] = [];
+	let last: number | null = null;
+
+	for (let n = 0; n < frames; n++) {
+		const slot = floorToDivisor(frameTime(startTicks, n, inRate, timeBase), outRate);
+		if (last === null || slot > last) {
+			openers.push(n);
+			slots.push(slot);
+			last = slot;
+		}
+	}
+
+	return { openers, slots };
+};
+
+const halfRateCases = [
+	{ name: '50 -> 25', inRate: 50, outRate: 25, timeBases: [12800, 90000, 1000] },
+	{ name: '60 -> 30', inRate: 60, outRate: 30, timeBases: [15360, 90000] },
+	{ name: '60000/1001 -> 30000/1001', inRate: 60000 / 1001, outRate: 30000 / 1001, timeBases: [60000, 90000] },
+	{ name: '30 -> 15', inRate: 30, outRate: 15, timeBases: [30000] },
+];
+
+for (const { name, inRate, outRate, timeBases } of halfRateCases) {
+	for (const timeBase of timeBases) {
+		// 95443.7s is just under the 33-bit PCR wrap, and lands mid-slot at every one of these rates
+		for (const start of [0, 10, 95443.7]) {
+			test(`${name} at 1/${timeBase} from ${start}s halves the rate at a constant phase`, () => {
+				const frames = Math.floor(inRate * 60);
+				const { openers, slots } = selectFrames({ inRate, outRate, timeBase, start, frames });
+
+				// Every slot opened exactly once, so no frame pair collapses and no slot needs padding
+				for (let i = 1; i < slots.length; i++) {
+					expect(Math.round((slots[i]! - slots[i - 1]!) * outRate)).toBe(1);
+				}
+				expect(openers.length).toBeGreaterThanOrEqual(Math.floor(frames / 2));
+				expect(openers.length).toBeLessThanOrEqual(Math.floor(frames / 2) + 1);
+
+				// Frame 0 always emits, whatever its phase; the rest must agree on one
+				const parities = new Set(openers.slice(1).map(n => n % 2));
+				expect(parities.size).toBe(1);
+
+				// And on a source whose first frame is on the output grid, that phase is 2k
+				const onGrid = Number.isInteger(start * outRate);
+				expect(parities.has(0)).toBe(onGrid);
+			});
+		}
+	}
+}
+
+test('a gap gives its slot to the first frame at or after the boundary', () => {
+	const slotOf = (n: number) => floorToDivisor((n * 256) / 12800, 25);
+
+	// Frame 58 is the opener of slot 29; dropping it leaves 59, whose slot is the same
+	expect(slotOf(59)).toBe(slotOf(58));
+	expect(slotOf(59)).toBeGreaterThan(slotOf(57));
+});

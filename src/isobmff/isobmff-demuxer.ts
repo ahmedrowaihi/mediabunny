@@ -16,6 +16,7 @@ import {
 	extractAudioCodecString,
 	extractColorSpace,
 	extractVideoCodecString,
+	isMpeg2ObjectType,
 	MediaCodec,
 	OPUS_SAMPLE_RATE,
 	parsePcmCodec,
@@ -23,6 +24,8 @@ import {
 	PcmAudioCodec,
 	PRORES_FOURCCS,
 	ProresFourCc,
+	SubtitleCodec,
+	transferNeedsTenBits,
 	VideoCodec,
 } from '../codec';
 import {
@@ -30,10 +33,12 @@ import {
 	av1CodecInfoHasColorInfo,
 	AvcDecoderConfigurationRecord,
 	extractAv1CodecInfoFromPacket,
+	extractMpeg2CodecInfoFromPacket,
 	extractProresCodecInfoFromPacket,
 	extractVp9CodecInfoFromPacket,
 	FlacBlockType,
 	HevcDecoderConfigurationRecord,
+	Mpeg2CodecInfo,
 	ProresCodecInfo,
 	Vp9CodecInfo,
 	vp9CodecInfoHasColorInfo,
@@ -56,10 +61,15 @@ import {
 import { Demuxer } from '../demuxer';
 import { Input } from '../input';
 import {
+	DecodedSubtitleCue,
 	InputAudioTrackBacking,
+	InputSubtitleTrackBacking,
 	InputTrackBacking,
 	InputVideoTrackBacking,
+	type StartTimecode,
 } from '../input-track';
+import { extractTimecodeFromAvcSei, extractTimecodeFromHevcSei, startTimecodeOf } from '../timecode';
+import { parseTtmlDocument, SubtitleConfig } from '../subtitles';
 import { PacketRetrievalOptions } from '../media-sink';
 import {
 	assert,
@@ -91,9 +101,14 @@ import { EncodedPacket, PLACEHOLDER_DATA } from '../packet';
 import {
 	buildIsobmffMimeType,
 	parsePsshBoxContents,
+	parseSidxBoxContents,
 	psshBoxesAreEqual,
 	PsshBox,
+	SidxBox,
+	getSidxSegmentOffsets,
 	TIMESTAMP_OFFSET,
+	TrackEncryptionInfo,
+	TRACK_FRAGMENT_DESCRIPTION_INDEX_BASE,
 } from './isobmff-misc';
 import {
 	MAX_BOX_HEADER_SIZE,
@@ -102,7 +117,7 @@ import {
 	readDataBox,
 	readFixed_16_16,
 	readFixed_2_30,
-	readEsDescriptor,
+	readIsomVariableInteger,
 	readMetadataStringShort,
 } from './isobmff-reader';
 import {
@@ -125,6 +140,30 @@ import { AC3_SAMPLE_RATES } from '../../shared/ac3-misc';
 import { Bitstream } from '../../shared/bitstream';
 import { Aes128CbcContext } from '../aes';
 import { Logging } from '../logging';
+import {
+	type DoviConfig,
+	doviCodecString,
+	doviSupplementalFourCc,
+	parseDoviConfigRecord,
+} from '../dovi';
+import {
+	type HdrStaticMetadata,
+	type VideoDecoderConfigWithHdr,
+	extractSeiHdrMetadata,
+	parseContentLightLevel,
+	parseMasteringDisplayMetadata,
+} from '../hdr-metadata';
+
+/**
+ * AVC-Intra and XAVC video sample entries, lowercased. The names encode the class together with the
+ * raster and scan type — `ai5*` is AVC-Intra 50 on a subsampled raster, `ai1*` is 100 — and `AVin` is the
+ * variant whose parameter sets are implicit. Taken from FFmpeg's `ff_codec_movvideo_tags`.
+ */
+const AVC_INTRA_FOURCCS = new Set([
+	'ai5p', 'ai5q', 'ai52', 'ai53', 'ai55', 'ai56',
+	'ai1p', 'ai1q', 'ai12', 'ai13', 'ai15', 'ai16',
+	'aivx', 'avin',
+]);
 
 const TRUEHD_CHANNEL_ASSIGNMENT_COUNTS = [2, 1, 1, 2, 2, 2, 2, 1, 1, 2, 2, 1, 1];
 
@@ -157,11 +196,29 @@ type InternalTrack = {
 	editListPreviousSegmentDurations: number;
 	/** The media time offset of the main edit list entry (with media time !== -1) */
 	editListOffset: number;
+	/**
+	 * Ticks subtracted from every decode timestamp so nothing is presented before it is decoded;
+	 * 14496-12 8.6.1.3 allows signed composition offsets. `null` until derived.
+	 */
+	decodeTimestampShift: number | null;
+	/** Ticks per sample. `trex` is routinely zero, so the first `tfhd`'s value is taken and kept. */
+	sampleDurationForShift: number | null;
 	/** Set when the track's samples are encrypted using a supported scheme (cenc/cens/cbcs), parsed from sinf/tenc. */
 	encryptionInfo: TrackEncryptionInfo | null;
 	/** For non-fragmented encrypted tracks: parsed saiz+saio from stbl; aux info is fetched lazily on first use. */
 	encryptionAuxInfo: SampleEncryptionAuxInfo | null;
 	frmaCodecString: string | null;
+	/**
+	 * A QuickTime timecode track's own data: the sample description's fields and where its first sample
+	 * sits. Kept outside `info` because such a track is not one of the three kinds a caller sees.
+	 */
+	timecode: {
+		dropFrame: boolean;
+		timescale: number;
+		frameDuration: number;
+		framesPerSecond: number;
+		firstSampleOffset: number | null;
+	} | null;
 	/** In bits per second, from the btrt box if present. */
 	maxBitrate: number | null;
 	avgBitrate: number | null;
@@ -178,13 +235,18 @@ type InternalTrack = {
 		codecDescription: Uint8Array | null;
 		colorSpace: VideoColorSpaceInit;
 		avcType: 1 | 3 | null;
+		hevcType: 'hvc1' | 'hev1' | null;
 		avcCodecInfo: AvcDecoderConfigurationRecord | null;
-		hevcType: 'hev1' | 'hvc1' | null;
 		hevcCodecInfo: HevcDecoderConfigurationRecord | null;
 		vp9CodecInfo: Vp9CodecInfo | null;
 		av1CodecInfo: Av1CodecInfo | null;
+		mpeg2CodecInfo: Mpeg2CodecInfo | null;
 		proresCodecInfo: ProresCodecInfo | null;
 		proresFormat: ProresFourCc | null;
+		hdrStaticMetadata: HdrStaticMetadata | null;
+		/** The sample entry's depth field, whose 32 states an alpha channel. */
+		sampleEntryDepth: number | null;
+		doviConfig: DoviConfig | null;
 	};
 } | {
 	info: {
@@ -198,10 +260,17 @@ type InternalTrack = {
 		pcmLittleEndian: boolean;
 		pcmSampleSize: number | null;
 	};
+} | {
+	info: {
+		type: 'subtitle';
+		codec: SubtitleCodec | null;
+		config: SubtitleConfig | null;
+	};
 });
 
 type InternalVideoTrack = InternalTrack & {	info: { type: 'video' } };
 type InternalAudioTrack = InternalTrack & {	info: { type: 'audio' } };
+type InternalSubtitleTrack = InternalTrack & {	info: { type: 'subtitle' } };
 
 type SampleTable = {
 	sampleTimingEntries: SampleTimingEntry[];
@@ -253,6 +322,11 @@ type FragmentLookupTableEntry = {
 // Maintained for every track, even the ones we don't care about
 type FragmentTrackState = {
 	baseDataOffset: number;
+	/**
+	 * What to add to the base should its samples turn out to be measured from the `moof` after all, or
+	 * null where the `traf` named its base outright and there is nothing to second-guess.
+	 */
+	implicitBaseShift: number | null;
 	sampleDescriptionIndex: number | null;
 	defaultSampleDuration: number | null;
 	defaultSampleSize: number | null;
@@ -280,21 +354,27 @@ type FragmentTrackData = {
 	startTimestampIsFinal: boolean;
 	trunSampleCounts: number[];
 	encryptionAuxInfo: SampleEncryptionAuxInfo | null;
+	/** Carried from the traf's state so the fragment can be realigned once its true base is known. */
+	implicitBaseShift: number | null;
 };
 
 type FragmentTrackSample = {
 	presentationTimestamp: number;
+	decodeTimestamp: number;
 	duration: number;
 	byteOffset: number;
 	byteSize: number;
 	isKeyFrame: boolean;
 	encryption: SampleEncryptionInfo | null;
+	/** A `seig` sample group stated `is_protected = 0` for this sample, so the `tenc` default does not apply. */
+	unprotected: boolean;
 };
 
 type Fragment = {
 	moofOffset: number;
 	moofSize: number;
 	implicitBaseDataOffset: number;
+	basesRealigned: boolean;
 	trackData: Map<InternalTrack['id'], FragmentTrackData>;
 	psshBoxes: PsshBox[];
 	sampleCount: number;
@@ -305,15 +385,8 @@ type FragmentSummary = {
 	trackIds: Set<number>; // The tracks with samples in the fragment
 };
 
-type TrackEncryptionInfo = {
-	scheme: 'cenc' | 'cens' | 'cbcs';
-	defaultKid: string | null;
-	defaultIsProtected: boolean | null;
-	defaultPerSampleIvSize: number | null;
-	defaultConstantIv: Uint8Array | null;
-	defaultCryptByteBlock: number | null;
-	defaultSkipByteBlock: number | null;
-};
+/** `seig` entry fields up to and including `is_protected`; a complete one is 20 bytes plus any constant IV. */
+const SEIG_ENTRY_MIN_SIZE = 20;
 
 type SampleEncryptionInfo = {
 	iv: Uint8Array;
@@ -345,6 +418,8 @@ export class IsobmffDemuxer extends Demuxer {
 	currentTrack: InternalTrack | null = null;
 	tracks: InternalTrack[] = [];
 	idToTrack = new Map<number, InternalTrack>();
+	/** Timecode tracks' data, in file order; they carry a start timecode rather than media. */
+	timecodeTracks: NonNullable<InternalTrack['timecode']>[] = [];
 	metadataPromise: Promise<void> | null = null;
 	movieTimescale = -1;
 	movieDurationInTimescale = -1;
@@ -356,9 +431,14 @@ export class IsobmffDemuxer extends Demuxer {
 	isFragmented = false;
 	fragmentTrackDefaults = new Map<number, FragmentTrackDefaults>();
 	psshBoxes: PsshBox[] = [];
+	sidxBoxes: SidxBox[] = [];
 	currentFragment: Fragment | null = null;
 	isReadingTraf = false;
 	currentFragmentTrackState: FragmentTrackState | null = null;
+	/** `is_protected` per entry of the current `traf`'s own `sgpd`(`seig`), by zero-based entry index. */
+	currentTrafSeigEntries: boolean[] | null = null;
+	/** The current `traf`'s `sbgp`(`seig`) runs, applied once the `traf` is read: a `trun` may follow them. */
+	currentTrafSeigRuns: { sampleCount: number; descriptionIndex: number }[] | null = null;
 	/**
 	 * Caches the last fragment that was read. Based on the assumption that there will be multiple reads to the
 	 * same fragment in quick succession.
@@ -389,7 +469,8 @@ export class IsobmffDemuxer extends Demuxer {
 
 		const backings = await this.getTrackBackings();
 		const codecStrings = await Promise.all(backings.map(
-			x => x.getDecoderConfig().then(c => c?.codec ?? null),
+			async x => await x.getMetadataCodecParameterString?.()
+				?? await x.getDecoderConfig().then(c => c?.codec ?? null),
 		));
 
 		return buildIsobmffMimeType({
@@ -403,6 +484,16 @@ export class IsobmffDemuxer extends Demuxer {
 	async getMetadataTags() {
 		await this.readMetadata();
 		return this.metadataTags;
+	}
+
+	override async getSegmentIndex() {
+		await this.readMetadata();
+		return this.sidxBoxes;
+	}
+
+	override async getPsshBoxes() {
+		await this.readMetadata();
+		return this.psshBoxes;
 	}
 
 	readMetadata() {
@@ -425,6 +516,16 @@ export class IsobmffDemuxer extends Demuxer {
 				if ((boxInfo.name === 'ftyp' || boxInfo.name === 'styp') && slice.remainingLength >= 4) {
 					const majorBrand = readAscii(slice, 4);
 					this.isQuickTime = majorBrand === 'qt  ';
+				} else if (boxInfo.name === 'sidx') {
+					let sidxSlice = this.reader.requestSlice(slice.filePos, boxInfo.contentSize);
+					if (sidxSlice instanceof Promise) sidxSlice = await sidxSlice;
+					if (!sidxSlice) break;
+
+					this.sidxBoxes.push(parseSidxBoxContents(
+						readBytes(sidxSlice, boxInfo.contentSize),
+						startPos,
+						boxInfo.totalSize,
+					));
 				} else if (boxInfo.name === 'moov') {
 					// Found moov, load it
 
@@ -452,8 +553,14 @@ export class IsobmffDemuxer extends Demuxer {
 						&& this.reader.fileSize > startPos + boxInfo.totalSize; // There's more after the moov box
 					foundMovieBoxes = true;
 
-					break;
+					// No break: a `sidx` after `moov` (on-demand layout) is captured too
 				} else if (boxInfo.name === 'moof') {
+					if (this.movieTimescale !== -1) {
+						// `moov` was already parsed earlier in the same file; the rest is
+						// fragments which are read lazily.
+						break;
+					}
+
 					if (!this.input._initInput) {
 						throw new Error(
 							'"moof" box encountered with no "moov" box present; this file is likely a Segment as'
@@ -514,6 +621,8 @@ export class IsobmffDemuxer extends Demuxer {
 				}
 			}
 
+			this.seedFragmentLookupTablesFromSidx();
+
 			for (const track of this.tracks) {
 				// Sort by timestamp in case it's not naturally sorted, and remove multiple entries for the same time
 				const table = track.fragmentLookupTable;
@@ -528,6 +637,74 @@ export class IsobmffDemuxer extends Demuxer {
 				table.length = writeIndex;
 			}
 		})();
+	}
+
+	/**
+	 * A `sidx` indexes every subsegment by duration and byte size, which is exactly what a fragment
+	 * lookup table holds. Without this, a fragmented file that carries a `sidx` but no `mfra` (the
+	 * DASH on-demand / CMAF layout) has an empty lookup table, so every seek — including the
+	 * `getPacket(Infinity)` behind `computeDuration()` — walks the file `moof` by `moof` from byte 0.
+	 *
+	 * `tfra` wins where both are present: it addresses individual fragments rather than subsegments.
+	 *
+	 * The offsets this derives are checked against what is actually at them, but the timestamps are
+	 * not checkable: a fragment stating no `tfdt` has no other source for its decode time. Walking to
+	 * one takes the neighbour's measured end instead, so only a fragment reached by JUMPING inherits
+	 * what the index claims — which makes `computeDuration()` answer differently before and after a
+	 * full read of such a file. Dropping the claim is not the fix: without it a cold jump has no
+	 * timestamp at all, and an honest file reports a duration far shorter than its own.
+	 */
+	private seedFragmentLookupTablesFromSidx() {
+		const entriesByTrack = new Map<InternalTrack, FragmentLookupTableEntry[]>();
+
+		for (const sidx of this.sidxBoxes) {
+			const offsets = getSidxSegmentOffsets(sidx);
+
+			// A subsegment boundary is a `moof` boundary, and every track in the fragment shares that
+			// `moof` — so an index naming one track locates the fragments of all of them.
+			for (const track of this.tracks) {
+				if (track.fragmentLookupTable.length > 0) {
+					// A `tfra` already filled this one in; it states each fragment's offset outright rather
+					// than accumulating sizes, so it's the better table.
+					continue;
+				}
+
+				let entries = entriesByTrack.get(track);
+				if (!entries) {
+					entries = [];
+					entriesByTrack.set(track, entries);
+				}
+
+				// Durations are in the sidx's own timescale; the lookup table is in the track's.
+				const timeRatio = track.timescale / sidx.timescale;
+				let timeInSidxTimescale = sidx.earliestPresentationTime;
+
+				for (const [i, reference] of sidx.references.entries()) {
+					if (reference.referenceType === 1) {
+						// A nested `sidx` sits where a subsegment would. We don't recurse into it, and every
+						// offset after it would be a guess, so stop rather than point at the wrong bytes.
+						break;
+					}
+
+					entries.push({
+						timestamp: Math.round(timeInSidxTimescale * timeRatio),
+						moofOffset: offsets[i]!,
+						// A subsegment boundary is the fragment's first sample.
+						trunNumber: 1,
+						sampleNumber: 1,
+					});
+
+					timeInSidxTimescale += reference.subsegmentDuration;
+				}
+			}
+		}
+
+		for (const [track, entries] of entriesByTrack) {
+			// Chained sidx boxes need not be ordered by presentation time, and the table is
+			// binary-searched by timestamp.
+			entries.sort((a, b) => a.timestamp - b.timestamp);
+			track.fragmentLookupTable = entries;
+		}
 	}
 
 	private async copyMetadataFromInitInput(initInput: Input) {
@@ -566,9 +743,12 @@ export class IsobmffDemuxer extends Demuxer {
 				fragmentPositionCache: [],
 				editListPreviousSegmentDurations: foreignTrack.editListPreviousSegmentDurations,
 				editListOffset: foreignTrack.editListOffset,
+				decodeTimestampShift: deriveDecodeTimestampShift(foreignTrack),
+				sampleDurationForShift: foreignTrack.sampleDurationForShift,
 				encryptionInfo: foreignTrack.encryptionInfo,
 				encryptionAuxInfo: null,
 				frmaCodecString: null,
+				timecode: foreignTrack.timecode,
 				maxBitrate: foreignTrack.maxBitrate,
 				avgBitrate: foreignTrack.avgBitrate,
 				info: foreignTrack.info,
@@ -585,6 +765,11 @@ export class IsobmffDemuxer extends Demuxer {
 				} else if (track.info.type === 'audio' && track.info.numberOfChannels !== -1) {
 					const audioTrack = track as InternalAudioTrack;
 					track.trackBacking = new IsobmffAudioTrackBacking(audioTrack);
+					this.tracks.push(track);
+					this.idToTrack.set(track.id, track);
+				} else if (track.info.type === 'subtitle' && track.info.codec !== null) {
+					const subtitleTrack = track as InternalSubtitleTrack;
+					track.trackBacking = new IsobmffSubtitleTrackBacking(subtitleTrack);
 					this.tracks.push(track);
 					this.idToTrack.set(track.id, track);
 				}
@@ -651,6 +836,15 @@ export class IsobmffDemuxer extends Demuxer {
 
 		capEntryCounts(sampleTable.sampleTimingEntries, sampleTable.sampleCount);
 		capEntryCounts(sampleTable.sampleCompositionTimeOffsets, sampleTable.sampleCount);
+
+		if (internalTrack.decodeTimestampShift === null && sampleTable.sampleCompositionTimeOffsets.length > 0) {
+			// Exact: a non-fragmented track's every offset is in the sample table
+			let least = 0;
+			for (const entry of sampleTable.sampleCompositionTimeOffsets) {
+				least = Math.min(least, entry.offset);
+			}
+			internalTrack.decodeTimestampShift = -least;
+		}
 
 		const isPcmCodec = internalTrack.info?.type === 'audio'
 			&& internalTrack.info.codec
@@ -807,7 +1001,63 @@ export class IsobmffDemuxer extends Demuxer {
 		return sampleTable;
 	}
 
-	readFragment(startPos: number) {
+	/**
+	 * A traf that states neither `base_data_offset` nor `default-base-is-moof` is based on the end of the
+	 * previous traf's data (ISO/IEC 14496-12 section 8.8.7). Writers commonly omit the flag and still
+	 * measure every traf from the moof, and read implicitly such a fragment names samples past the end of
+	 * its own mdat - so where the moof is the base that fits, that is the one the file meant.
+	 */
+	async realignImplicitBases(fragment: Fragment): Promise<void> {
+		if (fragment.basesRealigned) {
+			return;
+		}
+		fragment.basesRealigned = true;
+
+		const candidates = [...fragment.trackData.values()]
+			.filter(trackData => trackData.implicitBaseShift !== null && trackData.samples.length > 0);
+
+		const mdatOffset = fragment.moofOffset + fragment.moofSize;
+		let headerSlice = this.reader.requestSliceRange(mdatOffset, MIN_BOX_HEADER_SIZE, MAX_BOX_HEADER_SIZE);
+		if (isThenable(headerSlice)) headerSlice = await headerSlice;
+		if (!headerSlice) {
+			return;
+		}
+
+		const boxInfo = readBoxHeader(headerSlice);
+		if (boxInfo?.name !== 'mdat') {
+			return;
+		}
+
+		const dataStart = mdatOffset + boxInfo.headerSize;
+		const dataEnd = mdatOffset + boxInfo.totalSize;
+
+		for (const trackData of candidates) {
+			let start = Infinity;
+			let end = -Infinity;
+			for (const sample of trackData.samples) {
+				start = Math.min(start, sample.byteOffset);
+				end = Math.max(end, sample.byteOffset + sample.byteSize);
+			}
+
+			if (start >= dataStart && end <= dataEnd) {
+				continue; // The implicit base names bytes inside the mdat, so take the file at its word
+			}
+
+			const shift = trackData.implicitBaseShift!;
+			if (start + shift < dataStart || end + shift > dataEnd) {
+				continue; // Neither base fits; nothing here can say which was meant
+			}
+
+			for (const sample of trackData.samples) {
+				sample.byteOffset += shift;
+			}
+			// The running read offset needs no fixing up: it belongs to the traf's state, which is gone by
+			// the time a fragment is realigned
+		}
+	}
+
+	/** `precedingFragment` is null when the caller jumped here rather than walking. */
+	readFragment(startPos: number, precedingFragment: Fragment | null) {
 		if (this.lastReadFragment?.moofOffset === startPos) {
 			// Also covers reads still in progress, so concurrent reads of the same fragment share all the work
 			return this.lastReadFragment.promise;
@@ -860,7 +1110,22 @@ export class IsobmffDemuxer extends Demuxer {
 						&& trackData.trunSampleCounts.length >= lookupEntry.trunNumber
 						&& trackData.trunSampleCounts[lookupEntry.trunNumber - 1]! >= lookupEntry.sampleNumber;
 
-					if (lookupEntryIsValid) {
+					const precedingTrackData = precedingFragment?.trackData.get(track.id);
+					const cacheIndex = binarySearchLessOrEqual(
+						fragmentPositionCache,
+						fragment.moofOffset,
+						x => x.moofOffset,
+					);
+					const cached = cacheIndex === -1 ? null : fragmentPositionCache[cacheIndex]!;
+
+					if (precedingTrackData) {
+						// A neighbour we measured beats a timestamp the index merely claims. Its decode end, not
+						// its presentation end: this stands in for `tfdt`, and composition offsets part the two.
+						offsetFragmentTrackDataByTimestamp(trackData, precedingTrackData.endDecodeTimestamp);
+					} else if (cached?.moofOffset === fragment.moofOffset) {
+						// We have read this very fragment before and measured where it begins.
+						offsetFragmentTrackDataByTimestamp(trackData, cached.startTimestamp);
+					} else if (lookupEntryIsValid) {
 						// We ignore traf number here, since we've already matched based on track ID
 
 						let sampleIndex = 0;
@@ -937,6 +1202,8 @@ export class IsobmffDemuxer extends Demuxer {
 				}
 			}
 
+			await this.realignImplicitBases(fragment);
+
 			return fragment;
 		})();
 
@@ -953,6 +1220,15 @@ export class IsobmffDemuxer extends Demuxer {
 		});
 
 		return promise;
+	}
+
+	/** The current `traf`'s `seig` state, cleared as it is read: one `traf`'s groups never reach the next. */
+	private takeTrafSeig() {
+		const entries = this.currentTrafSeigEntries;
+		const runs = this.currentTrafSeigRuns;
+		this.currentTrafSeigEntries = null;
+		this.currentTrafSeigRuns = null;
+		return { entries, runs };
 	}
 
 	readContiguousBoxes(slice: FileSlice) {
@@ -1001,6 +1277,12 @@ export class IsobmffDemuxer extends Demuxer {
 
 		const contentStartPos = slice.filePos;
 		const boxEndPos = startPos + boxInfo.totalSize;
+
+		// Every slice handed to this method spans the box it starts with, so a box reaching past its end
+		// is lying about its size. Stop here rather than slice outside the parent, which reads as a bug.
+		if (boxEndPos > slice.end) {
+			return false;
+		}
 
 		switch (boxInfo.name) {
 			case 'mdia':
@@ -1071,15 +1353,24 @@ export class IsobmffDemuxer extends Demuxer {
 					fragmentPositionCache: [],
 					editListPreviousSegmentDurations: 0,
 					editListOffset: 0,
+					decodeTimestampShift: null,
+					sampleDurationForShift: null,
 					encryptionInfo: null,
 					encryptionAuxInfo: null,
 					frmaCodecString: null,
+					timecode: null,
 					maxBitrate: null,
 					avgBitrate: null,
 				} satisfies InternalTrack as InternalTrack;
 				this.currentTrack = track;
 
 				this.readContiguousBoxes(slice.slice(contentStartPos, boxInfo.contentSize));
+
+				// A timecode track is not one a caller sees, so it never joins `tracks`; what it carries is
+				// kept for the video tracks to read a start timecode from.
+				if (track.timecode && track.timecode.timescale > 0) {
+					this.timecodeTracks.push(track.timecode);
+				}
 
 				if (
 					track.id !== -1
@@ -1095,6 +1386,11 @@ export class IsobmffDemuxer extends Demuxer {
 					} else if (track.info.type === 'audio' && track.info.numberOfChannels !== -1) {
 						const audioTrack = track as InternalAudioTrack;
 						track.trackBacking = new IsobmffAudioTrackBacking(audioTrack);
+						this.tracks.push(track);
+						this.idToTrack.set(track.id, track);
+					} else if (track.info.type === 'subtitle' && track.info.codec !== null) {
+						const subtitleTrack = track as InternalSubtitleTrack;
+						track.trackBacking = new IsobmffSubtitleTrackBacking(subtitleTrack);
 						this.tracks.push(track);
 						this.idToTrack.set(track.id, track);
 					}
@@ -1249,13 +1545,17 @@ export class IsobmffDemuxer extends Demuxer {
 						codecDescription: null,
 						colorSpace: { ...EMPTY_COLOR_SPACE },
 						avcType: null,
-						avcCodecInfo: null,
 						hevcType: null,
+						avcCodecInfo: null,
 						hevcCodecInfo: null,
 						vp9CodecInfo: null,
 						av1CodecInfo: null,
+						mpeg2CodecInfo: null,
 						proresCodecInfo: null,
 						proresFormat: null,
+						hdrStaticMetadata: null,
+						sampleEntryDepth: null,
+						doviConfig: null,
 					};
 				} else if (handlerType === 'soun') {
 					track.info = {
@@ -1268,6 +1568,24 @@ export class IsobmffDemuxer extends Demuxer {
 						dtsFormat: null,
 						pcmLittleEndian: false,
 						pcmSampleSize: null,
+					};
+				} else if (handlerType === 'tmcd') {
+					// QuickTime timecode. `info` stays null, so it is not a track a caller sees; what it
+					// carries is a start timecode for the video it accompanies.
+					track.timecode = {
+						dropFrame: false,
+						timescale: 0,
+						frameDuration: 0,
+						framesPerSecond: 0,
+						firstSampleOffset: null,
+					};
+				} else if (handlerType === 'subt' || handlerType === 'sbtl' || handlerType === 'text') {
+					// The handler alone doesn't say the track is readable - 'text' also covers QuickTime text
+					// tracks. Only a sample entry we can actually decode fills in the codec below.
+					track.info = {
+						type: 'subtitle',
+						codec: null,
+						config: null,
 					};
 				}
 			}; break;
@@ -1289,6 +1607,23 @@ export class IsobmffDemuxer extends Demuxer {
 					break;
 				}
 
+				if (track.timecode) {
+					// QTFF Timecode Sample Description: reserved(6) + data_reference_index(2), then flags,
+					// timescale, frame duration and the frame count one second rounds to.
+					slice.skip(4); // Version + flags
+					const entries = readU32Be(slice);
+					if (entries > 0 && readBoxHeader(slice)) {
+						slice.skip(6 + 2 + 4); // Reserved, data reference index, reserved
+						const flags = readU32Be(slice);
+						track.timecode.dropFrame = (flags & 0x1) !== 0;
+						track.timecode.timescale = readU32Be(slice);
+						track.timecode.frameDuration = readU32Be(slice);
+						track.timecode.framesPerSecond = readU8(slice);
+					}
+
+					break;
+				}
+
 				if (track.info === null || track.sampleTable) {
 					break;
 				}
@@ -1301,7 +1636,7 @@ export class IsobmffDemuxer extends Demuxer {
 				for (let i = 0; i < entries; i++) {
 					const sampleBoxStartPos = slice.filePos;
 					const sampleBoxInfo = readBoxHeader(slice);
-					if (!sampleBoxInfo) {
+					if (!sampleBoxInfo || sampleBoxStartPos + sampleBoxInfo.totalSize > slice.end) {
 						break;
 					}
 
@@ -1316,7 +1651,10 @@ export class IsobmffDemuxer extends Demuxer {
 						track.info.squarePixelWidth = track.info.width;
 						track.info.squarePixelHeight = track.info.height;
 
-						slice.skip(4 + 4 + 4 + 2 + 32 + 2 + 2);
+						// Horizontal and vertical resolution, reserved, frame count, then the compressor name
+						slice.skip(4 + 4 + 4 + 2 + 32);
+						track.info.sampleEntryDepth = readU16Be(slice);
+						slice.skip(2); // Pre-defined
 
 						track.frmaCodecString = null;
 						this.readContiguousBoxes(
@@ -1334,15 +1672,40 @@ export class IsobmffDemuxer extends Demuxer {
 						if (codecName === 'avc1' || codecName === 'avc3') {
 							track.info.codec = 'avc';
 							track.info.avcType = codecName === 'avc1' ? 1 : 3;
+						} else if (AVC_INTRA_FOURCCS.has(codecName!)) {
+							// AVC-Intra and XAVC, as cameras and Avid write them. These sample entries carry
+							// no `avcC` at all and their samples are Annex B with the parameter sets in band,
+							// so the type is reported as in-band and the configuration record is read off the
+							// first packet - the path `avc` with no description already takes.
+							track.info.codec = 'avc';
+							track.info.avcType = 3;
 						} else if (codecName === 'hvc1' || codecName === 'hev1') {
 							track.info.codec = 'hevc';
 							track.info.hevcType = codecName;
+						} else if (codecName === 'dvh1' || codecName === 'dvhe') {
+							// A Dolby Vision entry is an HEVC one; the suffix states the same thing hvc1/hev1 does
+							track.info.codec = 'hevc';
+							track.info.hevcType = codecName === 'dvh1' ? 'hvc1' : 'hev1';
+						} else if (codecName === 'dva1' || codecName === 'dvav') {
+							track.info.codec = 'avc';
+							track.info.avcType = codecName === 'dva1' ? 1 : 3;
 						} else if (codecName === 'vp08') {
 							track.info.codec = 'vp8';
 						} else if (codecName === 'vp09') {
 							track.info.codec = 'vp9';
 						} else if (codecName === 'av01') {
 							track.info.codec = 'av1';
+						} else if (codecName === 'm2v1') {
+							// QuickTime's own MPEG-2 entry, which carries no esds
+							track.info.codec = 'mpeg2';
+						} else if (codecName === 'mp4v') {
+							// The codec is set by the esds box: only its object type tells MPEG-2 video
+							// from MPEG-4 Part 2
+						} else if (codecName === 'rle ') {
+							// QuickTime Animation. Its depth field is the whole configuration: 32 is ARGB
+							track.info.codec = 'qtrle';
+						} else if (codecName === 'png ') {
+							track.info.codec = 'png';
 						} else if ((PRORES_FOURCCS as readonly string[]).includes(lowercaseBoxName)) {
 							track.info.codec = 'prores';
 							track.info.proresFormat = lowercaseBoxName as ProresFourCc;
@@ -1351,7 +1714,7 @@ export class IsobmffDemuxer extends Demuxer {
 						} else {
 							Logging._warn(`Unsupported video codec (sample entry type '${sampleBoxInfo.name}').`);
 						}
-					} else {
+					} else if (track.info.type === 'audio') {
 						slice.skip(6 * 1 + 2);
 
 						const version = readU16Be(slice);
@@ -1417,6 +1780,10 @@ export class IsobmffDemuxer extends Demuxer {
 							track.info.codec = 'ulaw';
 						} else if (codecName === 'alaw') {
 							track.info.codec = 'alaw';
+						} else if (codecName === '.mp2') {
+							// QuickTime's own MPEG audio entry, which carries no esds. Unlike mp4a with an
+							// object type indication of 0x69/0x6B, this one does name Layer II.
+							track.info.codec = 'mp2';
 						} else if (codecName === 'ac-3') {
 							track.info.codec = 'ac3';
 						} else if (codecName === 'ec-3') {
@@ -1542,10 +1909,38 @@ export class IsobmffDemuxer extends Demuxer {
 						} else {
 							Logging._warn(`Unsupported audio codec (sample entry type '${sampleBoxInfo.name}').`);
 						}
+					} else if (track.info.type === 'subtitle') {
+						slice.skip(6 * 1 + 2);
+
+						this.readContiguousBoxes(
+							slice.slice(
+								slice.filePos,
+								(sampleBoxStartPos + sampleBoxInfo.totalSize) - slice.filePos,
+							),
+						);
+
+						if (lowercaseBoxName === 'wvtt') {
+							track.info.codec = 'webvtt';
+						} else if (lowercaseBoxName === 'stpp') {
+							track.info.codec = 'ttml';
+						} else {
+							Logging._warn(`Unsupported subtitle codec (sample entry type '${sampleBoxInfo.name}').`);
+						}
 					}
 
 					slice.filePos = sampleBoxStartPos + sampleBoxInfo.totalSize;
 				}
+			}; break;
+
+			case 'vttC': {
+				const track = this.currentTrack;
+				if (!track || track.info?.type !== 'subtitle') {
+					break;
+				}
+
+				track.info.config = {
+					description: textDecoder.decode(readBytes(slice, boxInfo.contentSize)),
+				};
 			}; break;
 
 			case 'frma': {
@@ -1770,6 +2165,43 @@ export class IsobmffDemuxer extends Demuxer {
 				} as VideoColorSpaceInit;
 			}; break;
 
+			case 'dvcC':
+			case 'dvvC':
+			case 'dvwC': {
+				const track = this.currentTrack;
+				if (!track || track.info?.type !== 'video') {
+					break;
+				}
+
+				track.info.doviConfig = parseDoviConfigRecord(readBytes(slice, boxInfo.contentSize));
+			}; break;
+
+			case 'mdcv': {
+				const track = this.currentTrack;
+				if (!track) {
+					break;
+				}
+				assert(track.info?.type === 'video');
+
+				const masteringDisplay = parseMasteringDisplayMetadata(readBytes(slice, 24));
+				if (masteringDisplay) {
+					(track.info.hdrStaticMetadata ??= {}).masteringDisplay = masteringDisplay;
+				}
+			}; break;
+
+			case 'clli': {
+				const track = this.currentTrack;
+				if (!track) {
+					break;
+				}
+				assert(track.info?.type === 'video');
+
+				const contentLight = parseContentLightLevel(readBytes(slice, 4));
+				if (contentLight) {
+					(track.info.hdrStaticMetadata ??= {}).contentLight = contentLight;
+				}
+			}; break;
+
 			case 'pasp': {
 				const track = this.currentTrack;
 				if (!track || track.info?.type !== 'video') {
@@ -1813,13 +2245,58 @@ export class IsobmffDemuxer extends Demuxer {
 
 			case 'esds': {
 				const track = this.currentTrack;
-				if (!track || track.info?.type !== 'audio') {
+				if (!track || (track.info?.type !== 'audio' && track.info?.type !== 'video')) {
 					break;
 				}
 
 				slice.skip(4); // Version + flags
 
-				const { objectTypeIndication, decoderSpecificInfo } = readEsDescriptor(slice);
+				const tag = readU8(slice);
+				assert(tag === 0x03); // ES Descriptor
+
+				readIsomVariableInteger(slice); // Length
+
+				slice.skip(2); // ES ID
+				const mixed = readU8(slice);
+
+				const streamDependenceFlag = (mixed & 0x80) !== 0;
+				const urlFlag = (mixed & 0x40) !== 0;
+				const ocrStreamFlag = (mixed & 0x20) !== 0;
+
+				if (streamDependenceFlag) {
+					slice.skip(2);
+				}
+				if (urlFlag) {
+					const urlLength = readU8(slice);
+					slice.skip(urlLength);
+				}
+				if (ocrStreamFlag) {
+					slice.skip(2);
+				}
+
+				const decoderConfigTag = readU8(slice);
+				assert(decoderConfigTag === 0x04); // DecoderConfigDescriptor
+
+				const decoderConfigDescriptorLength = readIsomVariableInteger(slice); // Length
+
+				const payloadStart = slice.filePos;
+
+				const objectTypeIndication = readU8(slice);
+
+				if (track.info.type === 'video') {
+					if (isMpeg2ObjectType(objectTypeIndication)) {
+						track.info.codec = 'mpeg2';
+					} else {
+						Logging._warn(
+							`Unsupported video codec (objectTypeIndication ${objectTypeIndication}) -`
+							+ ' discarding track.',
+						);
+					}
+
+					// No video object type here carries a DecoderSpecificInfo
+					break;
+				}
+
 				if (objectTypeIndication === 0x40 || objectTypeIndication === 0x67) {
 					track.info.codec = 'aac';
 					track.info.aacCodecInfo = {
@@ -1838,8 +2315,16 @@ export class IsobmffDemuxer extends Demuxer {
 					);
 				}
 
-				if (decoderSpecificInfo) {
-					track.info.codecDescription = decoderSpecificInfo;
+				slice.skip(1 + 3 + 4 + 4);
+
+				if (decoderConfigDescriptorLength > slice.filePos - payloadStart) {
+					// There's a DecoderSpecificInfo at the end, let's read it
+
+					const decoderSpecificInfoTag = readU8(slice);
+					assert(decoderSpecificInfoTag === 0x05); // DecoderSpecificInfo
+
+					const decoderSpecificInfoLength = readIsomVariableInteger(slice);
+					track.info.codecDescription = readBytes(slice, decoderSpecificInfoLength);
 
 					if (track.info.codec === 'aac') {
 						// Let's try to deduce more accurate values directly from the AudioSpecificConfig:
@@ -2110,6 +2595,19 @@ export class IsobmffDemuxer extends Demuxer {
 				}
 			}; break;
 
+			case 'cslg': {
+				const track = this.currentTrack;
+				if (!track) {
+					break;
+				}
+
+				const version = readU8(slice);
+				slice.skip(3); // Flags
+
+				const compositionToDtsShift = version === 0 ? readI32Be(slice) : Number(readI64Be(slice));
+				track.decodeTimestampShift = Math.max(0, compositionToDtsShift);
+			}; break;
+
 			case 'ctts': {
 				const track = this.currentTrack;
 				if (!track) {
@@ -2291,6 +2789,16 @@ export class IsobmffDemuxer extends Demuxer {
 					break;
 				}
 
+				if (track.timecode) {
+					// A timecode track has one sample, the start timecode, so its first chunk is where it is
+					slice.skip(4); // Version + flags
+					if (readU32Be(slice) > 0) {
+						track.timecode.firstSampleOffset = readU32Be(slice);
+					}
+
+					break;
+				}
+
 				if (!track.sampleTable) {
 					break;
 				}
@@ -2308,6 +2816,16 @@ export class IsobmffDemuxer extends Demuxer {
 			case 'co64': {
 				const track = this.currentTrack;
 				if (!track) {
+					break;
+				}
+
+				if (track.timecode) {
+					// A timecode track has one sample, the start timecode, so its first chunk is where it is
+					slice.skip(4); // Version + flags
+					if (readU32Be(slice) > 0) {
+						track.timecode.firstSampleOffset = readU64Be(slice);
+					}
+
 					break;
 				}
 
@@ -2412,6 +2930,7 @@ export class IsobmffDemuxer extends Demuxer {
 					moofOffset: startPos,
 					moofSize: boxInfo.totalSize,
 					implicitBaseDataOffset: startPos,
+					basesRealigned: false,
 					trackData: new Map(),
 					psshBoxes: [],
 					sampleCount: 0,
@@ -2419,6 +2938,9 @@ export class IsobmffDemuxer extends Demuxer {
 
 				try {
 					this.readContiguousBoxes(slice.slice(contentStartPos, boxInfo.contentSize));
+					// Settled here so the hot path that returns a cached fragment stays a boolean check
+					this.currentFragment.basesRealigned = ![...this.currentFragment.trackData.values()]
+						.some(trackData => trackData.implicitBaseShift !== null && trackData.samples.length > 0);
 				} catch (error) {
 					this.currentFragment = null;
 					throw error;
@@ -2434,6 +2956,7 @@ export class IsobmffDemuxer extends Demuxer {
 				}
 
 				this.isReadingTraf = true;
+				this.takeTrafSeig(); // Nothing should be left over from the previous traf
 				try {
 					this.readContiguousBoxes(slice.slice(contentStartPos, boxInfo.contentSize));
 				} finally {
@@ -2442,6 +2965,26 @@ export class IsobmffDemuxer extends Demuxer {
 
 				const fragmentTrackState = this.currentFragmentTrackState;
 				this.currentFragmentTrackState = null;
+				// Applied here rather than in the `sbgp` case: a `trun` may follow the group boxes, so the
+				// samples they describe need not exist yet while they are being read
+				const seig = this.takeTrafSeig();
+				if (seig.runs && this.currentTrack) {
+					const trackData = this.currentFragment.trackData.get(this.currentTrack.id);
+					const entries = seig.entries;
+					let sampleIndex = 0;
+					for (const run of seig.runs) {
+						// Index 0 means the sample belongs to no group, and a movie-level one names an `sgpd`
+						// of the sample table rather than of this fragment; both leave the `tenc` default
+						const local = run.descriptionIndex - TRACK_FRAGMENT_DESCRIPTION_INDEX_BASE - 1;
+						const unprotected = entries !== null && local >= 0 && entries[local] === false;
+						for (let i = 0; i < run.sampleCount; i++, sampleIndex++) {
+							const sample = trackData?.samples[sampleIndex];
+							if (sample && unprotected) {
+								sample.unprotected = true;
+							}
+						}
+					}
+				}
 
 				// It is possible that there is no current track, for example when we don't care about the track
 				// referenced in the track fragment header.
@@ -2506,7 +3049,11 @@ export class IsobmffDemuxer extends Demuxer {
 					break;
 				}
 
-				const psshBox = parsePsshBoxContents(readBytes(slice, boxInfo.contentSize));
+				const bytes = readBytes(slice.slice(startPos, boxInfo.totalSize), boxInfo.totalSize);
+				const psshBox: PsshBox = {
+					...parsePsshBoxContents(readBytes(slice, boxInfo.contentSize)),
+					bytes,
+				};
 
 				if (this.currentFragment) {
 					this.currentFragment.psshBoxes.push(psshBox);
@@ -2538,6 +3085,7 @@ export class IsobmffDemuxer extends Demuxer {
 				// Even tracks we ignore get this state, since their data still shifts the implicit base data offset
 				const fragmentTrackState: FragmentTrackState = {
 					baseDataOffset: this.currentFragment.implicitBaseDataOffset,
+					implicitBaseShift: this.currentFragment.moofOffset - this.currentFragment.implicitBaseDataOffset,
 					sampleDescriptionIndex: defaults?.defaultSampleDescriptionIndex ?? null,
 					defaultSampleDuration: defaults?.defaultSampleDuration ?? null,
 					defaultSampleSize: defaults?.defaultSampleSize ?? null,
@@ -2551,8 +3099,10 @@ export class IsobmffDemuxer extends Demuxer {
 
 				if (baseDataOffsetPresent) {
 					fragmentTrackState.baseDataOffset = readU64Be(slice);
+					fragmentTrackState.implicitBaseShift = null;
 				} else if (defaultBaseIsMoof) {
 					fragmentTrackState.baseDataOffset = this.currentFragment.moofOffset;
+					fragmentTrackState.implicitBaseShift = null;
 				}
 				if (sampleDescriptionIndexPresent) {
 					fragmentTrackState.sampleDescriptionIndex = readU32Be(slice);
@@ -2574,6 +3124,12 @@ export class IsobmffDemuxer extends Demuxer {
 				if (!track) {
 					// We don't care about this track
 					break;
+				}
+
+				// Below the lookup, because the tfhd defaults are read before the track is resolved: the first
+				// default a track states is what a decode-time shift is measured in
+				if (fragmentTrackState.defaultSampleDuration !== null) {
+					track.sampleDurationForShift ??= fragmentTrackState.defaultSampleDuration;
 				}
 
 				if (this.currentFragment.trackData.has(trackId)) {
@@ -2670,6 +3226,7 @@ export class IsobmffDemuxer extends Demuxer {
 							startTimestampIsFinal: false,
 							trunSampleCounts: [],
 							encryptionAuxInfo: null,
+							implicitBaseShift: fragmentTrackState.implicitBaseShift,
 						};
 						this.currentFragment.trackData.set(track.id, trackData);
 					}
@@ -2712,11 +3269,13 @@ export class IsobmffDemuxer extends Demuxer {
 
 					trackData?.samples.push({
 						presentationTimestamp: fragmentTrackState.currentTimestamp + sampleCompositionTimeOffset,
+						decodeTimestamp: fragmentTrackState.currentTimestamp,
 						duration: sampleDuration,
 						byteOffset: currentOffset,
 						byteSize: sampleSize,
 						isKeyFrame: !(sampleFlags & 0x00010000),
 						encryption: null,
+						unprotected: false,
 					});
 
 					currentOffset += sampleSize;
@@ -2751,6 +3310,9 @@ export class IsobmffDemuxer extends Demuxer {
 
 				let sampleSizes: Uint8Array | null = null;
 				if (defaultSampleInfoSize === 0 && sampleCount > 0) {
+					if (slice.remainingLength < sampleCount) {
+						throw new Error('Malformed saiz box: the per-sample size table runs past the end of the box.');
+					}
 					sampleSizes = readBytes(slice, sampleCount);
 				}
 
@@ -2798,6 +3360,69 @@ export class IsobmffDemuxer extends Demuxer {
 				aux.offset = offset;
 			}; break;
 
+			case 'sgpd': {
+				// A `seig` group states protection per sample, which is how a clear lead under an encrypted
+				// init says that its samples are not to be decrypted (ISO/IEC 23001-7 §6).
+				if (!this.isReadingTraf) {
+					break;
+				}
+
+				const version = readU8(slice);
+				slice.skip(3); // Flags
+				if (readAscii(slice, 4) !== 'seig') {
+					break;
+				}
+
+				const defaultLength = version === 1 ? readU32Be(slice) : 0;
+				if (version >= 2) {
+					slice.skip(4); // default_sample_description_index
+				}
+
+				const entryCount = readU32Be(slice);
+				const entries: boolean[] = [];
+				for (let i = 0; i < entryCount; i++) {
+					// A version 1 box may state each entry's length instead of one for all of them
+					const length = version === 1 && defaultLength === 0 ? readU32Be(slice) : defaultLength;
+					if (length < SEIG_ENTRY_MIN_SIZE || length > slice.remainingLength) {
+						throw new Error(
+							`Malformed sgpd box: a seig entry of ${length} bytes cannot hold its own fields.`,
+						);
+					}
+
+					slice.skip(2); // reserved, then the crypt/skip pattern
+					entries.push(readU8(slice) !== 0);
+					slice.skip(length - 3);
+				}
+
+				this.currentTrafSeigEntries = entries;
+			}; break;
+
+			case 'sbgp': {
+				if (!this.isReadingTraf) {
+					break;
+				}
+
+				const version = readU8(slice);
+				slice.skip(3); // Flags
+				if (readAscii(slice, 4) !== 'seig') {
+					break;
+				}
+				if (version === 1) {
+					slice.skip(4); // grouping_type_parameter
+				}
+
+				const entryCount = readU32Be(slice);
+				const runs: { sampleCount: number; descriptionIndex: number }[] = [];
+				for (let i = 0; i < entryCount; i++) {
+					if (slice.remainingLength < 8) {
+						throw new Error('Malformed sbgp box: it claims more runs than it holds.');
+					}
+					runs.push({ sampleCount: readU32Be(slice), descriptionIndex: readU32Be(slice) });
+				}
+
+				this.currentTrafSeigRuns = runs;
+			}; break;
+
 			case 'senc': {
 				// Per-sample encryption info inside a 'traf'. Holds per-sample IV and optional subsample breakdown
 				// for CENC-protected samples
@@ -2837,6 +3462,12 @@ export class IsobmffDemuxer extends Demuxer {
 					let subsamples: SampleEncryptionInfo['subsamples'] = null;
 					if (useSubsamples) {
 						const subsampleCount = readU16Be(slice);
+						// A pair is a 16-bit clear length and a 32-bit protected one.
+						if (slice.remainingLength < subsampleCount * 6) {
+							throw new Error(
+								'Malformed senc box: an entry claims more subsamples than the box holds.',
+							);
+						}
 						subsamples = [];
 						for (let j = 0; j < subsampleCount; j++) {
 							const clearLen = readU16Be(slice);
@@ -3224,6 +3855,10 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 		return this.internalTrack.internalCodecId;
 	}
 
+	getEncryptionInfo(): TrackEncryptionInfo | null {
+		return this.internalTrack.encryptionInfo;
+	}
+
 	getName() {
 		return this.internalTrack.name;
 	}
@@ -3232,8 +3867,63 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 		return this.internalTrack.languageCode;
 	}
 
+	/**
+	 * The start timecode from the file's QuickTime timecode track, whose single sample is a frame number
+	 * counted from 00:00:00:00. Null when the file has none.
+	 */
+	async getStartTimecode(): Promise<StartTimecode | null> {
+		const timecode = this.internalTrack.demuxer.timecodeTracks[0];
+
+		if (timecode && timecode.firstSampleOffset !== null && timecode.framesPerSecond > 0) {
+			const slice = await this.internalTrack.demuxer.reader.requestSlice(timecode.firstSampleOffset, 4);
+			if (slice) {
+				return startTimecodeOf(readU32Be(slice), timecode.framesPerSecond, timecode.dropFrame);
+			}
+		}
+
+		// No timecode track, so fall back to the bitstream's own
+		const info = this.internalTrack.info;
+		if (info === null || info.type !== 'video' || (info.codec !== 'hevc' && info.codec !== 'avc')) {
+			return null;
+		}
+
+		const config = {
+			codec: '',
+			codedWidth: info.width,
+			codedHeight: info.height,
+			description: info.codecDescription ?? undefined,
+		};
+		const firstPacket = await this.getFirstPacket({});
+		if (!firstPacket || firstPacket.duration <= 0) {
+			return null;
+		}
+
+		// The SEI states no rate of its own, and the timecode counts at the nominal one
+		const frameRate = Math.round(1 / firstPacket.duration);
+
+		if (info.codec === 'hevc') {
+			return extractTimecodeFromHevcSei(firstPacket.data, config, frameRate);
+		}
+
+		// H.264's `pic_timing` is only parsable with the field widths its SPS states. With an `avcC` the
+		// parameter sets are in the description rather than in band, so `avcCodecInfo` is null here.
+		const record = info.avcCodecInfo
+			?? (info.codecDescription && deserializeAvcDecoderConfigurationRecord(info.codecDescription));
+		const sps = record ? record.sequenceParameterSets[0] : undefined;
+		const parsed = sps && parseAvcSps(sps);
+		if (!parsed) {
+			return null;
+		}
+
+		return extractTimecodeFromAvcSei(firstPacket.data, config, parsed, frameRate);
+	}
+
 	getTimeResolution() {
 		return this.internalTrack.timescale;
+	}
+
+	getPresentationOffset() {
+		return this.internalTrack.editListOffset / this.internalTrack.timescale;
 	}
 
 	isRelativeToUnixEpoch() {
@@ -3587,6 +4277,9 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 			duration,
 			sampleIndex,
 			sampleInfo.sampleSize,
+			undefined,
+			(sampleInfo.decodeTimestamp - this.internalTrack.editListOffset
+				- deriveDecodeTimestampShift(this.internalTrack)) / this.internalTrack.timescale,
 		);
 
 		if (this.internalTrack.info?.codec === 'eac3') {
@@ -3627,7 +4320,7 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 
 			data = readBytes(slice, fragmentSample.byteSize);
 
-			if (this.internalTrack.encryptionInfo) {
+			if (this.internalTrack.encryptionInfo && !fragmentSample.unprotected) {
 				const sampleEncryption = fragmentSample.encryption
 					?? getDefaultSampleEncryption(this.internalTrack.encryptionInfo);
 				if (sampleEncryption) {
@@ -3646,6 +4339,9 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 			duration,
 			fragment.moofOffset + sampleIndex,
 			fragmentSample.byteSize,
+			undefined,
+			(fragmentSample.decodeTimestamp - this.internalTrack.editListOffset
+				- deriveDecodeTimestampShift(this.internalTrack)) / this.internalTrack.timescale,
 		);
 
 		if (this.internalTrack.info?.codec === 'eac3') {
@@ -3723,6 +4419,10 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 
 			let currentPos: number;
 			let currentFragment: Fragment | null = null;
+			// A fragment stating no decode time of its own is placed from its predecessor in the scan
+			let precedingFragment: Fragment | null = null;
+			// A lookup entry can point into an `mdat`, and such a scan reads no `moof` and proves nothing
+			let scanReachedFragment = false;
 
 			if (!startFragment) {
 				currentPos = lookupEntryPosition ?? 0;
@@ -3746,6 +4446,7 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 						break;
 					}
 
+					precedingFragment = currentFragment;
 					currentFragment = null; // So we don't process it again next iteration
 				}
 
@@ -3769,7 +4470,8 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 				}
 
 				if (boxInfo.name === 'moof') {
-					currentFragment = await demuxer.readFragment(boxStartPos);
+					scanReachedFragment = true;
+					currentFragment = await demuxer.readFragment(boxStartPos, precedingFragment);
 					if (!currentFragment) {
 						break;
 					}
@@ -3793,7 +4495,20 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 
 			// We found a lookup entry but no fragment from there on that satisfied the match. In this case, let's
 			// search again from the lookup entry preceding the fragments we just scanned.
-			stopPos = scanStartPos; // So we don't read the same fragments again
+			if (scanReachedFragment) {
+				stopPos = scanStartPos; // So we don't read the same fragments again
+			} else {
+				// The scan read no `moof`, so it says nothing about what lies after it and capping there would
+				// hide the rest of the file. Drop just the entry that sent us there, which is what advances the
+				// loop in place of the bound.
+				if (fragmentLookupTable[lookupEntryIndex]?.moofOffset === lookupEntryPosition) {
+					lookupEntryIndex--;
+				}
+				if (fragmentPositionCache[positionCacheIndex]?.moofOffset === lookupEntryPosition) {
+					positionCacheIndex--;
+				}
+			}
+
 			startFragment = null;
 		}
 
@@ -3871,6 +4586,26 @@ class IsobmffVideoTrackBacking extends IsobmffTrackBacking implements InputVideo
 
 	getType() {
 		return 'video' as const;
+	}
+
+	getMetadataCodecParameterString(): string | null {
+		// A non-cross-compatible base layer is not decodable as plain HEVC or AVC, so a manifest must not
+		// state the sample entry's codec for it
+		const dovi = this.internalTrack.info.doviConfig;
+		const codec = this.internalTrack.info.codec;
+		if (!dovi || dovi.blSignalCompatibilityId !== 0 || (codec !== 'hevc' && codec !== 'avc')) {
+			return null;
+		}
+
+		return doviCodecString(
+			doviSupplementalFourCc(
+				codec,
+				codec === 'hevc'
+					? this.internalTrack.info.hevcType === 'hev1'
+					: this.internalTrack.info.avcType === 3,
+			),
+			dovi,
+		);
 	}
 
 	override getCodec(): VideoCodec | null {
@@ -3972,6 +4707,12 @@ class IsobmffVideoTrackBacking extends IsobmffTrackBacking implements InputVideo
 				const firstPacket = await this.getFirstPacket({});
 				this.internalTrack.info.proresCodecInfo
 					= firstPacket && extractProresCodecInfoFromPacket(firstPacket.data);
+			} else if (this.internalTrack.info.codec === 'mpeg2' && !this.internalTrack.info.mpeg2CodecInfo) {
+				// The profile is in the sequence extension and nowhere else: `m2v1` carries no box for it, and
+				// the object type an `esds` states is only what a writer claimed
+				const firstPacket = await this.getFirstPacket({});
+				this.internalTrack.info.mpeg2CodecInfo
+					= firstPacket && extractMpeg2CodecInfoFromPacket(firstPacket.data);
 			}
 
 			if (!colorSpaceIsComplete(this.internalTrack.info.colorSpace)) {
@@ -3984,13 +4725,44 @@ class IsobmffVideoTrackBacking extends IsobmffTrackBacking implements InputVideo
 				this.internalTrack.info.colorSpace.fullRange ??= colorSpace.fullRange;
 			}
 
-			const config: VideoDecoderConfig = {
+			const config: VideoDecoderConfigWithHdr = {
 				codec: extractVideoCodecString(this.internalTrack.info),
 				codedWidth: this.internalTrack.info.width,
 				codedHeight: this.internalTrack.info.height,
 				description: this.internalTrack.info.codecDescription ?? undefined,
 				colorSpace: this.internalTrack.info.colorSpace,
 			};
+
+			if (this.internalTrack.info.hdrStaticMetadata) {
+				config.hdrStaticMetadata = this.internalTrack.info.hdrStaticMetadata;
+			}
+
+			if (this.internalTrack.info.doviConfig) {
+				config.dolbyVision = this.internalTrack.info.doviConfig;
+			}
+
+			if (this.internalTrack.info.sampleEntryDepth !== null) {
+				config.bitsPerCodedSample = this.internalTrack.info.sampleEntryDepth;
+			}
+
+			// An x265 HDR10 master written by ffmpeg states its metadata only in the first access unit, so the SEI
+			// fills what no box did. Gated on an HDR transfer, since the probe costs a packet fetch.
+			const codec = this.internalTrack.info.codec;
+			if (
+				(codec === 'hevc' || codec === 'avc')
+				&& transferNeedsTenBits(config.colorSpace?.transfer)
+				&& (!config.hdrStaticMetadata?.masteringDisplay || !config.hdrStaticMetadata.contentLight)
+			) {
+				const firstPacket = await this.getFirstPacket({});
+				const fromSei = firstPacket && extractSeiHdrMetadata(firstPacket.data, config, codec);
+
+				if (fromSei?.masteringDisplay && !config.hdrStaticMetadata?.masteringDisplay) {
+					(config.hdrStaticMetadata ??= {}).masteringDisplay = fromSei.masteringDisplay;
+				}
+				if (fromSei?.contentLight && !config.hdrStaticMetadata?.contentLight) {
+					(config.hdrStaticMetadata ??= {}).contentLight = fromSei.contentLight;
+				}
+			}
 
 			if (
 				this.internalTrack.info.width !== this.internalTrack.info.squarePixelWidth
@@ -4051,6 +4823,124 @@ class IsobmffAudioTrackBacking extends IsobmffTrackBacking implements InputAudio
 	}
 }
 
+/**
+ * Walks the top-level boxes of one in-memory sample, which is how ISO/IEC 14496-30 stores WebVTT cues.
+ * Throws on a size that runs past the sample rather than truncating silently.
+ */
+const forEachSampleBox = (data: Uint8Array, onBox: (name: string, payload: Uint8Array) => void) => {
+	const view = toDataView(data);
+	let pos = 0;
+
+	while (pos + MIN_BOX_HEADER_SIZE <= data.byteLength) {
+		let size = view.getUint32(pos, false);
+		let headerSize = MIN_BOX_HEADER_SIZE;
+		const name = String.fromCharCode(data[pos + 4]!, data[pos + 5]!, data[pos + 6]!, data[pos + 7]!);
+
+		if (size === 1) {
+			if (pos + MAX_BOX_HEADER_SIZE > data.byteLength) {
+				throw new Error('Malformed subtitle sample: truncated large box header.');
+			}
+
+			size = Number(view.getBigUint64(pos + MIN_BOX_HEADER_SIZE, false));
+			headerSize = MAX_BOX_HEADER_SIZE;
+		} else if (size === 0) {
+			size = data.byteLength - pos;
+		}
+
+		if (size < headerSize || pos + size > data.byteLength) {
+			throw new Error('Malformed subtitle sample: box size runs past the end of the sample.');
+		}
+
+		onBox(name, data.subarray(pos + headerSize, pos + size));
+		pos += size;
+	}
+};
+
+/**
+ * Reads the cues of one `wvtt` sample. The sample's own timing is the cues' timing; a cue that outlives the
+ * sample was split by the muxer and every part carries the same `vsid`.
+ */
+const parseWvttSample = (data: Uint8Array, timestamp: number, duration: number): DecodedSubtitleCue[] => {
+	const cues: DecodedSubtitleCue[] = [];
+	let notes: string | undefined = undefined;
+
+	forEachSampleBox(data, (name, payload) => {
+		if (name === 'vtta') {
+			notes = textDecoder.decode(payload);
+			return;
+		}
+
+		// A vtte box is an explicitly empty cue, and anything else is not a cue at all.
+		if (name !== 'vttc') {
+			return;
+		}
+
+		let text = '';
+		let identifier: string | undefined = undefined;
+		let settings: string | undefined = undefined;
+		let continuationId: number | null = null;
+
+		forEachSampleBox(payload, (childName, childPayload) => {
+			if (childName === 'payl') {
+				text = textDecoder.decode(childPayload);
+			} else if (childName === 'iden') {
+				identifier = textDecoder.decode(childPayload);
+			} else if (childName === 'sttg') {
+				settings = textDecoder.decode(childPayload);
+			} else if (childName === 'vsid') {
+				continuationId = toDataView(childPayload).getInt32(0, false);
+			}
+		});
+
+		cues.push({
+			cue: { timestamp, duration, text, identifier, settings, notes },
+			continuationId,
+		});
+
+		notes = undefined;
+	});
+
+	return cues;
+};
+
+class IsobmffSubtitleTrackBacking extends IsobmffTrackBacking implements InputSubtitleTrackBacking {
+	override internalTrack: InternalSubtitleTrack;
+
+	constructor(internalTrack: InternalSubtitleTrack) {
+		super(internalTrack);
+		this.internalTrack = internalTrack;
+	}
+
+	getType() {
+		return 'subtitle' as const;
+	}
+
+	override getCodec(): SubtitleCodec | null {
+		return this.internalTrack.info.codec;
+	}
+
+	getConfig(): SubtitleConfig | null {
+		return this.internalTrack.info.config;
+	}
+
+	async getDecoderConfig(): Promise<null> {
+		return null;
+	}
+
+	decodeCues(packet: EncodedPacket): DecodedSubtitleCue[] {
+		const codec = this.internalTrack.info.codec;
+		assert(codec !== null);
+
+		if (codec === 'webvtt') {
+			return parseWvttSample(packet.data, packet.timestamp, packet.duration);
+		}
+
+		// A TTML document states its own cue timings, so the sample's timing is not used.
+		return parseTtmlDocument(textDecoder.decode(packet.data))
+			.map(cue => ({ cue, continuationId: null }));
+	}
+}
+
 const getSampleIndexForTimestamp = (sampleTable: SampleTable, timescaleUnits: number) => {
 	if (sampleTable.sortedCompositionTimeOffsets) {
 		return performPresentationTimeLookup(sampleTable, timescaleUnits, false);
@@ -4095,11 +4985,48 @@ const getKeyframeSampleIndexForTimestamp = (sampleTable: SampleTable, timescaleU
 
 type SampleInfo = {
 	presentationTimestamp: number;
+	decodeTimestamp: number;
 	duration: number;
 	sampleOffset: number;
 	sampleSize: number;
 	chunkOffset: number;
 	isKeyFrame: boolean;
+};
+
+/**
+ * The track's decode-time shift in ticks, from the init alone: a `cslg` or a complete `ctts` states
+ * it, otherwise the codec's reorder depth bounds it. Never from the fragments a reader happened to
+ * open, or two readers of one track disagree.
+ */
+const deriveDecodeTimestampShift = (track: InternalTrack): number => {
+	if (track.decodeTimestampShift !== null) {
+		return track.decodeTimestampShift;
+	}
+
+	let reorderDepth = 0;
+	if (track.info?.type === 'video' && track.info.codec === 'avc') {
+		// avcCodecInfo is only filled in on the encode side; the init's own avcC is what a reader has
+		const record = track.info.avcCodecInfo
+			?? (track.info.codecDescription && deserializeAvcDecoderConfigurationRecord(track.info.codecDescription));
+		const avcSps = record ? record.sequenceParameterSets[0] : undefined;
+		if (avcSps) {
+			reorderDepth = parseAvcSps(avcSps)?.numReorderFrames ?? 0;
+		}
+	} else if (track.info?.type === 'video' && track.info.codec === 'hevc') {
+		const record = track.info.hevcCodecInfo
+			?? (track.info.codecDescription && deserializeHevcDecoderConfigurationRecord(track.info.codecDescription));
+		const hevcSps = record?.arrays.find(x => x.nalUnitType === 33)?.nalUnits[0];
+		if (hevcSps) {
+			reorderDepth = parseHevcSps(hevcSps)?.numReorderFrames ?? 0;
+		}
+	}
+
+	const sampleDuration = track.demuxer.fragmentTrackDefaults.get(track.id)?.defaultSampleDuration
+		|| track.sampleDurationForShift
+		|| 0;
+	track.decodeTimestampShift = reorderDepth * sampleDuration;
+
+	return track.decodeTimestampShift;
 };
 
 const getSampleInfo = (sampleTable: SampleTable, sampleIndex: number): SampleInfo | null => {
@@ -4154,6 +5081,7 @@ const getSampleInfo = (sampleTable: SampleTable, sampleIndex: number): SampleInf
 
 	return {
 		presentationTimestamp,
+		decodeTimestamp,
 		duration,
 		sampleOffset,
 		sampleSize,
@@ -4285,6 +5213,9 @@ const offsetFragmentTrackDataByTimestamp = (trackData: FragmentTrackData, timest
 
 	for (const sample of trackData.samples) {
 		sample.presentationTimestamp += timestamp;
+		// The decode timestamp sits on the same timeline and shifts with it; leaving it behind made
+		// every fragment after the first restart its decode time at zero.
+		sample.decodeTimestamp += timestamp;
 	}
 	for (const entry of trackData.presentationTimestamps) {
 		entry.presentationTimestamp += timestamp;
@@ -4411,6 +5342,12 @@ const resolveEncryptionAuxInfo = async (
 		let subsamples: { clearLen: number; protectedLen: number }[] | null = null;
 		if (entrySize > ivSize) {
 			const subsampleCount = readU16Be(slice);
+			// A pair is a 16-bit clear length and a 32-bit protected one, after the count itself.
+			if (ivSize + 2 + subsampleCount * 6 > entrySize) {
+				throw new Error(
+					'Malformed encryption info: an entry claims more subsamples than saiz gives it room for.',
+				);
+			}
 			subsamples = [];
 			for (let j = 0; j < subsampleCount; j++) {
 				const clearLen = readU16Be(slice);

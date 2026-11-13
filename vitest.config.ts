@@ -17,12 +17,22 @@ export default defineConfig({
 				path.resolve(__dirname, './packages/mp3-encoder/dist/bundles/mediabunny-mp3-encoder.mjs'),
 			'@mediabunny/prores':
 				path.resolve(__dirname, './packages/prores/dist/bundles/mediabunny-prores.mjs'),
+			'@mediabunny/truehd':
+				path.resolve(__dirname, './packages/truehd/dist/bundles/mediabunny-truehd.mjs'),
 			'@mediabunny/server':
 				path.resolve(__dirname, './packages/server/src/index.ts'),
+			'@mediabunny/rist':
+				path.resolve(__dirname, './packages/rist/src/index.ts'),
 		},
 	},
 	test: {
 		restoreMocks: true,
+		// node-gc tests force collections to check finalization behaviour. --expose-gc is a V8 flag, which
+		// worker_threads execArgv rejects, so the whole run needs the forked pool.
+		pool: 'forks',
+		execArgv: ['--expose-gc'],
+		// UV_THREADPOOL_SIZE is set by the `test` script rather than here: libuv reads it when a process starts,
+		// so `test.env` lands too late to take effect. See the script for why it is needed.
 		projects: [
 			{
 				extends: true,
@@ -30,6 +40,15 @@ export default defineConfig({
 					name: 'node',
 					root: 'test',
 					include: ['node/**/*.test.ts'],
+					environment: 'node',
+				},
+			},
+			{
+				extends: true,
+				test: {
+					name: 'node-gc',
+					root: 'test',
+					include: ['node-gc/**/*.test.ts'],
 					environment: 'node',
 				},
 			},

@@ -12,9 +12,11 @@ import {
 	getAudioPreRollDuration,
 	MediaCodec,
 	PCM_AUDIO_CODECS,
+	SubtitleCodec,
 	VideoCodec,
 } from './codec';
 import { determineAudioPacketType, determineVideoPacketType } from './codec-data';
+import { type VideoDecoderConfigWithHdr } from './hdr-metadata';
 import { customAudioDecoders, customVideoDecoders } from './custom-coder';
 import { Input } from './input';
 import { Logging } from './logging';
@@ -35,6 +37,8 @@ import { TrackType } from './output';
 import { EncodedPacket, PacketType } from './packet';
 import { TrackDisposition } from './metadata';
 import { DurationMetadataRequestOptions } from './demuxer';
+import { TrackEncryptionInfo } from './isobmff/isobmff-misc';
+import { SubtitleConfig, SubtitleCue } from './subtitles';
 
 /**
  * Contains aggregate statistics about the encoded packets of a track.
@@ -122,6 +126,30 @@ export type FrameRateMetricsOptions = {
 	targetPacketCount?: number;
 };
 
+/**
+ * The timecode a track's media starts at, as a broadcast timecode rather than a duration.
+ *
+ * @group Input files & tracks
+ * @public
+ */
+export type StartTimecode = {
+	/** Hours, 0-23. */
+	hours: number;
+	/** Minutes, 0-59. */
+	minutes: number;
+	/** Seconds, 0-59. */
+	seconds: number;
+	/** Frames within the second, counting at {@link StartTimecode.frameRate}. */
+	frames: number;
+	/**
+	 * Whether the timecode is drop-frame, where the count skips numbers to stay near wall clock at
+	 * 29.97 or 59.94. Conventionally written with `;` before the frames rather than `:`.
+	 */
+	dropFrame: boolean;
+	/** The rate the frame numbers count at, which for drop-frame is the nominal 30 or 60, not 29.97. */
+	frameRate: number;
+};
+
 export interface InputTrackBacking {
 	getType(): TrackType;
 	getNumber(): number;
@@ -130,7 +158,10 @@ export interface InputTrackBacking {
 	getInternalCodecId(): MaybePromise<string | number | Uint8Array | null>;
 	getName(): MaybePromise<string | null>;
 	getLanguageCode(): MaybePromise<string>;
+	/** Optional: only formats that carry a timecode implement it. */
+	getStartTimecode?(): MaybePromise<StartTimecode | null>;
 	getTimeResolution(): MaybePromise<number>;
+	getPresentationOffset?(): MaybePromise<number>;
 	isRelativeToUnixEpoch(): MaybePromise<boolean>;
 	getUnixTimeForTimestamp(timestamp: number): MaybePromise<number | null>;
 	getDisposition(): MaybePromise<TrackDisposition>;
@@ -142,6 +173,7 @@ export interface InputTrackBacking {
 	getHasOnlyKeyPackets?(): MaybePromise<boolean | null>;
 	getDecoderConfig(): Promise<VideoDecoderConfig | AudioDecoderConfig | null>;
 	getMetadataCodecParameterString?(): MaybePromise<string | null>;
+	getEncryptionInfo(): MaybePromise<TrackEncryptionInfo | null>;
 
 	getFirstPacket(options: PacketRetrievalOptions): Promise<EncodedPacket | null>;
 	getPacket(timestamp: number, options: PacketRetrievalOptions): Promise<EncodedPacket | null>;
@@ -191,6 +223,16 @@ export abstract class InputTrack {
 	 */
 	abstract hasOnlyKeyPackets(): Promise<boolean>;
 
+	/**
+	 * Returns the Common Encryption descriptor parsed from the track's `tenc` box, or `null` if the track is
+	 * unencrypted (or the container has no equivalent metadata). When non-null, `defaultKid` and `scheme` describe
+	 * how subsequent samples are protected; pair with {@link Input.getPsshBoxes} to obtain DRM-system-specific
+	 * licensing data.
+	 */
+	async getEncryptionInfo(): Promise<TrackEncryptionInfo | null> {
+		return this._backing.getEncryptionInfo();
+	}
+
 	/** Returns true if and only if this track is a video track. */
 	isVideoTrack(): this is InputVideoTrack {
 		return this instanceof InputVideoTrack;
@@ -199,6 +241,11 @@ export abstract class InputTrack {
 	/** Returns true if and only if this track is an audio track. */
 	isAudioTrack(): this is InputAudioTrack {
 		return this instanceof InputAudioTrack;
+	}
+
+	/** Returns true if and only if this track is a subtitle track. */
+	isSubtitleTrack(): this is InputSubtitleTrack {
+		return this instanceof InputSubtitleTrack;
 	}
 
 	/**
@@ -258,6 +305,17 @@ export abstract class InputTrack {
 	}
 
 	/**
+	 * The timecode this track's media starts at, or `null` when the file states none.
+	 *
+	 * Read from a QuickTime `tmcd` track in MP4 and MOV, from the TimecodeComponent of an MXF package,
+	 * and otherwise from the bitstream's own timecode SEI — H.264 `pic_timing` or HEVC `time_code`.
+	 * Formats that carry none of those return `null`.
+	 */
+	async getStartTimecode(): Promise<StartTimecode | null> {
+		return this._backing.getStartTimecode?.() ?? null;
+	}
+
+	/**
 	 * The ISO 639-2/T language code for this track. If the language is unknown, this field is `'und'` (undetermined).
 	 * @deprecated Use {@link InputTrack.getLanguageCode} instead.
 	 */
@@ -284,6 +342,24 @@ export abstract class InputTrack {
 	 */
 	async getTimeResolution() {
 		return this._backing.getTimeResolution();
+	}
+
+	/**
+	 * Returns the offset, in seconds, between this track's media timeline and its presentation timeline: media
+	 * at time `t` is presented at `t - offset`, so the first `offset` seconds of media fall before the
+	 * presentation begins. `0` where the track states no such offset, or the container cannot express one.
+	 *
+	 * This is what an ISO BMFF edit list's media time states, and what Matroska states as `CodecDelay`. Its
+	 * usual cause is encoder delay: an AAC encoder emits 1024 priming samples that a decoder needs and a player
+	 * does not present, which is why `ffprobe` reports such a file as starting at 0 while this library's first
+	 * packet sits one frame below it.
+	 *
+	 * Packets covering that span are still yielded, with timestamps below zero, because a decoder needs them and
+	 * a muxer copying the track has to carry them. A reader that wants only what is presented drops the packets
+	 * with `timestamp + duration <= 0`; everything at or above zero is presentation.
+	 */
+	async getPresentationOffset() {
+		return this._backing.getPresentationOffset?.() ?? 0;
 	}
 
 	/**
@@ -473,7 +549,7 @@ export abstract class InputTrack {
 	 * via {@link InputTrack.getLiveRefreshInterval}.
 	 */
 	async isLive() {
-		return (await this._backing.getLiveRefreshInterval()) !== null;
+		return (await this.getLiveRefreshInterval()) !== null;
 	}
 
 	/**
@@ -481,7 +557,9 @@ export abstract class InputTrack {
 	 * the time it takes, on average, for new live media data to become available.
 	 */
 	async getLiveRefreshInterval() {
-		return this._backing.getLiveRefreshInterval();
+		// The container wins when it has an answer — a playlist states liveness directly. Otherwise the
+		// source does: the same bytes are a file on disk and a live feed off a socket.
+		return (await this._backing.getLiveRefreshInterval()) ?? this.input._reader.source._getLiveRefreshInterval();
 	}
 
 	/**
@@ -629,7 +707,7 @@ export interface InputVideoTrackBacking extends InputTrackBacking {
 	getTransformationMatrix(): MaybePromise<TransformationMatrix>;
 	getColorSpace(): Promise<VideoColorSpaceInit>;
 	canBeTransparent(): Promise<boolean>;
-	getDecoderConfig(): Promise<VideoDecoderConfig | null>;
+	getDecoderConfig(): Promise<VideoDecoderConfigWithHdr | null>;
 }
 
 /**
@@ -856,7 +934,10 @@ export class InputVideoTrack extends InputTrack {
 		return requireSync(value, 'displayHeight', 'getDisplayHeight');
 	}
 
-	/** Returns the color space of the track's samples. */
+	/**
+	 * Returns the color space of the track's samples. A field the file does not state is `undefined` or `null`
+	 * depending on where it was read from, so test an unstated field with `== null`, not `=== null`.
+	 */
 	async getColorSpace() {
 		return this._backing.getColorSpace();
 	}
@@ -878,6 +959,8 @@ export class InputVideoTrack extends InputTrack {
 	 * Returns the [decoder configuration](https://www.w3.org/TR/webcodecs/#video-decoder-config) for decoding the
 	 * track's packets using a [`VideoDecoder`](https://developer.mozilla.org/en-US/docs/Web/API/VideoDecoder). Returns
 	 * null if the track's codec is unknown.
+	 *
+	 * The config also carries the track's HDR10 static metadata, which WebCodecs has no field of its own for.
 	 */
 	async getDecoderConfig() {
 		return this._backing.getDecoderConfig();
@@ -1245,6 +1328,92 @@ export class InputAudioTrack extends InputTrack {
 		}
 
 		return determineAudioPacketType(codec, packet.data);
+	}
+}
+
+/**
+ * One cue as it was found inside a single packet of a subtitle track.
+ *
+ * A cue that outlives its packet is written into every packet it overlaps - split into parts by the ISOBMFF
+ * WebVTT rules, or repeated whole by a self-timed TTML document. `continuationId` ties the parts of one split
+ * cue together so {@link SubtitleCueSink} can rejoin them.
+ *
+ * @internal
+ */
+export type DecodedSubtitleCue = {
+	cue: SubtitleCue;
+	continuationId: number | null;
+};
+
+export interface InputSubtitleTrackBacking extends InputTrackBacking {
+	getType(): 'subtitle';
+	getCodec(): MaybePromise<SubtitleCodec | null>;
+	getConfig(): MaybePromise<SubtitleConfig | null>;
+	getDecoderConfig(): Promise<null>;
+	decodeCues(packet: EncodedPacket): DecodedSubtitleCue[];
+}
+
+/**
+ * Represents a subtitle track in an input file. Its cues are read with a {@link SubtitleCueSink}; its raw,
+ * still-encoded samples are available from an {@link EncodedPacketSink} like those of any other track.
+ *
+ * @group Input files & tracks
+ * @public
+ */
+export class InputSubtitleTrack extends InputTrack {
+	/** @internal */
+	override _backing: InputSubtitleTrackBacking;
+
+	/** @internal */
+	constructor(input: Input, backing: InputSubtitleTrackBacking) {
+		super(input, backing);
+
+		this._backing = backing;
+	}
+
+	get type(): TrackType {
+		return 'subtitle';
+	}
+
+	/** The codec of the track's packets. */
+	async getCodec(): Promise<SubtitleCodec | null> {
+		return this._backing.getCodec();
+	}
+
+	/**
+	 * The codec of the track's packets.
+	 * @deprecated Use {@link InputSubtitleTrack.getCodec} instead.
+	 */
+	get codec(): SubtitleCodec | null {
+		return requireSync(this._backing.getCodec(), 'codec', 'getCodec');
+	}
+
+	/**
+	 * Returns the track's codec-specific setup data, such as the WebVTT header preceding the first cue, or `null`
+	 * for codecs that carry no such data.
+	 */
+	async getConfig(): Promise<SubtitleConfig | null> {
+		return this._backing.getConfig();
+	}
+
+	async hasOnlyKeyPackets() {
+		return true; // Every subtitle packet stands on its own
+	}
+
+	async getCodecParameterString() {
+		return this._backing.getMetadataCodecParameterString?.() ?? null;
+	}
+
+	async canDecode() {
+		return (await this._backing.getCodec()) !== null;
+	}
+
+	async determinePacketType(packet: EncodedPacket): Promise<PacketType | null> {
+		if (!(packet instanceof EncodedPacket)) {
+			throw new TypeError('packet must be an EncodedPacket.');
+		}
+
+		return 'key';
 	}
 }
 

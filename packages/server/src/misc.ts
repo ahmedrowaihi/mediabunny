@@ -6,22 +6,205 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
+import { isMainThread } from 'node:worker_threads';
 import { VideoSamplePixelFormat, MediaCodec } from 'mediabunny';
 import * as NodeAv from 'node-av';
+import { IOContext } from 'node-av';
+import { AVIO_FLAG_WRITE } from 'node-av/constants';
 import { _serverOptions } from './index';
 import { assertNever } from '../../../src/misc';
 
+/**
+ * Satisfies a listening socket's parked accept by dialling it, which is the only way to end one: a native
+ * accept cannot be interrupted, so closing the context under it aborts the process. See FORK.md.
+ *
+ * @internal
+ */
+export const wakePendingAccept = async (url: string) => {
+	const target = new URL(url);
+	target.search = '';
+	if (target.hostname === '0.0.0.0' || target.hostname === '::' || target.hostname === '[::]') {
+		target.hostname = '127.0.0.1';
+	}
+
+	const peer = new IOContext();
+	try {
+		await peer.open2(target.toString(), AVIO_FLAG_WRITE);
+	} catch {
+		// The accept may have already failed or been satisfied; either way there is nothing to wake.
+	}
+
+	await peer.closep().catch(() => {});
+};
+
+/**
+ * The option checks every source and target in this package opens with, so their messages stay the same.
+ *
+ * @internal
+ */
+export const checkUrlAndOptions = (url: unknown, options: unknown): void => {
+	if (typeof url !== 'string') {
+		throw new TypeError('url must be a string.');
+	}
+	if (!options || typeof options !== 'object') {
+		throw new TypeError('options must be an object.');
+	}
+};
+
+/**
+ * Query parameters whose value is a shared secret. `passphrase` is SRT's and `secret` is RIST's; both
+ * can only be given to FFmpeg through the URL, since `avio_open2` takes no options dictionary and a
+ * protocol's private options do not exist until it has resolved the URL.
+ */
+const SECRET_QUERY_PARAMS = ['passphrase', 'secret'];
+
+/**
+ * Replaces the secrets in a URL with `[redacted]`, for a message that is about to be thrown or logged.
+ * Also drops userinfo, which is where an http(s) URL carries credentials.
+ *
+ * Takes the string rather than a `URL` so it can be used on input that failed to parse, and falls back
+ * to a blunt substitution for exactly that case.
+ *
+ * @internal
+ */
+export const redactUrl = (url: string): string => {
+	try {
+		const parsed = new URL(url);
+		for (const name of SECRET_QUERY_PARAMS) {
+			if (parsed.searchParams.has(name)) {
+				parsed.searchParams.set(name, '[redacted]');
+			}
+		}
+		if (parsed.password) {
+			parsed.password = '[redacted]';
+		}
+		return parsed.toString();
+	} catch {
+		return redactSecretsInText(url);
+	}
+};
+
+/**
+ * Redacts the same secrets in arbitrary text, for a line that holds a URL somewhere inside it — which
+ * is the shape of FFmpeg's own log output.
+ *
+ * @internal
+ */
+export const redactSecretsInText = (text: string): string =>
+	text.replace(
+		new RegExp(`([?&](?:${SECRET_QUERY_PARAMS.join('|')})=)[^&\\s"']*`, 'gi'),
+		'$1[redacted]',
+	);
+
+let logRedactionInstalled = false;
+
+/**
+ * Takes FFmpeg's log callback so the URL it prints on a failed open has its secrets removed.
+ *
+ * FFmpeg logs `Connection to <url> failed` at `AV_LOG_ERROR` from C, and the URL is the only way to give
+ * libsrt a passphrase - `avio_open2` takes no options dictionary, and a protocol's private options do
+ * not exist until it has resolved the URL. Taking the callback is therefore the only place the secret
+ * can be removed, and it replaces FFmpeg's own printing, so the line is written on unchanged otherwise.
+ *
+ * **Called from every class that can carry a secret, not only from `registerMediabunnyServer`.** A host
+ * that constructs an `SrtTarget` or a `NetworkSource` without registering the server would otherwise get
+ * the unredacted line, which is how this was found.
+ *
+ * @internal
+ */
+export const installSecretRedactingLog = (): void => {
+	// One process-wide slot: a callback left behind by an exited worker aborts the process
+	if (logRedactionInstalled || !isMainThread) {
+		return;
+	}
+
+	logRedactionInstalled = true;
+	NodeAv.Log.setCallback((_level: number, message: string) => {
+		process.stderr.write(redactSecretsInText(message));
+	});
+};
+
+/**
+ * Reports a failed `open2` and closes the context it failed on. Always throws.
+ *
+ * @internal
+ */
+export const throwFailedOpen = async (
+	context: IOContext,
+	label: string,
+	url: string,
+	ret: number,
+	encrypted: boolean,
+): Promise<never> => {
+	// Without this the native handle is left for the GC to finalize whenever it likes, and these failures
+	// come in bursts because a caller retries
+	await context.closep().catch(() => {});
+
+	throw new Error(
+		`${label}: could not open ${redactUrl(url)} (AVERROR ${ret}).`
+		// SRT reports a refused connection, an unreachable host and a rejected passphrase with the same
+		// AVERROR - measured -5 or -60 for all of them - so the passphrase is named rather than diagnosed
+		+ (encrypted
+			? ' SRT does not distinguish a rejected passphrase from any other refusal, so check that both'
+			+ ' ends agree on the passphrase and key length.'
+			: ''),
+	);
+};
+
+/** @internal */
+export const __resetSecretRedactingLogForTests = (): void => {
+	logRedactionInstalled = false;
+	NodeAv.Log.setCallback(null);
+};
+
+/** SRT key lengths in bits, as the options take them; libsrt's `pbkeylen` is the byte count. */
+const KEY_LENGTHS_IN_BITS = [128, 192, 256];
+
+/**
+ * The passphrase checks every SRT-speaking class in this package opens with. SRT itself requires 10 to
+ * 79 characters and refuses the connection otherwise, which it reports no differently from any other
+ * failure - so the bound is enforced here, where it can still be attributed.
+ *
+ * @internal
+ */
+export const checkPassphrase = (
+	options: { passphrase?: unknown; keyLength?: unknown },
+	namespace = 'options',
+): void => {
+	if (
+		options.passphrase !== undefined
+		&& (typeof options.passphrase !== 'string' || options.passphrase.length < 10
+			|| options.passphrase.length > 79)
+	) {
+		throw new TypeError(`${namespace}.passphrase, when provided, must be a string of 10 to 79 characters.`);
+	}
+	if (options.keyLength !== undefined && !KEY_LENGTHS_IN_BITS.includes(options.keyLength as number)) {
+		throw new TypeError(`${namespace}.keyLength, when provided, must be 128, 192 or 256.`);
+	}
+};
+
+/** @internal */
+export const positive = (value: number | undefined, name: string): void => {
+	if (value !== undefined && (!Number.isFinite(value) || value <= 0)) {
+		throw new TypeError(`options.${name}, when provided, must be a positive number.`);
+	}
+};
+
 export const CODEC_TO_CODEC_ID: Partial<Record<MediaCodec, NodeAv.AVCodecID>> = {
 	avc: NodeAv.AV_CODEC_ID_H264,
+	mpeg2: NodeAv.AV_CODEC_ID_MPEG2VIDEO,
 	hevc: NodeAv.AV_CODEC_ID_HEVC,
 	vp8: NodeAv.AV_CODEC_ID_VP8,
 	vp9: NodeAv.AV_CODEC_ID_VP9,
 	av1: NodeAv.AV_CODEC_ID_AV1,
 	prores: NodeAv.AV_CODEC_ID_PRORES,
+	qtrle: NodeAv.AV_CODEC_ID_QTRLE,
+	png: NodeAv.AV_CODEC_ID_PNG,
 
 	aac: NodeAv.AV_CODEC_ID_AAC,
 	opus: NodeAv.AV_CODEC_ID_OPUS,
 	mp3: NodeAv.AV_CODEC_ID_MP3,
+	mp2: NodeAv.AV_CODEC_ID_MP2,
 	vorbis: NodeAv.AV_CODEC_ID_VORBIS,
 	flac: NodeAv.AV_CODEC_ID_FLAC,
 	ac3: NodeAv.AV_CODEC_ID_AC3,
@@ -308,3 +491,5 @@ export const getTrueHdChannelLayout = (numChannels: number): NodeAv.ChannelLayou
 		default: return { nbChannels: numChannels, order: NodeAv.AV_CHANNEL_ORDER_UNSPEC, mask: 0n };
 	}
 };
+
+export const DEFAULT_MAX_QUEUE_BYTES = 2 * 1024 * 1024;

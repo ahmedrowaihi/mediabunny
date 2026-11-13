@@ -418,3 +418,21 @@ test('CustomSource cancels streams yielding more than requested', async () => {
 	expect(await new Reader(ref.source).requestSlice(0, 10)).not.toBeNull();
 	expect(cancel).toHaveBeenCalledOnce();
 });
+
+// Regression test for upstream #542.
+test('A source that resolves after dispose is freed, and the caller is told', async () => {
+	const { promise, resolve } = promiseWithResolvers<BufferSource>();
+	const root = new CustomPathedSource('root.m3u8', () => promise);
+
+	const input = new Input({ source: root, formats: ALL_FORMATS });
+	const inFlight = input._getSourceCached({ path: 'segment.ts', isRoot: false });
+
+	// Dispose while the request handler is still unresolved
+	input.dispose();
+
+	const resolved = new BufferSource(new Uint8Array(8));
+	resolve(resolved);
+
+	await expect(inFlight).rejects.toThrow(InputDisposedError);
+	expect(resolved._disposed).toBe(true);
+});

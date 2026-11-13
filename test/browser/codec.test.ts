@@ -272,6 +272,7 @@ test('AV1 level for a wide picture', () => {
 		hevcCodecInfo: null,
 		vp9CodecInfo: null,
 		av1CodecInfo: null,
+		mpeg2CodecInfo: null,
 		proresFormat: null,
 	})).toBe('av01.0.01M.08');
 });
@@ -299,6 +300,7 @@ test('VP9 codec info with level 0', () => {
 			matrixCoefficients: 1,
 		},
 		av1CodecInfo: null,
+		mpeg2CodecInfo: null,
 		proresFormat: null,
 	})).toBe('vp09.00.31.08');
 });

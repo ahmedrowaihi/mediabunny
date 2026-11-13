@@ -24,7 +24,7 @@ test('MPEG-TS output format', async () => {
 	expect(format.mimeType).toBe('video/MP2T');
 	expect(format.fileExtension).toBe('.ts');
 	expect(format.supportsVideoTransformationMetadata).toBe(false);
-	expect(format.getSupportedCodecs()).toEqual(['avc', 'hevc', 'aac', 'mp3', 'ac3', 'eac3', 'dts']);
+	expect(format.getSupportedCodecs()).toEqual(['avc', 'hevc', 'mpeg2', 'aac', 'mp3', 'mp2', 'ac3', 'eac3', 'dts']);
 	expect(format.getSupportedTrackCounts()).toEqual({
 		video: { min: 0, max: 16 },
 		audio: { min: 0, max: 32 },
@@ -346,8 +346,12 @@ test('MPEG-TS muxing with HEVC and MP3', async () => {
 	const videoDuration = await videoTrack.computeDuration();
 	const audioDuration = await audioTrack.computeDuration();
 
-	expect(videoDuration).toBeCloseTo(4.933333333333334, 1);
-	expect(audioDuration).toBeCloseTo(5, 1);
+	// video-h265.mp4's first packet presents at 0 but decodes at -0.0667, so the programme is moved
+	// forward by that much to keep DTS <= PTS on the wire, as ffmpeg's avoid_negative_ts does. Both
+	// tracks then begin at 0.0667, and MPEG-TS has no edit list to hide the gap, so both durations
+	// read that much longer than the media they carry.
+	expect(videoDuration).toBeCloseTo(5.033333333333333, 1);
+	expect(audioDuration).toBeCloseTo(5.084622222222222, 1);
 });
 
 test('MPEG-TS muxing with no data', async () => {
@@ -838,8 +842,19 @@ test('DTS with B-frames', async () => {
 	await output.finalize();
 
 	const pesPackets = readPesPackets(new Uint8Array(output.target.buffer!), 0x100);
-	expect(pesPackets.map(x => x.pts)).toEqual(frames.map(x => 3000 * x));
-	expect(pesPackets.map(x => x.dts)).toEqual([-1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9].map(x => 3000 * x));
+
+	// The head packet decodes a frame before zero while presenting at zero, which is the sign split, so the
+	// programme is carried forward one frame rather than wrapping a negative decode time onto the wire.
+	expect(pesPackets.map(x => x.pts)).toEqual(frames.map(x => 3000 * (x + 1)));
+	expect(pesPackets.map(x => x.dts)).toEqual(frames.map((_, i) => 3000 * i));
+
+	// What the numbers above are for: no two access units may decode at the same instant, and 13818-1
+	// 2.4.2 wants DTS <= PTS. Clamping each decode time to its own presentation time satisfies the second
+	// and quietly breaks the first.
+	const dts = pesPackets.map(x => x.dts!);
+	expect(dts.every((value, i) => i === 0 || value > dts[i - 1]!)).toBe(true);
+	expect(dts.every((value, i) => value <= pesPackets[i]!.pts)).toBe(true);
+	expect(dts.every(value => value >= 0)).toBe(true);
 });
 
 test('HEVC access unit delimiter', async () => {

@@ -18,6 +18,7 @@ import {
 	toArray,
 	TransformationMatrix,
 } from './misc';
+import { type DoviConfig, validateDoviConfig } from './dovi';
 import { MetadataTags, TrackDisposition, validateMetadataTags, validateTrackDisposition } from './metadata';
 import { Muxer } from './muxer';
 import { OutputFormat } from './output-format';
@@ -27,6 +28,8 @@ import { Writer } from './writer';
 import { Logging } from './logging';
 import { EncodedPacket } from './packet';
 import { validateAudioChunkMetadata, validateVideoChunkMetadata } from './codec';
+import { type VideoDecoderConfigWithHdr } from './hdr-metadata';
+import { type ClosedCaptionsMetadata, validateClosedCaptionsMetadata } from './closed-captions';
 
 /**
  * List of all track types.
@@ -304,13 +307,49 @@ export type VideoTrackMetadata = BaseTrackMetadata & {
 	 * The decoder config for this video track, provided ahead of time. This is provided automatically when media data
 	 * added to the track, but by specifying it here, you give the muxer additional information that it can make use of.
 	 * Zero-packet tracks become possible to write when this field is set.
+	 *
+	 * It may also carry the track's HDR10 static metadata, which WebCodecs has no field of its own for.
 	 */
-	decoderConfig?: VideoDecoderConfig;
+	decoderConfig?: VideoDecoderConfigWithHdr;
 	/**
 	 * Can be provided in addition to {@link VideoTrackMetadata.decoderConfig} to provide additional track information
 	 * not included in the decoder config. This packet will not be added to the media data.
 	 */
 	primingPacket?: EncodedPacket;
+	/**
+	 * Where the AVC or HEVC parameter sets (SPS/PPS, plus VPS) are carried in this track's packets. Ignored by all
+	 * other codecs.
+	 *
+	 * - `'outOfBand'`: They are kept solely in the sample entry, signalled as `avc1`/`hvc1`.
+	 * - `'inBand'`: They are also repeated throughout the packets, signalled as `avc3`/`hev1`.
+	 *
+	 * Defaults to `'inBand'` for packets given in Annex B format, which keep theirs, and to `'outOfBand'` otherwise.
+	 * Set it when remuxing packets that repeat their parameter sets and come with a decoder config, as nothing in
+	 * such packets tells the two layouts apart.
+	 */
+	parameterSets?: 'inBand' | 'outOfBand';
+	/**
+	 * Declares that this track's packets carry closed captions in their video bitstream, and says whether the HLS
+	 * and DASH manifests announce them. Only AVC and HEVC tracks can carry them.
+	 *
+	 * Declaring is what makes the manifests announce the captions; it is not what permits them. The bytes come
+	 * from the frames (`VideoSampleInit.closedCaptions`) or, on an encoded track, per packet via the
+	 * `closedCaptions` field of the metadata passed to {@link EncodedVideoPacketSource.add} — and a track may
+	 * carry captions it does not declare, which no manifest then mentions. The reverse is refused: declaring
+	 * them and supplying none fails before any manifest is written, as does a packet that would end up
+	 * stating two disagreeing caption SEI messages.
+	 */
+	closedCaptions?: ClosedCaptionsMetadata;
+	/**
+	 * Declares that this track is Dolby Vision, stating the configuration record the output writes into its
+	 * sample entry. Only AVC and HEVC tracks can carry one.
+	 *
+	 * The per-frame RPUs come from the frames (`VideoSampleInit.dolbyVisionRpu`) or, on an encoded track,
+	 * already in the packets. Only a cross-compatible base layer can be declared here: a
+	 * `blSignalCompatibilityId` of 0 — profile 5 — means the base layer is IPT-PQ-c2, which an encoder
+	 * cannot produce from ordinary frames, so declaring it on an encoded track is refused.
+	 */
+	dolbyVision?: DoviConfig;
 };
 /**
  * Additional metadata for audio tracks.
@@ -726,6 +765,34 @@ export class Output<
 				throw new TypeError('metadata.primingPacket can only be provided alongside metadata.decoderConfig.');
 			}
 		}
+		if (
+			metadata.parameterSets !== undefined
+			&& !['inBand', 'outOfBand'].includes(metadata.parameterSets)
+		) {
+			throw new TypeError(
+				`Invalid parameter set placement: ${metadata.parameterSets}. Must be 'inBand' or 'outOfBand'.`,
+			);
+		}
+		if (metadata.dolbyVision !== undefined) {
+			validateDoviConfig(metadata.dolbyVision, 'metadata.dolbyVision');
+
+			if (source._codec !== 'avc' && source._codec !== 'hevc') {
+				throw new Error(
+					`metadata.dolbyVision was provided, but ${source._codec} cannot carry a Dolby Vision`
+					+ ' configuration record. Dolby Vision rides on AVC or HEVC.',
+				);
+			}
+		}
+		if (metadata.closedCaptions !== undefined) {
+			validateClosedCaptionsMetadata(metadata.closedCaptions, 'metadata.closedCaptions');
+
+			if (source._codec !== 'avc' && source._codec !== 'hevc') {
+				throw new Error(
+					`metadata.closedCaptions was provided, but ${source._codec} has no bitstream that can carry`
+					+ ' them. Closed captions ride in AVC or HEVC SEI messages.',
+				);
+			}
+		}
 
 		const metadataCopy = { ...metadata };
 		metadataCopy.group ??= this.defaultTrackGroup;
@@ -811,7 +878,8 @@ export class Output<
 		if (presentTracksOfThisType === maxCount) {
 			throw new Error(
 				maxCount === 0
-					? `${this.format._name} does not support ${track.type} tracks.`
+					? (`${this.format._name} does not support ${track.type} tracks.`
+						+ this.format._trackTypeUnsupportedHint(track.type))
 					: (`${this.format._name} does not support more than ${maxCount} ${track.type} track`
 						+ `${maxCount === 1 ? '' : 's'}.`),
 			);

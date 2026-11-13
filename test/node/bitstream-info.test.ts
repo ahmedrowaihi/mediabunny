@@ -1,0 +1,420 @@
+/*!
+ * Copyright (c) 2026-present, Vanilagy and contributors
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
+
+// A packet's own type says 'key' or 'delta', and a codec string says nothing about film grain. Both are facts
+// a consumer otherwise has to trace with ffprobe, which is the point of reading them out of the bitstream.
+
+import fs from 'node:fs';
+import path from 'node:path';
+import { expect, test } from 'vitest';
+import { registerMediabunnyServer } from '@mediabunny/server';
+import { Input } from '../../src/input.js';
+import { BufferSource } from '../../src/source.js';
+import { ALL_FORMATS } from '../../src/input-format.js';
+import { EncodedPacketSink } from '../../src/media-sink.js';
+import { Output } from '../../src/output.js';
+import { BufferTarget } from '../../src/target.js';
+import { Mp4OutputFormat } from '../../src/output-format.js';
+import { VideoSampleSource } from '../../src/media-source.js';
+import { VideoSample } from '../../src/sample.js';
+import { Quality, type VideoEncoderControls } from '../../src/encode.js';
+import {
+	createAv1FilmGrainStateReader,
+	createVideoQuantizerReader,
+	readVideoSliceType,
+	type VideoQuantizerCodec,
+	type VideoSliceType,
+} from '../../src/bitstream-info.js';
+import { FilePathSource } from '../../src/source.js';
+import { extractVideoBitDepth, extractVideoCodecString, type VideoBitDepth } from '../../src/codec.js';
+import {
+	deserializeHevcDecoderConfigurationRecord,
+	removeEmulationPreventionBytes,
+	serializeHevcDecoderConfigurationRecord,
+} from '../../src/codec-data.js';
+import { Bitstream } from '../../shared/bitstream.js';
+import { readExpGolomb, readSignedExpGolomb, writeExpGolomb } from '../../src/misc.js';
+import { toUint8Array } from '../../src/misc.js';
+
+registerMediabunnyServer();
+
+const FPS = 24;
+const FRAMES = 24;
+const WIDTH = 256;
+const HEIGHT = 144;
+
+/** Moving structure, so the encoder has something to predict rather than coding every frame intra. */
+const frameAt = (index: number) => {
+	const data = new Uint8Array(WIDTH * HEIGHT * 4);
+	for (let pixel = 0; pixel < WIDTH * HEIGHT; pixel++) {
+		const x = pixel % WIDTH;
+		const y = Math.floor(pixel / WIDTH);
+		const value = ((x + 3 * index) & 0x20) ^ ((y >> 3) & 1 ? 0xff : 0) ? 220 : 30;
+		data[4 * pixel] = value;
+		data[4 * pixel + 1] = value;
+		data[4 * pixel + 2] = value;
+	}
+
+	return data;
+};
+
+const encode = async (options: {
+	codec: 'avc' | 'hevc' | 'av1';
+	encoderControls?: VideoEncoderControls;
+	bitDepth?: VideoBitDepth;
+	quality?: Quality;
+}) => {
+	const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+	const source = new VideoSampleSource({
+		codec: options.codec,
+		quality: options.quality ?? new Quality('low'),
+		keyFrameInterval: 10,
+		hardwareAcceleration: 'prefer-software',
+		encoderControls: options.encoderControls,
+		bitDepth: options.bitDepth,
+	});
+	output.addVideoTrack(source);
+	await output.start();
+
+	for (let i = 0; i < FRAMES; i++) {
+		using sample = new VideoSample(frameAt(i), {
+			format: 'RGBX',
+			codedWidth: WIDTH,
+			codedHeight: HEIGHT,
+			timestamp: i / FPS,
+			duration: 1 / FPS,
+		});
+		await source.add(sample);
+	}
+	source.close();
+	await output.finalize();
+
+	using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+	const track = (await input.getPrimaryVideoTrack())!;
+	const decoderConfig = (await track.getDecoderConfig())!;
+	const packets = [];
+	for await (const packet of new EncodedPacketSink(track).packets()) {
+		packets.push({ type: packet.type, timestamp: packet.timestamp, data: packet.data });
+	}
+
+	return { decoderConfig, packets };
+};
+
+test.each(['avc', 'hevc'] as const)(
+	'%s slice types name how each packet is coded, not whether it is a sync sample',
+	async (codec) => {
+		// B frames, so the result has to distinguish all three rather than only intra from inter
+		const { decoderConfig, packets } = await encode({ codec, encoderControls: { maxBFrames: 3 } });
+		const sliceTypes = packets.map(p => readVideoSliceType(p.data, decoderConfig, codec));
+
+		expect(sliceTypes).not.toContain(null);
+
+		// Every sync sample is intra-coded, which is the half of the mapping the packet type already implies
+		for (const [index, { type }] of packets.entries()) {
+			if (type === 'key') {
+				expect(sliceTypes[index]).toBe('i');
+			}
+		}
+
+		// The half it does not: a reader that returned a constant, or only ever 'i', would pass the above
+		const kinds = new Set(sliceTypes as VideoSliceType[]);
+		expect(kinds).toContain('i');
+		expect(kinds).toContain('p');
+		expect(kinds).toContain('b');
+
+		// Decode order against presentation order, which is the container's account rather than this reader's:
+		// a packet decoded after a frame it presents before can only be a B frame, and a P frame never is one.
+		// Without this, a mapping with 'p' and 'b' swapped would satisfy every assertion above.
+		let highestSoFar = -Infinity;
+		let reordered = 0;
+		for (const [index, packet] of packets.entries()) {
+			if (packet.timestamp < highestSoFar) {
+				reordered++;
+				expect(sliceTypes[index]).toBe('b');
+			} else {
+				expect(sliceTypes[index]).not.toBe('b');
+			}
+
+			highestSoFar = Math.max(highestSoFar, packet.timestamp);
+		}
+
+		expect(reordered).toBeGreaterThan(0);
+	},
+	300_000,
+);
+
+test('readVideoSliceType reports nothing rather than guessing on data that carries no slice', async () => {
+	const { decoderConfig } = await encode({ codec: 'avc' });
+
+	expect(readVideoSliceType(new Uint8Array(0), decoderConfig, 'avc')).toBe(null);
+	// A well-formed length prefix over a truncated slice header, which the exp-Golomb reader rejects
+	expect(readVideoSliceType(new Uint8Array([0, 0, 0, 2, 0x65, 0x00]), decoderConfig, 'avc')).toBe(null);
+}, 300_000);
+
+test('AV1 film grain reads as absent unless the encoder was asked to synthesize it', async () => {
+	const plain = await encode({ codec: 'av1' });
+	const plainReader = createAv1FilmGrainStateReader(plain.decoderConfig.description);
+	const plainStates = plain.packets.map(p => plainReader.read(p.data));
+
+	expect(plainStates.every(state => state?.filmGrainParamsPresent === false)).toBe(true);
+	expect(plainStates.some(state => state?.applyGrain)).toBe(false);
+
+	// SVT-AV1's film-grain denoise level, which turns synthesis on
+	const grainy = await encode({
+		codec: 'av1',
+		encoderControls: { options: { 'svtav1-params': 'film-grain=12' } },
+	});
+	const grainyReader = createAv1FilmGrainStateReader(grainy.decoderConfig.description);
+	const grainyStates = grainy.packets.map(p => grainyReader.read(p.data));
+
+	expect(grainyStates.every(state => state?.filmGrainParamsPresent === true)).toBe(true);
+	expect(grainyStates.some(state => state?.applyGrain === true)).toBe(true);
+}, 300_000);
+
+// A profile only bounds the depth a stream may use. Reading the bound as the depth made every rung of a
+// lossless 8-bit source 10-bit, so these assert the config's answer rather than the codec string's.
+const BIT_DEPTH_CASES = [
+	{
+		// High 4:4:4 Predictive permits 8 through 14 bits while this stream is 8-bit. This is the case that
+		// was read as 10-bit.
+		label: 'avc High 4:4:4 Predictive, 8-bit',
+		encode: { codec: 'avc' as const, encoderControls: { profile: 'high444' } },
+		expected: 8 as VideoBitDepth,
+	},
+	{
+		label: 'avc High, 8-bit',
+		encode: { codec: 'avc' as const, encoderControls: { profile: 'high' } },
+		expected: 8 as VideoBitDepth,
+	},
+	{
+		label: 'avc 10-bit',
+		encode: { codec: 'avc' as const, bitDepth: 10 as VideoBitDepth },
+		expected: 10 as VideoBitDepth,
+	},
+	{
+		label: 'hevc Main, 8-bit',
+		encode: { codec: 'hevc' as const, encoderControls: { profile: 'main' } },
+		expected: 8 as VideoBitDepth,
+	},
+	{
+		label: 'hevc Main 10',
+		encode: { codec: 'hevc' as const, bitDepth: 10 as VideoBitDepth },
+		expected: 10 as VideoBitDepth,
+	},
+	{
+		// Asked for main444-8; x265 encodes Main instead, because the input is 4:2:0. Kept because the asked-for
+		// depth is what matters here, but it is Main that is measured - this path reaches no RExt profile.
+		label: 'hevc 4:4:4 8-bit requested',
+		encode: { codec: 'hevc' as const, encoderControls: { profile: 'main444-8' } },
+		expected: 8 as VideoBitDepth,
+	},
+];
+
+test.each(BIT_DEPTH_CASES)(
+	'bit depth comes from the decoder config, not the profile ($label)',
+	async ({ encode: options, expected }) => {
+		const { decoderConfig } = await encode(options);
+
+		expect(extractVideoBitDepth(decoderConfig)).toBe(expected);
+	},
+	300_000,
+);
+
+test('the codec string alone cannot tell an 8-bit High 4:4:4 stream from a 10-bit one', async () => {
+	// No encoder here reaches a 4:4:4 AVC profile: libx264 takes its profile from the pixel format, and
+	// nothing asks the chooser for 4:4:4. High already carries chroma_format_idc and both bit depths, so
+	// restating its profile as High 4:4:4 Predictive leaves a legal 8-bit SPS whose profile states a range.
+	const { decoderConfig } = await encode({ codec: 'avc', encoderControls: { profile: 'high' } });
+
+	const avcC = new Uint8Array(toUint8Array(decoderConfig.description!));
+	const HIGH_444_PREDICTIVE = 0xf4;
+	expect(avcC[1]).toBe(0x64); // AVCProfileIndication, High
+	avcC[1] = HIGH_444_PREDICTIVE;
+
+	// The record holds the SPS from byte 8 on, behind its u16 length; its profile_idc has to agree with
+	// the record's own, or a reader may take either one.
+	const spsProfileIdc = 8 + 1;
+	expect(avcC[spsProfileIdc]).toBe(0x64);
+	avcC[spsProfileIdc] = HIGH_444_PREDICTIVE;
+
+	const patched = { ...decoderConfig, description: avcC };
+	const codecString = extractVideoCodecString({
+		width: WIDTH,
+		height: HEIGHT,
+		codec: 'avc',
+		codecDescription: avcC,
+		colorSpace: null,
+		avcType: 1,
+		avcCodecInfo: null,
+		hevcType: null,
+		hevcCodecInfo: null,
+		vp9CodecInfo: null,
+		av1CodecInfo: null,
+		mpeg2CodecInfo: null,
+		proresFormat: null,
+	});
+
+	// profile_idc 244 permits 8 to 14 bits and states none of them
+	expect(codecString.startsWith('avc1.f4')).toBe(true);
+
+	// With only the string there is nothing to read but the profile's upper bound; the config states the depth.
+	expect(extractVideoBitDepth(codecString)).toBe(10);
+	expect(extractVideoBitDepth(patched)).toBe(8);
+}, 300_000);
+
+test('hevc bit depth is read out of hvcC, which states depths no codec string carries', async () => {
+	const { decoderConfig } = await encode({ codec: 'hevc', bitDepth: 10 });
+	const record = deserializeHevcDecoderConfigurationRecord(toUint8Array(decoderConfig.description!))!;
+
+	// A 12-bit Range Extensions stream. x265 reaches no RExt profile from 4:2:0 input, so the record is edited
+	// rather than encoded - but hvcC's own field is what the HEVC branch reads, and this is that field.
+	const rExt = { ...record, generalProfileIdc: 4, bitDepthLumaMinus8: 4, bitDepthChromaMinus8: 4 };
+	const config = {
+		codec: 'hvc1.4.4.L60.90',
+		description: serializeHevcDecoderConfigurationRecord(rExt),
+	};
+
+	// RExt states its depth in the config alone; the string's profile number says nothing about it
+	expect(extractVideoBitDepth(config.codec)).toBe(8);
+	expect(extractVideoBitDepth(config)).toBe(12);
+}, 300_000);
+
+// What an encoder holding a bitrate varies is the quantizer, not the frame size, so the quantizer is what
+// ranks a source's difficulty. Every value below came out of `ffmpeg -i <fixture> -c copy -bsf:v
+// trace_headers -f null -`: `pic_init_qp_minus26`/`init_qp_minus26` plus each `slice_qp_delta` for AVC and
+// HEVC, each `base_q_idx` for AV1 and VP9. Keeping them as a fixture means CI reproduces the comparison
+// without ffmpeg, and that the expectation came from a second implementation rather than from this one.
+const QUANTIZER_GROUND_TRUTH = JSON.parse(
+	fs.readFileSync(path.join(__dirname, '_video-quantizers.json'), 'utf8'),
+) as Record<string, { codec: VideoQuantizerCodec; values: number[] }>;
+
+test.each(Object.entries(QUANTIZER_GROUND_TRUTH))(
+	'%s quantizers match what ffmpeg traces in the bitstream',
+	async (file, { codec, values: expected }) => {
+		using input = new Input({
+			source: new FilePathSource(path.join(__dirname, '../public', file)),
+			formats: ALL_FORMATS,
+		});
+		const track = (await input.getPrimaryVideoTrack())!;
+		const decoderConfig = (await track.getDecoderConfig())!;
+		const reader = createVideoQuantizerReader(codec, decoderConfig);
+
+		// Flattened, because a packet states one quantizer per slice or per coded frame and the trace states
+		// them in the same order without saying which packet each belonged to
+		const read: number[] = [];
+		let packets = 0;
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			packets++;
+			const quantizer = reader.read(packet.data);
+			expect(quantizer).not.toBeNull();
+			expect(quantizer!.scale).toBe(codec === 'avc' || codec === 'hevc' ? 'h26x' : 'qindex');
+			expect(quantizer!.value).toBe(
+				quantizer!.values.reduce((a, b) => a + b, 0) / quantizer!.values.length,
+			);
+			read.push(...quantizer!.values);
+		}
+
+		expect(packets).toBeGreaterThan(50);
+		expect(read).toEqual(expected);
+	},
+	300_000,
+);
+
+test.each(['avc', 'hevc'] as const)(
+	'%s quantizers follow what the encoder was asked for',
+	async (codec) => {
+		// The reader is only useful if it tracks the encoder's own decisions, and a fixed-quantizer request
+		// is the one case where those are known in advance. x264 and x265 still vary it per frame around what
+		// was asked, which is why this reads the mean rather than expecting the requested value back.
+		const meanQuantizer = async (quantizer: number) => {
+			const { decoderConfig, packets } = await encode({ codec, quality: new Quality({ quantizer }) });
+			const reader = createVideoQuantizerReader(codec, decoderConfig);
+			const values = packets.flatMap(packet => reader.read(packet.data)?.values ?? []);
+
+			expect(values.length).toBeGreaterThanOrEqual(packets.length);
+			expect(Math.min(...values)).toBeGreaterThanOrEqual(0);
+			expect(Math.max(...values)).toBeLessThanOrEqual(51);
+
+			return values.reduce((a, b) => a + b, 0) / values.length;
+		};
+
+		const [low, middle, high] = [await meanQuantizer(18), await meanQuantizer(30), await meanQuantizer(42)];
+
+		expect(low).toBeLessThan(middle);
+		expect(middle).toBeLessThan(high);
+		// Each step of 12 is 2 doublings of the quantizer step, so a reader off by a scale factor fails here
+		expect(middle - low).toBeGreaterThan(6);
+		expect(high - middle).toBeGreaterThan(6);
+	},
+	300_000,
+);
+
+/** Writes a signed exponential-Golomb code, the inverse of `readSignedExpGolomb`'s mapping. */
+const writeSignedExpGolomb = (bitstream: Bitstream, value: number) => {
+	writeExpGolomb(bitstream, value > 0 ? 2 * value - 1 : -2 * value);
+};
+
+/** Returns the given HEVC PPS with its `init_qp_minus26` replaced, every other field left as it was. */
+const withInitQpMinus26 = (pps: Uint8Array, initQpMinus26: number) => {
+	const source = new Bitstream(removeEmulationPreventionBytes(pps.subarray(2)));
+	const patched = new Bitstream(new Uint8Array(pps.length + 8));
+
+	// H.265 7.3.2.3, up to and including init_qp_minus26
+	writeExpGolomb(patched, readExpGolomb(source)); // pps_pic_parameter_set_id
+	writeExpGolomb(patched, readExpGolomb(source)); // pps_seq_parameter_set_id
+	patched.copyBits(1 + 1 + 3 + 1 + 1, source); // through cabac_init_present_flag
+	writeExpGolomb(patched, readExpGolomb(source)); // num_ref_idx_l0_default_active_minus1
+	writeExpGolomb(patched, readExpGolomb(source)); // num_ref_idx_l1_default_active_minus1
+	readSignedExpGolomb(source); // init_qp_minus26, replaced
+	writeSignedExpGolomb(patched, initQpMinus26);
+	patched.copyBits(source.getBitsLeft(), source);
+
+	return new Uint8Array([
+		...pps.subarray(0, 2),
+		...patched.bytes.subarray(0, Math.ceil(patched.pos / 8)),
+	]);
+};
+
+test('a HEVC quantizer is read relative to the PPS, not to 26', async () => {
+	// Every HEVC encoder here writes init_qp_minus26 = 0 and states the whole quantizer per slice, so no
+	// real encode can tell a reader that honours the PPS from one that assumes 26. This patches the term
+	// into a real PPS instead: if it is being read, every slice's quantizer shifts with it.
+	using input = new Input({
+		source: new FilePathSource(path.join(__dirname, '../public/video-h265.mp4')),
+		formats: ALL_FORMATS,
+	});
+	const track = (await input.getPrimaryVideoTrack())!;
+	const decoderConfig = (await track.getDecoderConfig())!;
+	const record = deserializeHevcDecoderConfigurationRecord(toUint8Array(decoderConfig.description!))!;
+
+	const ppsArray = record.arrays.find(array => array.nalUnitType === 34)!;
+	expect(ppsArray.nalUnits).toHaveLength(1);
+
+	const SHIFT = -7;
+	const patched = serializeHevcDecoderConfigurationRecord({
+		...record,
+		arrays: record.arrays.map(array => array.nalUnitType === 34
+			? { ...array, nalUnits: [withInitQpMinus26(array.nalUnits[0]!, SHIFT)] }
+			: array),
+	});
+
+	const read = async (description: AllowSharedBufferSource) => {
+		const reader = createVideoQuantizerReader('hevc', { ...decoderConfig, description });
+		const values: number[] = [];
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			values.push(...reader.read(packet.data)?.values ?? []);
+		}
+		return values;
+	};
+
+	const original = await read(decoderConfig.description!);
+	const shifted = await read(patched);
+
+	expect(original).toHaveLength(300);
+	expect(shifted).toEqual(original.map(value => value + SHIFT));
+});

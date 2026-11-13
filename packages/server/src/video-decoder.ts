@@ -17,6 +17,9 @@ import {
 } from './misc';
 import { assert, binarySearchLessOrEqual, simplifyRational, toUint8Array } from '../../../src/misc';
 import { AvFrameVideoSampleResource } from './video-sample';
+import { parseClosedCaptionBytePairs } from '../../../src/closed-captions';
+import { dolbyVisionRpuNalUnit } from '../../../src/dovi';
+import { extractHdr10PlusFromAv1Packet, extractHdr10PlusPayload } from '../../../src/hdr-metadata';
 
 export class NodeAvVideoDecoder extends CustomVideoDecoder {
 	frame!: NodeAv.Frame;
@@ -25,6 +28,8 @@ export class NodeAvVideoDecoder extends CustomVideoDecoder {
 	pixelAspectRatio!: Rational;
 
 	// Bookkeeping to restore the original timing information
+	/** Keyed by packet timestamp: the decoder reorders, so the frame carrying one comes out later. */
+	hdr10PlusByTimestamp = new Map<number, Uint8Array>();
 	preciseTimings: {
 		microsecondTimestamp: number;
 		timestamp: number;
@@ -35,7 +40,9 @@ export class NodeAvVideoDecoder extends CustomVideoDecoder {
 
 	// eslint-disable-next-line @typescript-eslint/no-unused-vars
 	static override supports(codec: VideoCodec, config: VideoDecoderConfig): boolean {
-		return codec === 'avc' || codec === 'hevc' || codec === 'vp8' || codec === 'vp9' || codec === 'av1';
+		return codec === 'avc' || codec === 'hevc' || codec === 'vp8' || codec === 'vp9' || codec === 'av1'
+			// The overlay codecs, whose alpha is in the bitstream rather than in a second stream
+			|| codec === 'qtrle' || codec === 'png';
 	}
 
 	async init() {
@@ -88,6 +95,13 @@ export class NodeAvVideoDecoder extends CustomVideoDecoder {
 			? Buffer.from(toUint8Array(this.config.description))
 			: null;
 		codecContext.sampleAspectRatio = new NodeAv.Rational(this.pixelAspectRatio.num, this.pixelAspectRatio.den);
+		codecContext.threadCount = 0; // libavcodec defaults this to 1, unlike the ffmpeg CLI
+
+		// QuickTime RLE and PNG take their pixel format from this rather than from the bitstream, and
+		// `open2` returns EINVAL without it: 32 is the one that keeps the alpha channel
+		if (this.config.bitsPerCodedSample !== undefined) {
+			codecContext.bitsPerCodedSample = this.config.bitsPerCodedSample;
+		}
 
 		// Honor inferred H.264 reorder buffering even when bitstream restrictions aren't explicitly signaled
 		// See https://github.com/Vanilagy/mediabunny/issues/488
@@ -121,6 +135,15 @@ export class NodeAvVideoDecoder extends CustomVideoDecoder {
 			matroskaBlockAdditional.set(packet.sideData.alpha, 8);
 
 			this.packet.addSideData(NodeAv.AV_PKT_DATA_MATROSKA_BLOCKADDITIONAL, matroskaBlockAdditional);
+		}
+
+		if (this.codec === 'hevc' || this.codec === 'av1') {
+			const payload = this.codec === 'av1'
+				? extractHdr10PlusFromAv1Packet(packet.data)
+				: extractHdr10PlusPayload(packet.data, this.config, 'hevc');
+			if (payload) {
+				this.hdr10PlusByTimestamp.set(packet.microsecondTimestamp, payload);
+			}
 		}
 
 		const preciseTimingIndex = binarySearchLessOrEqual(
@@ -218,9 +241,19 @@ export class NodeAvVideoDecoder extends CustomVideoDecoder {
 			throw new Error('Frame clone allocation failed.');
 		}
 
+		const ccData = this.frame.getSideData(NodeAv.AV_FRAME_DATA_A53_CC);
+		const rpuData = this.frame.getSideData(NodeAv.AV_FRAME_DATA_DOVI_RPU_BUFFER);
+
+		const framePts = Number(this.frame.pts);
+		const hdr10Plus = this.hdr10PlusByTimestamp.get(framePts) ?? null;
+		this.hdr10PlusByTimestamp.delete(framePts);
+
 		this.onSample(new VideoSample(new AvFrameVideoSampleResource(clone), {
 			timestamp,
 			duration,
+			closedCaptions: ccData ? parseClosedCaptionBytePairs(toUint8Array(ccData)) : null,
+			dolbyVisionRpu: rpuData ? dolbyVisionRpuNalUnit(toUint8Array(rpuData)) : null,
+			hdr10Plus,
 		}));
 	}
 

@@ -34,5 +34,6 @@
 	"@mediabunny/truehd": "Adds Dolby TrueHD decoder and encoder support to Mediabunny.",
 	"@mediabunny/aac-encoder": "Polyfills AAC encoder support to Mediabunny.",
 	"@mediabunny/flac-encoder": "Adds FLAC encoder support to Mediabunny.",
-	"@mediabunny/prores": "Adds Apple ProRes decoder support to Mediabunny."
+	"@mediabunny/prores": "Adds Apple ProRes decoder support to Mediabunny.",
+	"@mediabunny/rist": "Adds RIST transport to Mediabunny in Node, over a system librist."
 }

@@ -2,6 +2,8 @@ import { defineConfig } from 'vitest/config';
 import { webdriverio } from '@vitest/browser-webdriverio';
 import path from 'node:path';
 
+const CHROME_PROFILE = 'node_modules/.cache/chrome-profile';
+
 export default defineConfig({
 	resolve: {
 		alias: {
@@ -17,8 +19,6 @@ export default defineConfig({
 				path.resolve(__dirname, './packages/mp3-encoder/dist/bundles/mediabunny-mp3-encoder.mjs'),
 			'@mediabunny/prores':
 				path.resolve(__dirname, './packages/prores/dist/bundles/mediabunny-prores.mjs'),
-			'@mediabunny/truehd':
-				path.resolve(__dirname, './packages/truehd/dist/bundles/mediabunny-truehd.mjs'),
 			'@mediabunny/server':
 				path.resolve(__dirname, './packages/server/src/index.ts'),
 			'@mediabunny/rist':
@@ -68,8 +68,14 @@ export default defineConfig({
 								'wdio:chromedriverOptions': {
 									cacheDir: path.resolve(__dirname, 'node_modules/.cache/webdriver'),
 								},
+								// Chrome leaks the profile directory it picks for itself when the run ends: 81 of
+								// them, 13 GB, filled this machine's disk and the suite then failed with ENOSPC
+								// rather than a test result. Naming one keeps it to a single reused directory.
 								'goog:chromeOptions': {
-									args: ['--autoplay-policy=no-user-gesture-required'],
+									args: [
+										'--autoplay-policy=no-user-gesture-required',
+										`--user-data-dir=${path.resolve(__dirname, CHROME_PROFILE)}`,
+									],
 								},
 							},
 						}),

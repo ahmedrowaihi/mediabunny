@@ -13,6 +13,7 @@ rm -rf packages/aac-encoder/dist
 rm -rf packages/flac-encoder/dist
 rm -rf packages/prores/dist
 rm -rf packages/server/dist
+rm -rf packages/rist/dist
 
 # Ensure license headers on all source files
 tsx scripts/ensure-license-headers.ts
@@ -27,6 +28,7 @@ tsc -p packages/aac-encoder
 tsc -p packages/flac-encoder
 tsc -p packages/prores
 tsc -p packages/server
+tsc -p packages/rist
 
 # Generate the root again, now with internals properly stripped
 rm -rf dist
@@ -49,6 +51,7 @@ api-extractor run -c packages/aac-encoder/api-extractor.json
 api-extractor run -c packages/flac-encoder/api-extractor.json
 api-extractor run -c packages/prores/api-extractor.json
 api-extractor run -c packages/server/api-extractor.json
+api-extractor run -c packages/rist/api-extractor.json
 
 # Checks that all symbols are documented
 tsx scripts/check-docblocks.ts \
@@ -60,7 +63,8 @@ tsx scripts/check-docblocks.ts \
 	packages/aac-encoder/dist/mediabunny-aac-encoder.d.ts \
 	packages/flac-encoder/dist/mediabunny-flac-encoder.d.ts \
 	packages/prores/dist/mediabunny-prores.d.ts \
-	packages/server/dist/mediabunny-server.d.ts
+	packages/server/dist/mediabunny-server.d.ts \
+	packages/rist/dist/mediabunny-rist.d.ts
 
 # Checks that API docs are generatable
 npm run docs:generate -- --dry
@@ -75,3 +79,4 @@ echo 'export as namespace MediabunnyAacEncoder;' >> packages/aac-encoder/dist/me
 echo 'export as namespace MediabunnyFlacEncoder;' >> packages/flac-encoder/dist/mediabunny-flac-encoder.d.ts
 echo 'export as namespace MediabunnyProres;' >> packages/prores/dist/mediabunny-prores.d.ts
 echo 'export as namespace MediabunnyServer;' >> packages/server/dist/mediabunny-server.d.ts
+echo 'export as namespace MediabunnyRist;' >> packages/rist/dist/mediabunny-rist.d.ts

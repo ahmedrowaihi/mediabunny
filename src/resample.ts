@@ -23,8 +23,8 @@ export class AudioResampler {
 	startTime: number | null = null;
 	onSample: (sample: AudioSample) => Promise<void>;
 
-	bufferSizeInFrames: number;
-	bufferSizeInSamples: number;
+	bufferSizeInFrames!: number;
+	bufferSizeInSamples!: number;
 	bufferCapacityInFrames!: number;
 	outputBuffer!: Float32Array;
 	/** Start frame of current buffer */
@@ -42,9 +42,6 @@ export class AudioResampler {
 		this.targetSampleRate = options.targetSampleRate;
 		this.targetNumberOfChannels = options.targetNumberOfChannels;
 		this.onSample = options.onSample;
-
-		this.bufferSizeInFrames = Math.floor(this.targetSampleRate * 5.0); // 5 seconds
-		this.bufferSizeInSamples = this.bufferSizeInFrames * this.targetNumberOfChannels;
 	}
 
 	/**
@@ -185,6 +182,16 @@ export class AudioResampler {
 			// An input sample may map to more than one output sample, which is why we need padding in the buffer to not
 			// lose any data
 			const overflowFrames = Math.ceil(this.targetSampleRate / this.sourceSampleRate);
+
+			// One input sample's worth of output, so each `add` drives the buffer to `onSample` and the encoder's
+			// backpressure reaches the caller. A buffer spanning many input samples returns from `add` without
+			// encoding anything, letting a caller that awaits each `add` run arbitrarily far ahead of the encoder.
+			// The flush is lazy - it happens only once a write lands past the buffer - so no size loses a write.
+			this.bufferSizeInFrames = Math.max(
+				Math.ceil(audioSample.numberOfFrames * this.targetSampleRate / this.sourceSampleRate),
+				overflowFrames,
+			);
+			this.bufferSizeInSamples = this.bufferSizeInFrames * this.targetNumberOfChannels;
 			this.bufferCapacityInFrames = this.bufferSizeInFrames + overflowFrames;
 			this.outputBuffer = new Float32Array(
 				this.bufferCapacityInFrames * this.targetNumberOfChannels,

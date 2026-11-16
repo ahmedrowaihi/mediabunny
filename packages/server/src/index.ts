@@ -23,6 +23,7 @@ import { NodeAvAudioEncoder } from './audio-encoder';
 import { copyVideoSampleToAvFrame, AvFrameVideoSampleResource, transformVideoSample } from './video-sample';
 import { copyAudioSampleToAvFrame, AvFrameAudioSampleResource } from './audio-sample';
 import { registerProresDecoder } from '@mediabunny/prores';
+import { installSecretRedactingLog } from './misc';
 
 const SERVER_LOADED_SYMBOL = Symbol.for('@mediabunny/server loaded');
 if ((globalThis as Record<symbol, unknown>)[SERVER_LOADED_SYMBOL]) {
@@ -99,6 +100,8 @@ export const registerMediabunnyServer = (options: MediabunnyServerOptions = {}) 
 
 	NodeAv.Log.setLevel(NodeAv.AV_LOG_ERROR);
 
+	installSecretRedactingLog();
+
 	// Video
 	registerDecoder(NodeAvVideoDecoder);
 	registerProresDecoder(); // Faster than FFmpeg, so we use it
@@ -115,6 +118,29 @@ export type { MediabunnyServerOptions };
 
 export { AvFrameVideoSampleResource } from './video-sample';
 export { AvFrameAudioSampleResource } from './audio-sample';
+export { NetworkSource } from './network-source';
+export type { NetworkSourceOptions } from './network-source';
+export { RtmpSource } from './rtmp-source';
+export type { RtmpSourceOptions } from './rtmp-source';
+export { DEFAULT_RIST_BUFFER_MS, RistSource } from './rist-source';
+export { RistTarget } from './rist-target';
+export type { RistTargetOptions } from './rist-target';
+export { RtmpTarget } from './rtmp-target';
+export type { RtmpTargetOptions } from './rtmp-target';
+export { MxfTarget } from './mxf-target';
+export type { MxfTargetOptions } from './mxf-target';
+export { SrtTarget } from './srt-target';
+export type { SrtTargetOptions } from './srt-target';
+export { buildSdp, frameSizeOf, lineSizeOf, PGROUPS, St2110Packetizer, St2110VideoSender } from './st2110';
+export type {
+	St2110Depth,
+	St2110PacketizerOptions,
+	St2110Sampling,
+	St2110SdpOptions,
+	St2110VideoFormat,
+	St2110VideoSenderOptions,
+} from './st2110';
+export type { RistSourceOptions } from './rist-source';
 
 /**
  * Copies a `VideoSample` or `AudioSample` into the given NodeAV

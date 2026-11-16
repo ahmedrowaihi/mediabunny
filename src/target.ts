@@ -8,7 +8,7 @@
 
 import type { FileHandle } from 'node:fs/promises';
 import * as nodeAlias from './node';
-import { assert, EventEmitter, FilePath, isWebKit, MaybePromise } from './misc';
+import { assert, EventEmitter, FilePath, isBun, isWebKit, MaybePromise } from './misc';
 
 const node = typeof nodeAlias !== 'undefined'
 	? nodeAlias // Aliasing it prevents some bundler warnings
@@ -155,7 +155,10 @@ export class BufferTarget extends Target {
 
 		this._options = options;
 
-		this._supportsResize = 'resize' in new ArrayBuffer(0);
+		// Bun (JSC) never returns the memory backing a resizable ArrayBuffer: ~13KB per allocate-resize-drop,
+		// measured at 39MB over 3000, so ~940KB leaked per conversion at 1s segments. V8 and plain
+		// ArrayBuffers are flat, as is the copy-grow path below. Recheck when Bun changes ArrayBuffer.
+		this._supportsResize = !isBun() && 'resize' in new ArrayBuffer(0);
 		if (this._supportsResize) {
 			try {
 				// @ts-expect-error Don't want to bump "lib" in tsconfig

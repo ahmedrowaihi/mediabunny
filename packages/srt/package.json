@@ -1,0 +1,49 @@
+{
+  "name": "@ahmedrowaihi/mediabunny-srt",
+  "author": "Vanilagy",
+  "version": "1.65.2",
+  "description": "SRT connection bonding for Mediabunny, over libsrt socket groups.",
+  "main": "./dist/bundles/mediabunny-srt.cjs",
+  "module": "./dist/bundles/mediabunny-srt.mjs",
+  "types": "./dist/modules/src/index.d.ts",
+  "exports": {
+    "types": "./dist/modules/src/index.d.ts",
+    "import": "./dist/bundles/mediabunny-srt.mjs",
+    "require": "./dist/bundles/mediabunny-srt.cjs"
+  },
+  "files": [
+    "README.md",
+    "package.json",
+    "LICENSE",
+    "dist",
+    "src"
+  ],
+  "sideEffects": false,
+  "license": "MPL-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ahmedrowaihi/mediabunny.git",
+    "directory": "packages/srt"
+  },
+  "bugs": {
+    "url": "https://github.com/Vanilagy/mediabunny/issues"
+  },
+  "dependencies": {
+    "koffi": "^3.3.7"
+  },
+  "peerDependencies": {
+    "mediabunny": "^1.45.0"
+  },
+  "keywords": [
+    "srt",
+    "libsrt",
+    "bonding",
+    "socket-group",
+    "transport",
+    "udp",
+    "live",
+    "streaming",
+    "mediabunny",
+    "node"
+  ]
+}

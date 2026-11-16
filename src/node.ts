@@ -9,3 +9,4 @@
 // This file contains Node.js-specific code that does not run in a browser.
 
 export * as fs from 'node:fs/promises';
+export * as crypto from 'node:crypto';

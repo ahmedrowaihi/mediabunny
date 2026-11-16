@@ -10,6 +10,7 @@ import {
 	MediaStreamVideoTrackSource,
 	VideoSampleSource,
 } from '../../src/media-source.js';
+import { Logging } from '../../src/logging.js';
 import { AudioSample, VideoSample } from '../../src/sample.js';
 import { Quality } from '../../src/encode.js';
 import { Input } from '../../src/input.js';
@@ -17,6 +18,7 @@ import { ALL_FORMATS } from '../../src/input-format.js';
 import { BufferSource } from '../../src/source.js';
 import { EncodedPacketSink, VideoSampleSink } from '../../src/media-sink.js';
 import { assert, promiseWithResolvers, Rotation, toDataView, wait } from '../../src/misc.js';
+import { carriesClosedCaptions, type ClosedCaptionBytePair } from '../../src/closed-captions.js';
 import { InputAudioTrack, InputVideoTrack } from '../../src/input-track.js';
 
 test('VideoSampleSource, normal usage', async () => {
@@ -131,6 +133,49 @@ test('VideoSampleSource, same-sized frames with width and height set', async () 
 	expect(await track.getCodedHeight()).toBe(80);
 	input.dispose();
 });
+
+test('VideoSampleSource, changing input dimensions with a transform that states both is not a size change',
+	async () => {
+		const buffer = await encodeFrames(
+			{ codec: 'vp8', quality: new Quality('medium'), transform: { width: 50, height: 80, fit: 'fill' } },
+			[{ width: 100, height: 100 }, { width: 200, height: 150 }],
+		);
+
+		const { input, track } = await readBackTrack(buffer);
+		expect(await track.getCodedWidth()).toBe(50);
+		expect(await track.getCodedHeight()).toBe(80);
+		expect(await readBackSamples(buffer)).toHaveLength(2);
+		input.dispose();
+	},
+);
+
+test('VideoSampleSource, changing input dimensions with a transform that states a crop is not a size change',
+	async () => {
+		const buffer = await encodeFrames(
+			{
+				codec: 'vp8',
+				quality: new Quality('medium'),
+				transform: { crop: { left: 0, top: 0, width: 50, height: 50 } },
+			},
+			[{ width: 100, height: 100 }, { width: 200, height: 150 }],
+		);
+
+		const { input, track } = await readBackTrack(buffer);
+		expect(await track.getCodedWidth()).toBe(50);
+		expect(await track.getCodedHeight()).toBe(50);
+		expect(await readBackSamples(buffer)).toHaveLength(2);
+		input.dispose();
+	},
+);
+
+test('VideoSampleSource, changing input dimensions with a transform that states only the width is denied',
+	async () => {
+		await expect(encodeFrames(
+			{ codec: 'vp8', quality: new Quality('medium'), transform: { width: 50 } },
+			[{ width: 100, height: 100 }, { width: 200, height: 150 }],
+		)).rejects.toThrow(/Video sample size must remain constant/);
+	},
+);
 
 test('VideoSampleSource, same-sized frames with rotation set to 90', async () => {
 	const buffer = await encodeFrames(
@@ -341,6 +386,65 @@ test('VideoSampleSource, transform.process receives pre-transformed frames', asy
 	expect(await track.getCodedWidth()).toBe(50);
 	expect(await track.getCodedHeight()).toBe(80);
 	input.dispose();
+});
+
+test('VideoSampleSource, transform.preProcess receives the frames as handed over, before the transform',
+	async () => {
+		const seenByPreProcess: { width: number; height: number }[] = [];
+		const seenByProcess: { width: number; height: number }[] = [];
+		const record = (into: { width: number; height: number }[]) => (sample: VideoSample) => {
+			into.push({ width: sample.codedWidth, height: sample.codedHeight });
+			return sample;
+		};
+
+		const buffer = await encodeFrames(
+			{
+				codec: 'vp8',
+				quality: new Quality('medium'),
+				transform: {
+					width: 50,
+					height: 80,
+					fit: 'fill',
+					preProcess: record(seenByPreProcess),
+					process: record(seenByProcess),
+				},
+			},
+			[{ width: 200, height: 200 }, { width: 200, height: 200 }],
+		);
+
+		// The reason the hook exists: deinterlacing a frame the transform has already resized would
+		// interpolate across the two interleaved fields.
+		expect(seenByPreProcess).toEqual([{ width: 200, height: 200 }, { width: 200, height: 200 }]);
+		expect(seenByProcess).toEqual([{ width: 50, height: 80 }, { width: 50, height: 80 }]);
+
+		const { input, track } = await readBackTrack(buffer);
+		expect(await track.getCodedWidth()).toBe(50);
+		expect(await track.getCodedHeight()).toBe(80);
+		input.dispose();
+	},
+);
+
+test('VideoSampleSource, transform.preProcess can drop a frame and can split one in two', async () => {
+	let index = 0;
+	const buffer = await encodeFrames(
+		{
+			codec: 'vp8',
+			quality: new Quality('medium'),
+			transform: {
+				preProcess: (sample) => {
+					// What a deinterlacer does: one frame in, two fields out, and nothing for a frame it rejects.
+					if (index++ === 0) {
+						return null;
+					}
+					return [sample.clone(), sample.clone()];
+				},
+			},
+		},
+		[{ width: 100, height: 100 }, { width: 100, height: 100 }, { width: 100, height: 100 }],
+	);
+
+	// Three frames in: the first dropped, the other two doubled. Without the hook it would be three.
+	expect(await readBackSamples(buffer)).toHaveLength(4);
 });
 
 test('VideoSampleSource, transform.process drops all frames after the first', async () => {
@@ -569,6 +673,7 @@ const encodeFrames = async (
 		flip?: boolean;
 		leftHalfBlue?: boolean;
 	}[],
+	closedCaptions?: ClosedCaptionBytePair[],
 ) => {
 	const output = new Output({
 		format: new Mp4OutputFormat(),
@@ -587,6 +692,7 @@ const encodeFrames = async (
 			duration: f.duration ?? 1 / 30,
 			rotation: f.rotation,
 			flip: f.flip,
+			closedCaptions,
 		});
 		await videoSource.add(sample);
 		sample.close();
@@ -993,21 +1099,30 @@ test('Audio track resampled with a slow target', async () => {
 	}
 	await wait(200);
 
-	// The resampler's last second only gets handed over when finalizing
-	expect(encodedSamples).toEqual([{ timestamp: 0, numberOfFrames: 5 * 48000 }]);
+	// One hand-over per input sample, at the input's own granularity: the resampler sizes its buffer from the
+	// first sample instead of accumulating a fixed 5 seconds, which is what lets the blocked target's
+	// backpressure reach the caller. How many get through before it blocks is the encoder queue's depth, so
+	// only the bounds are asserted - what matters is that it is neither one 5-second block nor all 600.
+	expect(Math.max(...encodedSamples.map(x => x.numberOfFrames))).toBe(480);
+	expect(encodedSamples[0]).toEqual({ timestamp: 0, numberOfFrames: 480 });
+	expect(encodedSamples.length).toBeGreaterThan(1);
+	expect(encodedSamples.length).toBeLessThan(100);
 
 	// The queued samples were captured before finalizing, so they must still make it into the file, while the ones
 	// arriving once the queue was full got dropped
+	const encodedBeforeFinalize = encodedSamples.length;
 	const finalizePromise = output.finalize();
 	writesUnblocked.resolve();
 	await finalizePromise;
 	generator.stop();
 
 	expect(sourceErrors).toEqual([]);
-	expect(encodedSamples).toHaveLength(2);
-	expect(encodedSamples[1]!.timestamp).toBe(5);
-	// How many got queued depends on timing, but never more than the queue holds
-	const queuedSampleCount = Math.round(encodedSamples[1]!.numberOfFrames / 480);
+
+	// Still one sample per hand-over, so what finalizing drained shows up as further samples rather than as a
+	// second block holding them all; the last of them may be short. How many got queued depends on timing, but
+	// never more than the queue holds.
+	expect(Math.max(...encodedSamples.map(x => x.numberOfFrames))).toBe(480);
+	const queuedSampleCount = encodedSamples.length - encodedBeforeFinalize;
 	expect(queuedSampleCount).toBeGreaterThan(0);
 	expect(queuedSampleCount).toBeLessThanOrEqual(8);
 });
@@ -1242,3 +1357,81 @@ test('AudioBufferSource with overlapping adds', async () => {
 	expect(secondValues.size).toBe(1);
 	expect([...secondValues][0]).toBeGreaterThan([...firstValues][0]!);
 });
+test('CanvasSource, captions supplied with a frame are written into the packet encoded from it', async () => {
+	const canvas = new OffscreenCanvas(320, 180);
+	const ctx = canvas.getContext('2d')!;
+	ctx.fillStyle = '#3366ff';
+	ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+	const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+	const source = new CanvasSource(canvas, { codec: 'avc', quality: new Quality('low'), keyFrameInterval: 1 });
+	output.addVideoTrack(source, { closedCaptions: { channels: ['CC1'], announceInManifest: true } });
+	await output.start();
+
+	for (let i = 0; i < 4; i++) {
+		await source.add(i / 30, 1 / 30, undefined, [{ type: 0, byte0: 0x94, byte1: 0x20 }]);
+	}
+
+	source.close();
+	await output.finalize();
+
+	assert(output.target.buffer);
+	using input = new Input({ source: new BufferSource(output.target.buffer), formats: ALL_FORMATS });
+	const track = (await input.getPrimaryVideoTrack())!;
+	const decoderConfig = (await track.getDecoderConfig())!;
+
+	let captioned = 0;
+	let total = 0;
+	for await (const packet of new EncodedPacketSink(track).packets()) {
+		total++;
+		if (carriesClosedCaptions(packet.data, decoderConfig, 'avc')) {
+			captioned++;
+		}
+	}
+
+	expect(total).toBe(4);
+	expect(captioned).toBe(4);
+});
+
+test('VideoSampleSource, a throw partway through preProcess output still closes the rest', async () => {
+	const output = new Output({ format: new WebMOutputFormat(), target: new BufferTarget() });
+	// The second trips the size check, so its encode throws; the third is never handed to the encoder.
+	const wrongSize = new VideoSample(makeCanvas(200, 150), { timestamp: 1 / 30, duration: 1 / 30 });
+	const behindIt = new VideoSample(makeCanvas(100, 100), { timestamp: 2 / 30, duration: 1 / 30 });
+	const source = new VideoSampleSource({
+		codec: 'vp8',
+		quality: new Quality('medium'),
+		transform: { preProcess: sample => [sample, wrongSize, behindIt] },
+	});
+	output.addVideoTrack(source);
+	await output.start();
+
+	const first = new VideoSample(makeCanvas(100, 100), { timestamp: 0, duration: 1 / 30 });
+	await expect(source.add(first)).rejects.toThrow(/Video sample size must remain constant/);
+	first.close();
+
+	// Nothing else will ever reach it, so leaving it open leaks the frame.
+	expect(() => behindIt.clone()).toThrow(/VideoSample is closed/);
+
+	await output.cancel();
+});
+
+test.each(['av1', 'vp9'] as const)(
+	'VideoSampleSource, %s drops a captioned sample\'s captions and still encodes it',
+	async (codec) => {
+		const warnings: string[] = [];
+		const off = Logging.on('warn', (...args: unknown[]) => warnings.push(args.map(String).join(' ')));
+
+		// An ABR ladder hands one sample to every rung, so a codec that cannot carry CEA-608 must not
+		// take the encode down just because the sample states captions.
+		const buffer = await encodeFrames(
+			{ codec, quality: new Quality('low') },
+			[{ width: 64, height: 64 }, { width: 64, height: 64 }],
+			[{ type: 0, byte0: 0x80, byte1: 0x80 }],
+		);
+
+		off();
+		expect(await readBackSamples(buffer)).toHaveLength(2);
+		expect(warnings.join(' ')).toMatch(/cannot carry closed captions/);
+	},
+);

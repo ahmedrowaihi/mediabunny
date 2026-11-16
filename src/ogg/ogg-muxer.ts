@@ -12,6 +12,7 @@ import {
 	assert,
 	assertNever,
 	clamp,
+	DEFAULT_MAX_INTERLEAVE_DELTA,
 	promiseWithResolvers,
 	setInt64,
 	toDataView,
@@ -67,6 +68,10 @@ type Packet = {
 };
 
 export class OggMuxer extends Muxer {
+	protected override get maxInterleaveDelta(): number {
+		return this.format._options.maxInterleaveDelta ?? DEFAULT_MAX_INTERLEAVE_DELTA;
+	}
+
 	private format: OggOutputFormat;
 	private writer!: Writer;
 
@@ -475,13 +480,26 @@ export class OggMuxer extends Muxer {
 			let trackWithMinTimestamp: OggTrackData | null = null;
 			let minTimestamp = Infinity;
 
+			// Asked at most once per pass, and only once a track is found starved: this runs per packet.
+			let quietSkippable: boolean | null = null;
+
 			for (const trackData of this.trackDatas) {
 				if (
 					!isFinalCall
 					&& trackData.packetQueue.length <= 1 // Limit is 1, not 0, for correct EOS flag logic
 					&& !this.closedTracks.has(trackData.track)
 				) {
-					break outer;
+					quietSkippable ??= this.quietTrackMayBeSkipped(
+						this.trackDatas,
+						x => x.packetQueue,
+						(packet, track) => packet.timestampInSamples / track.internalSampleRate,
+					);
+					if (!quietSkippable) {
+						break outer;
+					}
+
+					// Its queued packet may still turn out not to be the last one, so leave it queued
+					continue;
 				}
 
 				if (trackData.packetQueue.length === 0) {

@@ -127,3 +127,19 @@ test('MP3 duration metadata', async () => {
 	assert(audioTrack);
 	expect(await audioTrack.getDurationFromMetadata()).toBe(expectedDuration);
 });
+
+// Ogg names each logical bitstream by a serial number, which is a random 32-bit value rather than a
+// position — so unlike the other containers, a position could never be mistaken for it.
+test('an Ogg track states its logical bitstream\'s serial number', async () => {
+	using input = new Input({
+		source: new FilePathSource(path.join(__dirname, '..', 'public/vorbis-eos.ogg')),
+		formats: ALL_FORMATS,
+	});
+	const track = await input.getPrimaryAudioTrack();
+	assert(track);
+
+	const serial = await track.getContainerId();
+	expect(typeof serial).toBe('number');
+	expect(Number.isInteger(serial)).toBe(true);
+	expect(serial).toBeGreaterThan(0);
+});

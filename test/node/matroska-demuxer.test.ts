@@ -720,3 +720,20 @@ const concat = (...parts: Bytes[]) => {
 
 	return result;
 };
+
+// Matroska states a `TrackNumber` per track, which is what an external tool addresses it by. It is not
+// the position in getTracks(), and a file is free to disagree with it.
+test('a track states its own TrackNumber', async () => {
+	using input = new Input({
+		source: new FilePathSource(path.join(__dirname, '..', 'public/demo.webm')),
+		formats: ALL_FORMATS,
+	});
+
+	const tracks = await input.getTracks();
+	expect(tracks.length).toBeGreaterThan(1);
+
+	const ids = await Promise.all(tracks.map(track => track.getContainerId()));
+	// Each one stated, each one distinct: a constant or a null would fail both
+	expect(ids.every(id => typeof id === 'number' && id > 0)).toBe(true);
+	expect(new Set(ids).size).toBe(ids.length);
+});

@@ -78,6 +78,8 @@ export abstract class SegmentedInput {
 	learnedSegmentTimestampOffset: number | null = null;
 	segmentMediaOffsets = new WeakMap<Segment, Promise<number>>();
 
+	timelineCorrectionPromise: Promise<number> | null = null;
+
 	constructor(input: Input, path: string, trackDeclarations: SegmentedInputTrackDeclaration[] | null) {
 		this.input = input;
 		this.path = path;
@@ -325,8 +327,16 @@ class SegmentedInputInputTrackBacking implements InputTrackBacking {
 		return this.delegate(() => this.firstInputTrack!._backing.getCodec());
 	}
 
+	getContainerId() {
+		return this.delegate(() => this.firstInputTrack!._backing.getContainerId?.() ?? null);
+	}
+
 	getInternalCodecId() {
 		return this.delegate(() => this.firstInputTrack!._backing.getInternalCodecId());
+	}
+
+	getEncryptionInfo() {
+		return this.delegate(() => this.firstInputTrack!._backing.getEncryptionInfo());
 	}
 
 	getDisposition() {

@@ -34,6 +34,7 @@ import {
 	DeepReadonly,
 } from './misc';
 import { Logging } from './logging';
+import { type ClosedCaptionBytePair, validateClosedCaptionBytePairs } from './closed-captions';
 
 polyfillSymbolDispose();
 
@@ -196,6 +197,9 @@ export const VIDEO_SAMPLE_PIXEL_FORMATS = [
 ] as const;
 const VIDEO_SAMPLE_PIXEL_FORMATS_SET = new Set(VIDEO_SAMPLE_PIXEL_FORMATS);
 
+const RGB_PIXEL_FORMATS: readonly string[] = ['RGBA', 'RGBX', 'BGRA', 'BGRX'];
+const isRgbFormat = (format: string | null) => format !== null && RGB_PIXEL_FORMATS.includes(format);
+
 /**
  * The internal pixel format with which a {@link VideoSample} is stored.
  * [See pixel formats](https://www.w3.org/TR/webcodecs/#pixel-format) for more.
@@ -239,9 +243,37 @@ export type VideoSampleInit = {
 	displayHeight?: number | undefined;
 	/** The encode options to use when this sample is passed to an encoder. */
 	encodeOptions?: DeepReadonly<VideoEncoderEncodeOptions>;
+	/**
+	 * The closed-caption byte pairs this frame carries. An encoder writes them into the encoded packet as an
+	 * ATSC A/53 SEI message; a decoder states the ones it found in the bitstream — which needs a decoder that
+	 * surfaces them, so `@mediabunny/server`'s does and WebCodecs, which exposes no A/53 side data, does not.
+	 */
+	closedCaptions?: DeepReadonly<ClosedCaptionBytePair[]> | null;
+	/**
+	 * The Dolby Vision RPU NAL unit this frame carries, complete with its NAL header and
+	 * emulation-prevention bytes, and without a start code or length prefix — what reading a NAL of type
+	 * 62 out of an HEVC access unit gives. An encoder writes it back ahead of the frame's VCL NAL units.
+	 */
+	dolbyVisionRpu?: Uint8Array | null;
+	/**
+	 * The HDR10+ (SMPTE ST 2094-40) dynamic metadata this frame carries, as the ITU-T T.35 payload: country
+	 * code 0xB5, provider 0x003C, oriented code 0x0001, application identifier 4, and the application's own
+	 * bytes after it. An encoder writes it back as a prefix SEI ahead of the frame's VCL NAL units.
+	 *
+	 * **Read from an HEVC bitstream's SEI only.** The payload rides in the video bitstream as SEI type 4, and
+	 * that is where this is taken from; metadata carried only by a container, with no SEI, reads as `null`.
+	 */
+	hdr10Plus?: Uint8Array | null;
 
 	/** @internal */
 	_doNotCopy?: boolean;
+};
+
+// A transformer is free to carry over part of the source's color (FFmpeg's filter graph keeps transfer and matrix
+// but loses primaries), so state nothing rather than a half-stale claim about re-rendered pixels.
+const dropColorSpace = (sample: VideoSample) => {
+	(sample as { colorSpace: VideoSampleColorSpace }).colorSpace = new VideoSampleColorSpace();
+	return sample;
 };
 
 /**
@@ -297,6 +329,21 @@ export class VideoSample implements Disposable {
 	readonly colorSpace!: VideoSampleColorSpace;
 	/** The encode options to use when this sample is passed to an encoder. */
 	readonly encodeOptions!: DeepReadonly<VideoEncoderEncodeOptions>;
+	/**
+	 * The closed-caption byte pairs this frame carries, or `null` when it carries none. Captions ride in the
+	 * video bitstream rather than in a track of their own, so they belong to the frame.
+	 */
+	readonly closedCaptions!: DeepReadonly<ClosedCaptionBytePair[]> | null;
+	/**
+	 * The Dolby Vision RPU NAL unit this frame carries, or `null` when it carries none. Like the captions,
+	 * it rides in the video bitstream rather than in a track of its own, so it belongs to the frame.
+	 */
+	readonly dolbyVisionRpu!: Uint8Array | null;
+	/**
+	 * The HDR10+ (SMPTE ST 2094-40) T.35 payload this frame carries, or `null` when it carries none. Read
+	 * from an HEVC bitstream's SEI type 4; metadata carried only by a container reads as `null`.
+	 */
+	readonly hdr10Plus!: Uint8Array | null;
 
 	/** The width of the frame in pixels. */
 	get codedWidth() {
@@ -451,8 +498,7 @@ export class VideoSample implements Disposable {
 			let colorSpaceInit = init.colorSpace ?? null;
 			if (colorSpaceInit === null) {
 				if (
-					this.format === 'RGBA' || this.format === 'RGBX'
-					|| this.format === 'BGRA' || this.format === 'BGRX'
+					isRgbFormat(this.format)
 				) {
 					// sRGB Color Space
 					colorSpaceInit = {
@@ -706,6 +752,19 @@ export class VideoSample implements Disposable {
 
 		this.encodeOptions = init?.encodeOptions ?? {};
 
+		if (init?.closedCaptions !== undefined && init.closedCaptions !== null) {
+			validateClosedCaptionBytePairs(init.closedCaptions, 'init.closedCaptions');
+		}
+		this.closedCaptions = init?.closedCaptions ?? null;
+		if (init?.dolbyVisionRpu != null && !(init.dolbyVisionRpu instanceof Uint8Array)) {
+			throw new TypeError('init.dolbyVisionRpu, when provided, must be a Uint8Array or null.');
+		}
+		if (init?.hdr10Plus != null && !(init.hdr10Plus instanceof Uint8Array)) {
+			throw new TypeError('init.hdr10Plus, when provided, must be a Uint8Array or null.');
+		}
+		this.dolbyVisionRpu = init?.dolbyVisionRpu ?? null;
+		this.hdr10Plus = init?.hdr10Plus ?? null;
+
 		this.pixelAspectRatio = simplifyRational({
 			num: this.squarePixelWidth * this.codedHeight,
 			den: this.squarePixelHeight * this.codedWidth,
@@ -728,6 +787,9 @@ export class VideoSample implements Disposable {
 				rotation: this.rotation,
 				flip: this.flip,
 				encodeOptions: this.encodeOptions,
+				closedCaptions: this.closedCaptions,
+				dolbyVisionRpu: this.dolbyVisionRpu,
+				hdr10Plus: this.hdr10Plus,
 			});
 		} else if (isVideoFrame(this._data)) {
 			return new VideoSample(this._data.clone(), {
@@ -736,6 +798,9 @@ export class VideoSample implements Disposable {
 				rotation: this.rotation,
 				flip: this.flip,
 				encodeOptions: this.encodeOptions,
+				closedCaptions: this.closedCaptions,
+				dolbyVisionRpu: this.dolbyVisionRpu,
+				hdr10Plus: this.hdr10Plus,
 			});
 		} else if (this._data instanceof Uint8Array) {
 			assert(this._layout);
@@ -754,6 +819,9 @@ export class VideoSample implements Disposable {
 				displayWidth: this.displayWidth,
 				displayHeight: this.displayHeight,
 				encodeOptions: this.encodeOptions,
+				closedCaptions: this.closedCaptions,
+				dolbyVisionRpu: this.dolbyVisionRpu,
+				hdr10Plus: this.hdr10Plus,
 
 				// It's already been copied, if we copy it again we make the clone unnecessarily expensive
 				_doNotCopy: true,
@@ -772,6 +840,9 @@ export class VideoSample implements Disposable {
 				displayWidth: this.displayWidth,
 				displayHeight: this.displayHeight,
 				encodeOptions: this.encodeOptions,
+				closedCaptions: this.closedCaptions,
+				dolbyVisionRpu: this.dolbyVisionRpu,
+				hdr10Plus: this.hdr10Plus,
 			});
 		}
 	}
@@ -852,8 +923,8 @@ export class VideoSample implements Disposable {
 		// Detect non-RGB to RGB conversion
 		if (
 			options.format
-			&& !['RGBA', 'RGBX', 'BGRA', 'BGRX'].includes(this.format!)
-			&& ['RGBA', 'RGBX', 'BGRA', 'BGRX'].includes(options.format)
+			&& !isRgbFormat(this.format)
+			&& isRgbFormat(options.format)
 		) {
 			// RGB conversion for custom VideoSampleResource
 			if (this._data instanceof VideoSampleResource) {
@@ -869,7 +940,7 @@ export class VideoSample implements Disposable {
 				if (!(rgbSample instanceof VideoSample)) {
 					throw new TypeError('toRgbSample() must return a VideoSample.');
 				}
-				if (!['RGBA', 'RGBX', 'BGRA', 'BGRX'].includes(rgbSample.format!)) {
+				if (!isRgbFormat(rgbSample.format)) {
 					throw new Error(
 						`Sample returned by toRgbSample was expected to have an RGB format, got`
 						+ ` '${rgbSample.format}' instead.`,
@@ -1588,6 +1659,9 @@ export class VideoSample implements Disposable {
 	 * Transform this video sample to a new video sample given the options. Can be used to resize, rotate, flip, and
 	 * crop the sample.
 	 *
+	 * The returned sample has an empty color space: its pixels have been re-rendered, so this sample's color space no
+	 * longer describes them.
+	 *
 	 * In non-browser environments, this method will not work by default. To make it work, register a custom
 	 * transformer function via {@link registerVideoSampleTransformer}.
 	 */
@@ -1693,7 +1767,15 @@ export class VideoSample implements Disposable {
 			if (isThenable(result)) result = await result;
 
 			if (result !== null) {
-				return result;
+				// A transformer builds its own sample, so the invariant holds here rather than in each of them
+				result.setClosedCaptions(this.closedCaptions);
+				result.setDolbyVisionRpu(this.dolbyVisionRpu);
+				result.setHdr10Plus(this.hdr10Plus);
+
+				// Same rule as the canvas path below: landing in RGB means the colour was flattened to
+				// whatever the rasteriser chose, so it describes that conversion and not the content.
+				// A transformer that stays in YUV filtered the frame and its colour still holds.
+				return isRgbFormat(result.format) ? dropColorSpace(result) : result;
 			}
 		}
 
@@ -1710,14 +1792,18 @@ export class VideoSample implements Disposable {
 			fillBlack: description.alpha === 'discard',
 		});
 
-		return new VideoSample(canvas, {
+		return dropColorSpace(new VideoSample(canvas, {
 			timestamp: this.timestamp,
 			duration: this.duration,
 			// Any previous rotation and flip are now baked in
 			rotation: 0,
 			flip: false,
 			encodeOptions: this.encodeOptions,
-		});
+			// A geometric transform does not change what is in the picture
+			closedCaptions: this.closedCaptions,
+			dolbyVisionRpu: this.dolbyVisionRpu,
+			hdr10Plus: this.hdr10Plus,
+		}));
 	}
 
 	/** Sets the rotation metadata of this video sample. */
@@ -1768,6 +1854,36 @@ export class VideoSample implements Disposable {
 
 		// eslint-disable-next-line @typescript-eslint/no-unnecessary-type-assertion
 		(this.encodeOptions as DeepReadonly<VideoEncoderEncodeOptions>) = newEncodeOptions;
+	}
+
+	/** Sets the Dolby Vision RPU NAL unit this frame carries. */
+	setDolbyVisionRpu(newRpu: Uint8Array | null) {
+		if (newRpu !== null && !(newRpu instanceof Uint8Array)) {
+			throw new TypeError('newRpu must be a Uint8Array or null.');
+		}
+
+		// eslint-disable-next-line @typescript-eslint/no-unnecessary-type-assertion
+		(this.dolbyVisionRpu as Uint8Array | null) = newRpu;
+	}
+
+	/** Sets the HDR10+ T.35 payload this frame carries. */
+	setHdr10Plus(newPayload: Uint8Array | null) {
+		if (newPayload !== null && !(newPayload instanceof Uint8Array)) {
+			throw new TypeError('newPayload must be a Uint8Array or null.');
+		}
+
+		// eslint-disable-next-line @typescript-eslint/no-unnecessary-type-assertion
+		(this.hdr10Plus as Uint8Array | null) = newPayload;
+	}
+
+	/** Sets the closed-caption byte pairs this frame carries. */
+	setClosedCaptions(newClosedCaptions: DeepReadonly<ClosedCaptionBytePair[]> | null) {
+		if (newClosedCaptions !== null) {
+			validateClosedCaptionBytePairs(newClosedCaptions, 'newClosedCaptions');
+		}
+
+		// eslint-disable-next-line @typescript-eslint/no-unnecessary-type-assertion
+		(this.closedCaptions as DeepReadonly<ClosedCaptionBytePair[]> | null) = newClosedCaptions;
 	}
 
 	/** Calls `.close()`. */

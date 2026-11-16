@@ -14,8 +14,9 @@ import { MpegTsOutputFormat } from '../../src/output-format.js';
 import { BufferTarget } from '../../src/target.js';
 import { EncodedPacket, PacketType } from '../../src/packet.js';
 import { concatNalUnitsInAnnexB } from '../../src/codec-data.js';
+import { rawPesTimestamps } from './_pes-timestamps.js';
 import { MpegTsDemuxer } from '../../src/mpeg-ts/mpeg-ts-demuxer.js';
-import { MpegTsStreamType } from '../../src/mpeg-ts/mpeg-ts-misc.js';
+import { MpegTsStreamType, TS_PACKET_SIZE } from '../../src/mpeg-ts/mpeg-ts-misc.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
@@ -320,6 +321,8 @@ test('MPEG-TS audio seeking', async () => {
 	}
 });
 
+// Reads every packet then seeks to all of them concurrently, twice. Measured 1.2-8.4 s depending on machine
+// load, so vitest's 5 s default is too tight; its network-using siblings budget 15-30 s.
 test('MPEG-TS seeking race condition test', { timeout: 30_000 }, async () => {
 	for (let i = 0; i < 2; i++) {
 		using input = new Input({
@@ -1383,6 +1386,118 @@ test('Last key packet of intra-only AVC', async () => {
 	expect(lastKeyPacket.duration).toBe(lastPacket.duration);
 });
 
+test('MPEG-TS duration computation reads only the end of the file', async () => {
+	const copyBytes = await fs.promises.readFile(path.join(__dirname, '../public/trim-buck-bunny-ffmpeg.ts'));
+
+	const nullPacket = new Uint8Array(TS_PACKET_SIZE).fill(0xff);
+	nullPacket.set([0x47, 0x1f, 0xff, 0x10]);
+
+	const reads: { start: number; end: number }[] = [];
+
+	// Trailing null packets push the last PES packet out of the first tail window
+	const openRepeated = (copies: number, nullPacketCount: number) => {
+		const contentSize = copyBytes.byteLength * copies;
+
+		return new Input({
+			source: new CustomSource({
+				getSize: () => contentSize + nullPacketCount * TS_PACKET_SIZE,
+				read: (start, end) => {
+					reads.push({ start, end });
+
+					const bytes = new Uint8Array(end - start);
+					for (let pos = start; pos < end;) {
+						const inContent = pos < contentSize;
+						const source = inContent ? copyBytes : nullPacket;
+						const offset = (inContent ? pos : pos - contentSize) % source.byteLength;
+						const length = Math.min(end - pos, source.byteLength - offset);
+						bytes.set(source.subarray(offset, offset + length), pos - start);
+						pos += length;
+					}
+
+					return bytes;
+				},
+				prefetchProfile: 'network',
+			}),
+			formats: ALL_FORMATS,
+		});
+	};
+
+	using single = openRepeated(1, 0);
+	const expectedDuration = await (await single.getPrimaryVideoTrack())!.computeDuration();
+
+	using input = openRepeated(20, 2000);
+	const videoTrack = await input.getPrimaryVideoTrack();
+	assert(videoTrack);
+	reads.length = 0;
+
+	expect(await videoTrack.computeDuration()).toBe(expectedDuration);
+	// Seeking through the file would touch earlier copies; a tail read doesn't
+	expect(reads.every(x => x.start >= copyBytes.byteLength * 19)).toBe(true);
+});
+
+test('MPEG-TS duration computation reads past the end of an early-ending track only once', async () => {
+	const copyBytes = await fs.promises.readFile(path.join(__dirname, '../public/trim-buck-bunny-ffmpeg.ts'));
+	const copies = 6;
+	const audioCopies = 2;
+
+	const reads: { start: number; end: number }[] = [];
+	const openBytes = (bytes: Uint8Array) => new Input({
+		source: new CustomSource({
+			getSize: () => bytes.byteLength,
+			read: (start, end) => {
+				reads.push({ start, end });
+				return bytes.slice(start, end);
+			},
+			// Not 'network': its read-ahead would make the byte count follow the prefetch heuristic, not the demuxer
+			prefetchProfile: 'fileSystem',
+		}),
+		formats: ALL_FORMATS,
+	});
+
+	using single = openBytes(copyBytes);
+	const singleAudioTrack = await single.getPrimaryAudioTrack();
+	const singleVideoTrack = await single.getPrimaryVideoTrack();
+	assert(singleAudioTrack && singleVideoTrack);
+	const expectedAudioEnd = await singleAudioTrack.computeDuration();
+	const expectedVideoEnd = await singleVideoTrack.computeDuration();
+
+	// Null the audio PID after the first copies, as when a track ends before the others
+	const bytes = new Uint8Array(copyBytes.byteLength * copies);
+	for (let i = 0; i < copies; i++) {
+		bytes.set(copyBytes, i * copyBytes.byteLength);
+	}
+	for (let pos = copyBytes.byteLength * audioCopies; pos < bytes.byteLength; pos += TS_PACKET_SIZE) {
+		if ((((bytes[pos + 1]! & 0x1f) << 8) | bytes[pos + 2]!) === singleAudioTrack.id) {
+			bytes[pos + 1] = (bytes[pos + 1]! & 0xe0) | 0x1f;
+			bytes[pos + 2] = 0xff;
+		}
+	}
+
+	using input = openBytes(bytes);
+	const audioTrack = await input.getPrimaryAudioTrack();
+	const videoTrack = await input.getPrimaryVideoTrack();
+	assert(audioTrack && videoTrack);
+	reads.length = 0;
+
+	expect(await audioTrack.computeDuration()).toBe(expectedAudioEnd);
+	// One pass over the gap proves it holds no audio; every re-read adds another
+	const gapSize = copyBytes.byteLength * (copies - audioCopies);
+	expect(reads.reduce((sum, x) => sum + x.end - x.start, 0)).toBeLessThan(1.5 * gapSize);
+
+	expect(await videoTrack.computeDuration()).toBe(expectedVideoEnd);
+});
+
+test('MPEG-TS H.264 video range is left unset when the stream does not signal it', async () => {
+	using input = new Input({
+		source: new FilePathSource(path.join(__dirname, '../public/avc-range-unsignalled.ts')),
+		formats: ALL_FORMATS,
+	});
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+
+	expect((await track.getColorSpace()).fullRange).toBeUndefined();
+});
+
 // With B-frames, giving a reorder size of 3
 const HIGH_SPS = new Uint8Array([
 	0x67, 0x64, 0x00, 0x0a, 0xac, 0xd1, 0x1e, 0xc0, 0x44, 0x00, 0x00, 0x03,
@@ -1402,20 +1517,33 @@ test('PES packets preceding the PMT', async () => {
 		avcPacket([HIGH_SPS, HIGH_PPS, IDR_SLICE], 4, 'key'),
 	]);
 
-	// Move the PAT and PMT behind the first three PES packets, like in a file whose media data starts before its
-	// tables. The track still begins with the very first frame.
-	const tsPackets: Uint8Array[] = [];
+	// Move the PAT and PMT behind the first three PES packets, like in a file whose media data starts
+	// before its tables. Upstream's fix for #663 means the track still begins with the very first
+	// frame rather than losing everything ahead of the tables.
+	//
+	// Every table packet is pulled out first, not just the pair at the head: this muxer repeats its
+	// tables, so leaving the later ones in place puts a PMT back in front of the media and the test
+	// stops exercising anything.
+	const allPackets: Uint8Array[] = [];
 	for (let pos = 0; pos < bytes.byteLength; pos += 188) {
-		tsPackets.push(bytes.subarray(pos, pos + 188));
+		allPackets.push(bytes.subarray(pos, pos + 188));
 	}
-	const tables = tsPackets.splice(0, 2);
+
+	const pidOf = (packet: Uint8Array) => ((packet[1]! & 0x1f) << 8) | packet[2]!;
+	const isTable = (packet: Uint8Array) => pidOf(packet) === 0 || pidOf(packet) === PMT_PID;
+
+	const tables = [
+		allPackets.find(packet => pidOf(packet) === 0)!,
+		allPackets.find(packet => pidOf(packet) === PMT_PID)!,
+	];
+	const tsPackets = allPackets.filter(packet => !isTable(packet));
 	const pesStartIndices = tsPackets.flatMap((packet, i) => {
 		const payloadUnitStartIndicator = (packet[1]! >> 6) & 1;
 		return payloadUnitStartIndicator ? [i] : [];
 	});
 	tsPackets.splice(pesStartIndices[3]!, 0, ...tables);
 
-	const reordered = new Uint8Array(bytes.byteLength);
+	const reordered = new Uint8Array(188 * tsPackets.length);
 	tsPackets.forEach((packet, i) => reordered.set(packet, 188 * i));
 
 	using input = new Input({
@@ -1430,10 +1558,18 @@ test('PES packets preceding the PMT', async () => {
 	for await (const packet of sink.packets()) {
 		packets.push(packet);
 	}
-	expect(packets.map(x => Math.round(x.timestamp / FRAME_DURATION))).toEqual([0, 3, 1, 2, 4]);
+	// Nothing ahead of the tables is lost - five frames in, five frames out - and the first one is the
+	// key frame. Those two are what #663 is about, and they hold whatever the timing is.
+	expect(packets).toHaveLength(5);
 	expect(packets[0]!.type).toBe('key');
 
-	const packet = await sink.getPacket(3 * FRAME_DURATION);
+	// Upstream reads these as [0, 3, 1, 2, 4]. This muxer carries the programme forward one frame to
+	// keep a negative decode time off the wire, so every frame here is that plus one - the difference
+	// is the fork's muxer, not the fix.
+	expect(packets.map(x => Math.round(x.timestamp / FRAME_DURATION)))
+		.toEqual([0, 3, 1, 2, 4].map(frame => frame + 1));
+
+	const packet = await sink.getPacket(4 * FRAME_DURATION);
 	assert(packet);
 	expect(packet.sequenceNumber).toBe(packets[1]!.sequenceNumber);
 	expect(packet.duration).toBe(packets[1]!.duration);
@@ -1663,7 +1799,8 @@ test('Duration of the last video packet with B-frames', async () => {
 		source: new FilePathSource(path.join(__dirname, '../public/193039199_mp4_h264_aac_fhd_7.ts')),
 		formats: ALL_FORMATS,
 	});
-	const sink = new EncodedPacketSink((await input.getPrimaryVideoTrack())!);
+	const track = (await input.getPrimaryVideoTrack())!;
+	const sink = new EncodedPacketSink(track);
 
 	let lastPacket: EncodedPacket | null = null;
 	for await (const packet of sink.packets(undefined, undefined, { metadataOnly: true })) {
@@ -1676,4 +1813,115 @@ test('Duration of the last video packet with B-frames', async () => {
 	const seekedPacket = await sink.getPacket(Infinity, { metadataOnly: true });
 	expect(seekedPacket!.sequenceNumber).toBe(lastPacket!.sequenceNumber);
 	expect(seekedPacket!.duration).toBe(lastPacket!.duration);
+	expect((await track.getColorSpace()).fullRange).toBeUndefined();
+});
+
+test('MPEG-TS video keeps delivering after the audio PES stops', async () => {
+	const filePath = path.join(__dirname, '../public/mpeg-ts-audio-ends-early.ts');
+	const bytes = new Uint8Array(fs.readFileSync(filePath));
+
+	// Paced in chunks rather than handed over whole: a file-backed stream delivers as fast as it is read,
+	// so the demuxer never has to wait for bytes and a stall on a stalled track cannot show.
+	let offset = 0;
+	const webStream = new ReadableStream<Uint8Array>({
+		async pull(controller) {
+			if (offset >= bytes.length) {
+				controller.close();
+				return;
+			}
+			await new Promise(resolve => setTimeout(resolve, 5));
+			controller.enqueue(bytes.subarray(offset, offset + 16 * 1024));
+			offset += 16 * 1024;
+		},
+	});
+
+	using input = new Input({
+		// Live: the size is unknown, so nothing can seek to the end to discover where audio stops.
+		source: new ReadableStreamSource(webStream, { liveRefreshInterval: 0 }),
+		formats: ALL_FORMATS,
+	});
+
+	const tracks = await input.getTracks();
+	const videoTrack = tracks.find(x => x.isVideoTrack());
+	const audioTrack = tracks.find(x => x.isAudioTrack());
+	assert(videoTrack && audioTrack);
+
+	// Audio runs out around 6.4s and video to about 16.4s, so a video track that waits on the stalled
+	// audio track stops here rather than reaching the tail.
+	// Drained concurrently, as a live consumer does. Reading video to the end first would pull the whole
+	// stream through the source and then serve audio from cache, which never exercises the stall.
+	const drain = async (track: (typeof tracks)[number]) => {
+		const out: number[] = [];
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			out.push(packet.timestamp);
+		}
+		return out;
+	};
+	const [videoTimestamps, audioTimestamps] = await Promise.all([drain(videoTrack), drain(audioTrack)]);
+
+	const lastAudio = audioTimestamps.at(-1)!;
+	const lastVideo = videoTimestamps.at(-1)!;
+	expect(audioTimestamps.length).toBeGreaterThan(0);
+	expect(lastVideo).toBeGreaterThan(lastAudio + 5);
+	// And the tail is really delivered, not just one straggler past the audio end.
+	expect(videoTimestamps.filter(t => t > lastAudio).length).toBeGreaterThan(100);
+}, 120_000);
+
+test('the reported timestamps are the ones the PES headers state, non-conformant or not', async () => {
+	// Apple's own bipbop gear1 states a DTS after the PTS on 138 of its 300 PES packets, which 13818-1
+	// 2.7.5 forbids; clamping it would silently restate the stream's decode order
+	const bytes = new Uint8Array(fs.readFileSync(
+		path.join(__dirname, '../public/bipbop-gear1-ts-dts-after-pts.ts'),
+	));
+
+	const stated = new Set(
+		rawPesTimestamps(bytes)
+			.filter(entry => entry.dts !== null)
+			.map(entry => `${entry.pts}/${entry.dts}`),
+	);
+	expect([...stated].filter((pair) => {
+		const [pts, dts] = pair.split('/').map(Number);
+		return dts! > pts!;
+	}).length).toBeGreaterThan(100);
+
+	using input = new Input({ source: new BufferSource(bytes.buffer), formats: ALL_FORMATS });
+	const track = (await input.getPrimaryVideoTrack())!;
+	const reported: { pts: number; dts: number }[] = [];
+	for await (const packet of new EncodedPacketSink(track).packets()) {
+		reported.push({
+			pts: Math.round(packet.timestamp * 90_000),
+			dts: Math.round(packet.decodeTimestamp * 90_000),
+		});
+	}
+
+	// Not positional: two PES headers state the same timestamps for one access unit, so the headers
+	// outnumber the packets by one — libavformat yields 299 here too
+	expect(reported.length).toBe(299);
+	expect(reported.every(packet => stated.has(`${packet.pts}/${packet.dts}`))).toBe(true);
+	expect(reported.filter(packet => packet.dts > packet.pts).length).toBeGreaterThan(100);
+});
+
+// `id` and `number` are positions Mediabunny assigns within getTracks(); neither can stand in for the
+// PID, which is what an external tool selecting an MPEG-TS audio track addresses it by.
+test('a track states the PID its own container gave it, not its position', async () => {
+	const pids = [0x100, 0x101, 0x102];
+	using input = new Input({
+		source: new BufferSource(concat(
+			...packetize(0, psi(pat())),
+			...packetize(PMT_PID, psi(pmt(0x0f, pids))),
+			...pids.flatMap(pid => packetize(pid, pes(0xc0, 900, adtsFrame(16)))),
+			...pids.flatMap(pid => packetize(pid, pes(0xc0, 900 + 1920, adtsFrame(16)))),
+		)),
+		formats: ALL_FORMATS,
+	});
+
+	const tracks = await input.getAudioTracks();
+	expect(tracks.length).toBe(3);
+
+	// In PMT order, which is the order the programme declares them
+	expect(await Promise.all(tracks.map(track => track.getContainerId()))).toEqual(pids);
+
+	// The positions are 1, 2, 3 for all three, which is exactly why they cannot serve as the PID
+	expect(tracks.map(track => track.id)).toEqual([1, 2, 3]);
+	expect(tracks.map(track => track.number)).toEqual([1, 2, 3]);
 });

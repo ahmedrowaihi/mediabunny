@@ -46,7 +46,9 @@ test('AVC, explicit quantizer with bitrate fallback', { timeout: 10_000 }, async
 const TESTED_VIDEO_CODECS: VideoCodec[] = ['avc', 'hevc', 'vp9', 'av1', 'vp8'];
 
 for (const codec of TESTED_VIDEO_CODECS) {
-	test(`Medium quality with codec '${codec}'`, { timeout: 10_000 }, async () => {
+	// libvpx VP8 runs ~0.6s alone but past 10s under the full suite's load.
+	const timeout = codec === 'vp8' ? 60_000 : 10_000;
+	test(`Medium quality with codec '${codec}'`, { timeout }, async () => {
 		const quality = new Quality('medium');
 		if (!await canEncodeVideo(codec, { quality })) {
 			// The environment can't encode this codec at all; nothing to test

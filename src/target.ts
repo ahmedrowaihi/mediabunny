@@ -155,9 +155,6 @@ export class BufferTarget extends Target {
 
 		this._options = options;
 
-		// Bun (JSC) never returns the memory backing a resizable ArrayBuffer: ~13KB per allocate-resize-drop,
-		// measured at 39MB over 3000, so ~940KB leaked per conversion at 1s segments. V8 and plain
-		// ArrayBuffers are flat, as is the copy-grow path below. Recheck when Bun changes ArrayBuffer.
 		this._supportsResize = !isBun() && 'resize' in new ArrayBuffer(0);
 		if (this._supportsResize) {
 			try {

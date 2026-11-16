@@ -298,8 +298,6 @@ export class EncodedPacket {
 			throw new TypeError('options.sideData, when provided, must be an object.');
 		}
 
-		// Re-timing a packet moves when it is decoded by the same amount: the gap between the two is
-		// the reorder delay, and a muxer that must write both reads it from here.
 		const timestamp = options?.timestamp ?? this.timestamp;
 		const decodeTimestamp = options?.decodeTimestamp
 			?? (this.statesDecodeTimestamp ? this.decodeTimestamp + (timestamp - this.timestamp) : undefined);

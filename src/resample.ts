@@ -183,10 +183,6 @@ export class AudioResampler {
 			// lose any data
 			const overflowFrames = Math.ceil(this.targetSampleRate / this.sourceSampleRate);
 
-			// One input sample's worth of output, so each `add` drives the buffer to `onSample` and the encoder's
-			// backpressure reaches the caller. A buffer spanning many input samples returns from `add` without
-			// encoding anything, letting a caller that awaits each `add` run arbitrarily far ahead of the encoder.
-			// The flush is lazy - it happens only once a write lands past the buffer - so no size loses a write.
 			this.bufferSizeInFrames = Math.max(
 				Math.ceil(audioSample.numberOfFrames * this.targetSampleRate / this.sourceSampleRate),
 				overflowFrames,

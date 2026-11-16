@@ -279,7 +279,6 @@ export const presentationSpan = (trackData: IsobmffTrackData) => {
 	return maxEndTimestamp - minTimestamp;
 };
 
-// The codecs whose bitstream can state HDR10 static metadata as an SEI message.
 type HdrSeiCodec = SeiCodec;
 
 /**
@@ -509,8 +508,6 @@ export class IsobmffMuxer extends Muxer {
 						{ decoderConfig: track.metadata.decoderConfig },
 					);
 				} else if (track.isSubtitleTrack() && track.source._codec === 'ttml') {
-					// `stpp` needs no configuration from the cues, so the track is known up front; a segment
-					// holding no cue still declares it in the moov instead of silently dropping the rendition.
 					this.getSubtitleTrackData(track, { config: { description: '' } });
 				}
 			}
@@ -613,28 +610,16 @@ export class IsobmffMuxer extends Muxer {
 			requiresAnnexBTransformation = true;
 		}
 
-		// Annex B carries its parameter sets in the samples, so 'outOfBand' means moving them out: the
-		// sample entry already holds them, since the description above was extracted from them, and the
-		// transformation drops them from each sample. Left unstated, Annex B keeps them, which is upstream's
-		// default and the only answer that preserves a mid-stream parameter-set change.
 		let stripsParameterSets = requiresAnnexBTransformation && track.metadata.parameterSets === 'outOfBand';
-		// Annex B carriage settles the question whatever the caller said, so only the remux path is left
-		// with nothing stated - and there an `avc3` codec string is the one remaining hint.
 		let parameterSets: ParameterSetPlacement = requiresAnnexBTransformation
 			? (stripsParameterSets ? 'outOfBand' : 'inBand')
 			: track.metadata.parameterSets ?? 'unstated';
 
-		// AVC-Intra and XAVC, which QuickTime names with its own entries. ffmpeg selects these itself from
-		// the intra profile, chroma format, raster and rate and overrides any caller-supplied tag, so this
-		// follows it rather than offering a choice. The carriage that goes with them is Annex B with the
-		// parameter sets in band and no `avcC` at all, so a stated 'outOfBand' cannot be honoured here.
 		let avcIntraEntry: string | null = null;
 		if (this.isQuickTime && track.source._codec === 'avc' && decoderConfig.description) {
 			const sps = firstSpsFromAvcRecord(toUint8Array(decoderConfig.description));
 			const spsInfo = sps ? parseAvcSps(sps) : null;
 
-			// The rate only chooses between the two codes of a pair, and a remux states none in its
-			// metadata, so the first packet's duration stands in - the same derivation the encoder uses.
 			const frameRate = track.metadata.frameRate
 				?? (packet && packet.duration > 0 ? 1 / packet.duration : null);
 
@@ -662,8 +647,6 @@ export class IsobmffMuxer extends Muxer {
 					den: displayAspectHeight * decoderConfig.codedWidth,
 				});
 
-		// ProRes 4444 states it in its four-character code; a QuickTime RLE or PNG track states it only in
-		// the sample entry's depth, which the demuxer carries on the config
 		const hasAlphaChannel = decoderConfig.codec === 'ap4h'
 			|| decoderConfig.codec === 'ap4x'
 			|| decoderConfig.bitsPerCodedSample === 32;
@@ -681,9 +664,6 @@ export class IsobmffMuxer extends Muxer {
 				stripsParameterSets,
 				parameterSets,
 				avcIntraEntry,
-				// Not for an AVC-Intra entry: the splice walks length-prefixed NAL units, and those samples
-				// are Annex B, so it would corrupt them. The `mdcv`/`clli` boxes still state the grade;
-				// only the in-bitstream copy is left out.
 				hdrSeiCodec: decoderConfig.hdrStaticMetadata
 					&& avcIntraEntry === null
 					&& (track.source._codec === 'avc' || track.source._codec === 'hevc')
@@ -917,9 +897,6 @@ export class IsobmffMuxer extends Muxer {
 					);
 				}
 
-				// Kept by default, because they can also appear mid-stream and change the parameters there,
-				// which only an in-band stream can express. 'outOfBand' is the caller saying the sample
-				// entry's copy is the whole story, which is what avc1/hvc1 claims.
 				const kept = trackData.info.stripsParameterSets
 					? nalUnits.filter(unit => !belongsInSampleEntry(
 							track.source._codec as 'avc' | 'hevc', unit[0]!,
@@ -933,14 +910,10 @@ export class IsobmffMuxer extends Muxer {
 					);
 				}
 
-				// An AVC-Intra entry carries Annex B, so the transformation that exists to length-prefix
-				// these samples is the one thing not wanted here - they stay as they arrived.
 				packetData = trackData.info.avcIntraEntry === null
 					? concatNalUnitsInLengthPrefixed(kept, 4)
 					: concatNalUnitsInAnnexB(kept);
 			} else if (trackData.info.avcIntraEntry !== null) {
-				// A length-prefixed source going out under an AVC-Intra entry has to be converted the other
-				// way, and its parameter sets moved into the samples: the entry has no `avcC` to hold them.
 				const nalUnits = [...iterateNalUnitsInLengthPrefixed(packetData, 4)]
 					.map(location => packetData.subarray(location.offset, location.offset + location.length));
 
@@ -1167,8 +1140,6 @@ export class IsobmffMuxer extends Muxer {
 
 				await this.processWebVTTCues(trackData, start);
 			} else {
-				// TTML turns the whole list into one document that carries its own timing, so every cue is
-				// kept — including a zero-duration one, which WebVTT above has no sample to put it in
 				trackData.cueQueue.push({
 					cue,
 					start: cue.timestamp,
@@ -1200,15 +1171,11 @@ export class IsobmffMuxer extends Muxer {
 			return;
 		}
 
-		// Without a window, one sample covers the whole presentation: a TTML document carries its own
-		// timing, so nothing is lost by not splitting it.
 		const start = window ? window.start : Math.min(0, ...queue.map(entry => entry.start));
 		const end = window
 			? window.start + window.duration
 			: queue.reduce((max, entry) => Math.max(max, entry.end), start);
 
-		// Flushing runs once per fragment and again at finalization; the second one must not repeat a
-		// sample the first already wrote.
 		if (trackData.lastCueEndTimestamp !== null && end <= trackData.lastCueEndTimestamp) {
 			return;
 		}
@@ -1216,6 +1183,7 @@ export class IsobmffMuxer extends Muxer {
 		const body = textEncoder.encode(buildTtmlDocument({
 			cues: queue.map(entry => entry.cue),
 			language: languageToShortestForm(trackData.track.metadata.languageCode ?? ''),
+			profile: trackData.track.source._ttmlProfile,
 		}));
 
 		const sample = this.createSampleForTrack(trackData, body, start, end - start, 'key', 0);
@@ -1353,9 +1321,6 @@ export class IsobmffMuxer extends Muxer {
 	_decodeAnchors(): Map<number, { firstDecodeTimestamp: number; statesDecodeTimeline: boolean }> {
 		const anchors = new Map<number, { firstDecodeTimestamp: number; statesDecodeTimeline: boolean }>();
 
-		// Only a fragmented file's anchor is a track constant - it is `min(anchor, 0)`, so it is the
-		// sub-zero decode shift and nothing else. A progressive segment rebases to its own first sample,
-		// which is its own business and would shift every later segment back onto the first one's start.
 		if (!this.isFragmented) {
 			return anchors;
 		}
@@ -1403,7 +1368,6 @@ export class IsobmffMuxer extends Muxer {
 		if (trackData.type === 'audio' && trackData.info.requiresPcmTransformation) {
 			assert(!this.isFragmented);
 
-			// The first timestamp is the lowest, and PCM audio is never reordered
 			trackData.startTimestampOffset ??= trackData.timestampProcessingQueue[0]!.timestamp;
 			trackData.firstDecodeTimestamp ??= trackData.startTimestampOffset;
 
@@ -1472,11 +1436,6 @@ export class IsobmffMuxer extends Muxer {
 				const timescaleUnits = intoTimescale(sample.decodeTimestamp, trackData.timescale, false);
 				const delta = Math.round(timescaleUnits - trackData.lastTimescaleUnits);
 
-				// Only reachable from packets that state their own decode timestamps: without them these are
-				// the sorted presentation timestamps and cannot go backwards. A caller rebuilding packets and
-				// restating the presentation timestamp as the decode timestamp is how this arrives.
-				// Negated rather than `delta < 0`, so a NaN delta is caught too - it was, when this was an
-				// assertion, and letting one through leaves the muxer adding NaN to its sample table
 				if (!(delta >= 0)) {
 					throw new Error(
 						`Decode timestamps must not go backwards, but a packet presenting at`
@@ -1625,8 +1584,6 @@ export class IsobmffMuxer extends Muxer {
 			if (this.isFragmented) {
 				// We can only finalize this fragment (and begin a new one) if we know that each track will be able to
 				// start the new one with a key frame.
-				// Hoisted: the answer cannot change between tracks, and computing it per track rescans
-				// every queue.
 				const quietSkippable = this.quietTracksMayBeSkipped();
 				const keyFrameQueuedEverywhere = this.trackDatas.every((otherTrackData) => {
 					if (trackData === otherTrackData) {
@@ -1638,7 +1595,6 @@ export class IsobmffMuxer extends Muxer {
 						return firstQueuedSample.type === 'key';
 					}
 
-					// A quiet track must not hold the fragment open either; same bound as the interleaver.
 					return this.closedTracks.has(otherTrackData.track) || quietSkippable;
 				});
 
@@ -1778,8 +1734,6 @@ export class IsobmffMuxer extends Muxer {
 		}
 	}
 
-	// A `sidx` points forward, so it precedes its subsegments, but the count is unknown until
-	// finalization: reserve a generous capacity and trim it then
 	private reserveSidx() {
 		const declared = this.formatOptions.sidxFragmentCapacity;
 		const capacity = declared ?? (this.formatOptions.segmentIndex ? DEFAULT_SIDX_FRAGMENT_CAPACITY : 0);
@@ -1812,7 +1766,6 @@ export class IsobmffMuxer extends Muxer {
 		assert(indexSize <= reservation.size); // Guaranteed by the per-fragment check in `finalizeFragment`
 
 		if (!primaryTrack || subsegments.length === 0) {
-			// There is nothing to index, so leave the slot as free space.
 			this.writer.seek(reservation.position);
 			this.boxWriter.writeBox(free(reservation.size));
 			this.writer.seek(endOfMedia);
@@ -1927,8 +1880,6 @@ export class IsobmffMuxer extends Muxer {
 
 		const fragmentNumber = this.nextFragmentNumber++;
 
-		// Fail on the fragment that no longer fits rather than at finalization: this throw travels the
-		// path the caller awaits, and it doesn't wait for the rest of the file to be written first.
 		if (this.sidxReservation && fragmentNumber > this.sidxReservation.capacity) {
 			throw new Error(
 				`The reserved \`sidx\` holds ${this.sidxReservation.capacity} fragments, but the file has more.`
@@ -1949,8 +1900,6 @@ export class IsobmffMuxer extends Muxer {
 				sample.timestamp -= trackData.firstDecodeTimestamp;
 				sample.decodeTimestamp -= trackData.firstDecodeTimestamp;
 
-				// Recorded here rather than where the sample was queued: what a `sidx` reports is a media
-				// time, and only the shifted values are on that timeline
 				this.minWrittenTimestamp = Math.min(this.minWrittenTimestamp, sample.timestamp);
 				this.maxWrittenEndTimestamp = Math.max(
 					this.maxWrittenEndTimestamp,
@@ -2281,8 +2230,6 @@ export class IsobmffMuxer extends Muxer {
 				trackData.maxBitrate = 8 * maxWindowBytes;
 
 				if (trackData.firstDecodeTimestamp !== null) {
-					// Shift all of the samples so that decoding begins at media time zero. We'll then write out an
-					// edit list that shifts them back to their proper spot in the composition.
 					for (let i = 0; i < trackData.samples.length; i++) {
 						const sample = trackData.samples[i]!;
 						sample.timestamp -= trackData.firstDecodeTimestamp;

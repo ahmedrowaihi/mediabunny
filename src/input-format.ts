@@ -678,7 +678,6 @@ export class DashInputFormat extends InputFormat {
 
 		input._rootSource._usedForDash = true;
 
-		// An MPD is the whole file; there is no run-in to skip
 		return 0;
 	}
 

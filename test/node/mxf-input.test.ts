@@ -17,11 +17,12 @@ import { mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, test } from 'vitest';
+import { registerMediabunnyServer } from '@mediabunny/server';
 import { FileSlice } from '../../src/reader.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
 import { Input } from '../../src/input.js';
 import { FilePathSource } from '../../src/source.js';
-import { EncodedPacketSink } from '../../src/media-sink.js';
+import { EncodedPacketSink, VideoSampleSink } from '../../src/media-sink.js';
 import type { EncodedPacket } from '../../src/packet.js';
 import { asRational, asUint, type LocalSet } from '../../src/mxf/mxf-klv.js';
 import { readPictureInfo, readSoundInfo } from '../../src/mxf/mxf-codec.js';
@@ -64,7 +65,8 @@ const streamsOf = (name: string) => JSON.parse(execFileSync('ffprobe', [
 	'-v', 'error', '-show_streams', '-of', 'json', path.join(dir, name),
 ], { encoding: 'utf8' })) as {
 	streams: { codec_type: string; codec_name: string; width?: number; height?: number;
-		sample_rate?: string; channels?: number; avg_frame_rate: string; }[];
+		sample_rate?: string; channels?: number; avg_frame_rate: string;
+		display_aspect_ratio?: string; }[];
 };
 
 beforeAll(() => {
@@ -263,8 +265,17 @@ describe('MXF essence coding', () => {
 		expect(info.internalId, 'no PictureEssenceCoding label').not.toBeNull();
 
 		const stream = streamsOf(name).streams.find(entry => entry.codec_type === 'video')!;
-		expect(info.displayWidth).toBe(stream.width);
-		expect(info.displayHeight).toBe(stream.height);
+
+		// ffprobe's width and height are the coded picture; it states the aspect separately, and DV is
+		// anamorphic - 720x576 shown at 16:9 - so comparing a display size against them conflates the two
+		expect(info.codedWidth).toBe(stream.width);
+		expect(info.codedHeight).toBe(stream.height);
+
+		const dar = stream.display_aspect_ratio;
+		if (dar && dar !== '0:1') {
+			const [num, den] = dar.split(':').map(Number);
+			expect(info.displayWidth / info.displayHeight).toBeCloseTo(num! / den!, 1);
+		}
 	}, 180_000);
 
 	test('PCM sound reads as the width and rate ffprobe reports', () => {
@@ -830,4 +841,86 @@ describe('MXF shapes the small fixtures miss', () => {
 		expect(packets.length, 'no packets: the index in the footer was never found').toBe(rows.length);
 		expect(packets.map(packet => packet.byteLength)).toEqual(rows);
 	}, 300_000);
+});
+
+describe('what a track reports to a consumer', () => {
+	const open = (name: string, args: string[]) => {
+		makeMxf(name, args);
+		return new Input({
+			source: new FilePathSource(path.join(dir, name)),
+			formats: ALL_FORMATS,
+		});
+	};
+
+	test('a padded raster is not reported as the picture, and the pixels stay square', async () => {
+		// StoredHeight is 1088 for a 1080-line AVC picture, since the coding pads up to its grid
+		using input = open('r-avc1080.mxf', [
+			'-s', '1920x1080', '-c:v', 'libx264', '-pix_fmt', 'yuv422p', '-an', '-t', '0.4',
+		]);
+		const track = await input.getPrimaryVideoTrack();
+		expect(track).toBeDefined();
+
+		expect(await track!.getCodedWidth()).toBe(1920);
+		expect(await track!.getCodedHeight()).toBe(1080);
+		expect(await track!.getDisplayWidth()).toBe(1920);
+		expect(await track!.getDisplayHeight()).toBe(1080);
+	});
+
+	test('several sound tracks are told apart rather than collapsed onto the first', async () => {
+		using input = open('r-multiaudio.mxf', [
+			'-map', '0:v', '-map', '0:a', '-map', '0:a', '-map', '0:a',
+			'-c:v', 'mpeg2video', '-b:v', '2M', '-c:a', 'pcm_s16le', '-ar', '48000', '-t', '0.5',
+		]);
+		const audio = (await input.getTracks()).filter(track => track.type === 'audio');
+		expect(audio).toHaveLength(3);
+
+		// Each sound track keys its own essence, so matching a clip to a file track by kind alone would
+		// hand all three the first track's essence
+		const ids = await Promise.all(audio.map(track => track.getContainerId()));
+		expect(new Set(ids).size).toBe(3);
+	});
+
+	test('a track reports the essence element number the container keys it by', async () => {
+		using input = open('r-containerid.mxf', [
+			'-s', '1920x1080', '-c:v', 'libx264', '-pix_fmt', 'yuv422p', '-an', '-t', '0.4',
+		]);
+		const track = await input.getPrimaryVideoTrack();
+		expect(track).toBeDefined();
+
+		// The GC essence element number, whose first byte (0x15) states picture essence
+		const id = await track!.getContainerId();
+		expect(id).not.toBeNull();
+		expect(id! >>> 24).toBe(0x15);
+	});
+
+	test('the codec string states the profile and level out of the essence', async () => {
+		using input = open('r-avcstring.mxf', [
+			'-s', '1920x1080', '-c:v', 'libx264', '-pix_fmt', 'yuv422p', '-profile:v', 'high422',
+			'-an', '-t', '0.4',
+		]);
+		const track = await input.getPrimaryVideoTrack();
+		expect(track).toBeDefined();
+
+		// High 4:2:2 is profile_idc 0x7a, and a bare 'avc' matches no codecs= attribute
+		expect(await track!.getCodecParameterString()).toMatch(/^avc1\.7a[0-9a-f]{4}$/);
+	});
+
+	test('MPEG-2 essence decodes, which is what XDCAM HD422 carries', async () => {
+		registerMediabunnyServer();
+
+		using input = open('r-mpeg2.mxf', [
+			'-s', '1920x1080', '-c:v', 'mpeg2video', '-pix_fmt', 'yuv422p', '-b:v', '20M',
+			'-an', '-t', '0.4',
+		]);
+		const track = await input.getPrimaryVideoTrack();
+		expect(track).toBeDefined();
+		expect(await track!.getCodec()).toBe('mpeg2');
+
+		let frames = 0;
+		for await (const sample of new VideoSampleSink(track!).samples()) {
+			frames++;
+			sample.close();
+		}
+		expect(frames).toBeGreaterThan(0);
+	}, 60_000);
 });

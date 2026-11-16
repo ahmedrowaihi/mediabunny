@@ -6,11 +6,6 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-// Kept apart from `misc.ts` on purpose: that module imports the package entry for its options, and the
-// entry imports `@mediabunny/prores`, which the test config aliases to a built bundle. Encoder choice
-// needs none of that, and keeping it at a leaf is what lets the linux-arm64 CI job check it without a
-// build — on arm64 is the only place FFmpeg's default for AVC is a hardware wrapper.
-
 import * as NodeAv from 'node-av';
 import type { VideoCodec } from 'mediabunny';
 
@@ -66,14 +61,12 @@ const SOFTWARE_ENCODER_NAMES: Partial<Record<VideoCodec, EncoderName[]>> = {
 /** @internal */
 export const getSoftwareEncoderCodec = (codec: VideoCodec, codecId: NodeAv.AVCodecID) => {
 	if (codec === 'prores') {
-		// Prefer prores_ks for ProRes
 		const proresKs = NodeAv.Codec.findEncoderByName(NodeAv.FF_ENCODER_PRORES_KS);
 		if (proresKs) {
 			return proresKs;
 		}
 	}
 
-	// The default first, so every build whose default is already software keeps the encoder it had
 	const byId = NodeAv.Codec.findEncoder(codecId);
 	if (byId && !isHardwareCodec(byId)) {
 		return byId;
@@ -86,7 +79,5 @@ export const getSoftwareEncoderCodec = (codec: VideoCodec, codecId: NodeAv.AVCod
 		}
 	}
 
-	// Null rather than the hardware default: `prefer-software` asked for the CPU, and a caller is better
-	// told there is none than handed a device encoder that fails on the next option it is given
 	return null;
 };

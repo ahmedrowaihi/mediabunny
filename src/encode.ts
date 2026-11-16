@@ -30,6 +30,8 @@ import {
 import { customAudioEncoders, customVideoEncoders } from './custom-coder';
 import { type HdrStaticMetadata } from './hdr-metadata';
 import {
+	MaybePromise,
+	Rotation,
 	assert,
 	clamp,
 	getChromiumVersion,
@@ -37,8 +39,7 @@ import {
 	isNumber,
 	isRecordStringString,
 	lerp,
-	MaybePromise,
-	Rotation,
+	type WideVideoColorSpaceInit,
 } from './misc';
 import { EncodedPacket } from './packet';
 import { AudioSample, CropRectangle, validateCropRectangle, VideoSample, VideoSampleResource } from './sample';
@@ -96,8 +97,6 @@ export type VideoEncodingConfig = {
 	/** Called right before a sample is passed to the encoder. */
 	onEncodedSample?: (sample: VideoSample) => unknown;
 
-	// A config alone cannot say whether these were demanded or inherited, and only what was inherited may
-	// be dropped where the samples reaching the encoder do not back it
 	/** @internal */
 	_bitDepthIsInherited?: boolean;
 	/** @internal */
@@ -528,7 +527,7 @@ export type VideoEncodingAdditionalOptions = {
 	 * The first sample reaching the encoder is checked against this field and a contradiction is rejected, so that
 	 * the output cannot claim a color space its samples don't have.
 	 */
-	colorSpace?: VideoColorSpaceInit;
+	colorSpace?: WideVideoColorSpaceInit;
 	/**
 	 * The HDR10 static metadata (mastering display colour volume and content light level) to signal on the output
 	 * track, written to the container next to the color signalling. It describes how the content was graded, not how
@@ -594,8 +593,6 @@ export const validateVideoEncodingAdditionalOptions = (
 	if (options.hdrStaticMetadata !== undefined) {
 		validateHdrStaticMetadata(options.hdrStaticMetadata, 'hdrStaticMetadata');
 	}
-	// An inherited color is not a claim the caller made, so a depth that cannot carry it drops the transfer
-	// at encode time rather than failing here.
 	if (!options._colorSpaceIsInherited) {
 		validateBitDepthCarriesTransfer(options.bitDepth, options.colorSpace, '');
 	}
@@ -644,7 +641,6 @@ export type VideoRateControl = {
 	cap: { maxBitrate: number; bufferSize: number } | null;
 };
 
-// WebCodecs configs can't carry a cap, so custom encoders receive it in these fields
 export type QualityCappedVideoEncoderConfig = VideoEncoderConfig & {
 	_maxBitrate?: number;
 	_bufferSize?: number;
@@ -1204,7 +1200,6 @@ export class Quality {
 
 			bitrate = computeVideoBitrate(codec, width, height, qualityToBitrateFactor(quality));
 			if (this._maxBitrate !== undefined) {
-				// A derived bitrate is also the fallback where the cap can't be enforced, so it must respect the cap
 				bitrate = Math.min(bitrate, this._maxBitrate);
 			}
 		}
@@ -1309,11 +1304,10 @@ export const VIDEO_CODEC_QUANTIZER_SUPPORT: Partial<Record<VideoCodec, {
 }>> = {
 	avc: { min: 0, max: 51, worst: 41, best: 16 },
 	hevc: { min: 0, max: 51, worst: 41, best: 16 },
-	// Chromium moved VP9's quantizer to 0-255 in v145 (mediabunny#566); libvpx kept 0-63 and refuses to
-	// open above it, and this fork drives libvpx directly, so an unknown environment gets the narrow scale
-	vp9: (getChromiumVersion() ?? 0) >= 145
-		? { min: 0, max: 255, worst: 208, best: 80 }
-		: { min: 0, max: 63, worst: 52, best: 20 },
+	// Chromium used the 0-63 scale before v145, see https://github.com/Vanilagy/mediabunny/issues/566
+	vp9: (getChromiumVersion() ?? Infinity) < 145
+		? { min: 0, max: 63, worst: 52, best: 20 }
+		: { min: 0, max: 255, worst: 208, best: 80 },
 	av1: { min: 0, max: 255, worst: 208, best: 80 },
 };
 

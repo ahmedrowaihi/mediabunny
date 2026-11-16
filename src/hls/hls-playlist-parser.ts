@@ -614,8 +614,6 @@ export const parseHlsPlaylist = (text: string, variables?: HlsPlaylistVariables)
 const INDEPENDENT_SEGMENTS = '#EXT-X-INDEPENDENT-SEGMENTS';
 const EXT_X_VERSION = '#EXT-X-VERSION:';
 
-// A tag this library does not model is kept verbatim in `unknownTags` and written back, so nothing
-// is lost and there is nothing to report. It used to be dropped, which is what the warning was for.
 const noteUnmodelledTag = (line: string, lineNumber: number, notes: HlsParseNote[]) => {
 	const name = line.slice(0, line.indexOf(':') === -1 ? undefined : line.indexOf(':'));
 	if (name === '#EXTM3U' || notes.some(note => note.kind === 'unmodelled-tag' && note.tag === name)) {
@@ -700,7 +698,6 @@ const parseMaster = (lines: string[], variables?: HlsPlaylistVariables): HlsMast
 				throw new MalformedInputError('Invalid HLS master playlist: #EXT-X-SESSION-KEY requires METHOD');
 			}
 			const key = keyFromAttrs(attrs, method);
-			// As with #EXT-X-KEY, one key per KEYFORMAT; different formats coexist for multi-DRM.
 			out.sessionKeys = [...out.sessionKeys.filter(k => k.keyFormat !== key.keyFormat), key];
 			continue;
 		}
@@ -741,8 +738,6 @@ const parseMaster = (lines: string[], variables?: HlsPlaylistVariables): HlsMast
 		}
 		if (line.startsWith(TAG_STREAM_INF)) {
 			const attrs = new AttributeList(line.slice(TAG_STREAM_INF.length), vars);
-			// 4.1: blank lines are ignored and comments SHOULD be, so the URI need not be the very
-			// next line — media playlists already read it this way.
 			let uriIndex = i + 1;
 			while (uriIndex < lines.length && canIgnoreLine(lines[uriIndex]!)) {
 				uriIndex++;
@@ -1151,7 +1146,6 @@ const parseMedia = (lines: string[], variables?: HlsPlaylistVariables): HlsMedia
 				currentKeys = [];
 			} else {
 				const key: HlsKey = keyFromAttrs(attrs, method);
-				// A new key supersedes the prior one of the same KEYFORMAT; different formats coexist (multi-DRM).
 				currentKeys = [...currentKeys.filter(k => k.keyFormat !== key.keyFormat), key];
 			}
 			continue;
@@ -1268,7 +1262,6 @@ const parseMedia = (lines: string[], variables?: HlsPlaylistVariables): HlsMedia
 			continue;
 		}
 
-		// A non-tag, non-comment, non-blank line is a segment URI.
 		if (pendingDuration === null) {
 			throw new MalformedInputError('Invalid HLS media playlist: segment URI without preceding #EXTINF');
 		}
@@ -1299,11 +1292,8 @@ const parseMedia = (lines: string[], variables?: HlsPlaylistVariables): HlsMedia
 		pendingUnknownTags = [];
 	}
 
-	// Anything still pending belonged to no segment: it sat before the first one, or after the last.
 	out.unknownTags.push(...pendingUnknownTags);
 
-	// 4.4.3.1 makes it REQUIRED and a player sizes its buffer from it, but it carries no sample data and
-	// the caller can see the null, so a missing one is stated rather than thrown
 	if (out.targetDuration === null) {
 		out.notes.push({ kind: 'missing-target-duration' });
 	}
@@ -1348,7 +1338,6 @@ const parseTileLayout = (value: string | null): HlsTiles['layout'] | null => {
 
 	const columns = Number(match[1]);
 	const rows = Number(match[2]);
-	// The spec's minimum is 1x1; a zero would make the grid describe no tiles at all.
 	return columns > 0 && rows > 0 ? { columns, rows } : null;
 };
 

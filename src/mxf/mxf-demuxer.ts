@@ -15,7 +15,13 @@
 // states every edit unit's offset, so the only thing the essence itself has to supply is where the
 // container starts.
 
-import { AudioCodec, VideoCodec } from '../codec';
+import { AudioCodec, extractVideoCodecString, VideoCodec } from '../codec';
+import {
+	extractAvcDecoderConfigurationRecord,
+	extractHevcDecoderConfigurationRecord,
+	type AvcDecoderConfigurationRecord,
+	type HevcDecoderConfigurationRecord,
+} from '../codec-data';
 import { Demuxer } from '../demuxer';
 import { MalformedInputError } from '../errors';
 import { Input } from '../input';
@@ -91,6 +97,29 @@ type MxfTrackData = {
 	wrapping: MxfWrapping;
 };
 
+/** A run of one essence container's bytes inside a single body partition. */
+type MxfEssenceRun = {
+	/** Stream offset, within the container, of this run's first byte. */
+	bodyOffset: number;
+	/** File offset of that same byte. */
+	fileStart: number;
+};
+
+// A stream offset counts from the container's start, not the file's: the partitions carrying its
+// BodySID laid end to end.
+const fileOffsetOf = (runs: MxfEssenceRun[], streamOffset: number): number | null => {
+	let chosen: MxfEssenceRun | null = null;
+	for (const run of runs) {
+		if (run.bodyOffset > streamOffset) {
+			break;
+		}
+
+		chosen = run;
+	}
+
+	return chosen === null ? null : chosen.fileStart + (streamOffset - chosen.bodyOffset);
+};
+
 export class MxfDemuxer extends Demuxer {
 	reader: Reader;
 	metadataPromise: Promise<void> | null = null;
@@ -121,17 +150,28 @@ export class MxfDemuxer extends Demuxer {
 			const { sets, setTypes } = readHeaderMetadataSets(metadataSlice);
 			const metadata = readHeaderMetadata(sets, setTypes);
 
-			// Index segments, from whichever partitions announce one. The footer usually carries them,
-			// which is why the file is read from both ends rather than streamed forward.
+			// A partition states no length, so the next one's start is the only bound there is.
+			const endOf = (index: number) => partitions[index + 1]?.start ?? fileSize;
+
 			const segments: MxfIndexSegment[] = [];
-			for (const partition of partitions) {
+			for (const [index, partition] of partitions.entries()) {
 				if (partition.indexSid === 0) {
 					continue;
 				}
 
-				const slice = FileSlice.tempFromBytes(front.bytes);
-				slice.skip(partition.contentsStart);
-				segments.push(...readIndexSegmentsIn(slice).map(readIndexTableSegment));
+				// OP1b spreads index segments through the file, past the window read at the front.
+				const end = endOf(index);
+				if (end <= front.bytes.length) {
+					const slice = FileSlice.tempFromBytes(front.bytes);
+					slice.skip(partition.contentsStart);
+					segments.push(...readIndexSegmentsIn(slice).map(readIndexTableSegment));
+					continue;
+				}
+
+				const slice = await this.sliceOf(partition.contentsStart, end - partition.contentsStart);
+				if (slice) {
+					segments.push(...readIndexSegmentsIn(slice).map(readIndexTableSegment));
+				}
 			}
 
 			// The footer, wherever it is. Not found by the walk above: that only covers the window read at
@@ -148,46 +188,65 @@ export class MxfDemuxer extends Demuxer {
 				}
 			}
 
-			// Where each track's essence starts. One forward walk of the first body partition, stopping
-			// as soon as every track has been seen: everything after that comes from the index.
-			const containerBase = new Map<number, number>();
-			const elementCounts = new Map<number, number>();
-			const body = partitions.find(partition => partition.bodySid !== 0);
-			if (body) {
-				const length = Math.min(fileSize - body.contentsStart, HEADER_READ_SIZE);
-				const slice = await this.sliceOf(body.contentsStart, length);
-				if (slice) {
-					walkEssenceElements(slice, (element) => {
-						if (!containerBase.has(element.trackNumber)) {
-							// The key, not the value: an index offset counts the whole KLV triplet
-							containerBase.set(element.trackNumber, element.keyStart);
-						}
-						elementCounts.set(
-							element.trackNumber,
-							(elementCounts.get(element.trackNumber) ?? 0) + 1,
-						);
-					});
+			const runsBySid = new Map<number, MxfEssenceRun[]>();
+			const elementCounts = new Map<string, number>();
+			for (const [index, partition] of partitions.entries()) {
+				if (partition.bodySid === 0) {
+					continue;
 				}
+
+				// Bounded by the partition: a 4 MB read each would cost the file over many times.
+				const length = Math.min(endOf(index) - partition.contentsStart, HEADER_READ_SIZE);
+				const slice = await this.sliceOf(partition.contentsStart, length);
+				if (!slice) {
+					continue;
+				}
+
+				let runStarted = false;
+				walkEssenceElements(slice, (element) => {
+					if (!runStarted) {
+						// The key, not the value: an index offset counts the whole KLV triplet
+						const runs = runsBySid.get(partition.bodySid) ?? [];
+						runs.push({ bodyOffset: partition.bodyOffset, fileStart: element.keyStart });
+						runsBySid.set(partition.bodySid, runs);
+						runStarted = true;
+					}
+
+					const key = `${partition.bodySid}:${element.trackNumber}`;
+					elementCounts.set(key, (elementCounts.get(key) ?? 0) + 1);
+				});
+			}
+			for (const runs of runsBySid.values()) {
+				runs.sort((a, b) => a.bodyOffset - b.bodyOffset);
 			}
 
-			// Stated once for the whole package, on its own track beside the essence tracks
 			const startTimecode = metadata.materialPackage?.tracks
 				.map(track => track.startTimecode)
 				.find(entry => entry !== null) ?? null;
 
 			for (const resolved of resolveTracks(metadata)) {
-				const fileTrack = resolved.pkg.tracks.find(candidate => (
-					candidate.kind === resolved.track.kind && candidate.trackNumber !== 0
-				));
+				// Matching on kind alone hands every sound track the first one's essence.
+				const sourceTrackId = resolved.track.sourceTrackId ?? resolved.track.id;
+				const fileTrack = resolved.pkg.tracks.find(candidate => candidate.id === sourceTrackId)
+					?? resolved.pkg.tracks.find(candidate => (
+						candidate.kind === resolved.track.kind && candidate.trackNumber !== 0
+					));
 				if (!fileTrack || !resolved.descriptor) {
 					continue;
 				}
 
-				const base = containerBase.get(fileTrack.trackNumber);
+				const bodySid = metadata.essenceContainers.get(resolved.pkg.uid)?.bodySid ?? 0;
+				const runs = runsBySid.get(bodySid)
+					?? (metadata.essenceContainers.size === 0 ? [...runsBySid.values()][0] : undefined);
 				const editRate = resolved.track.editRate ?? fileTrack.editRate;
-				if (base === undefined || !editRate || editRate.den === 0 || editRate.num === 0) {
+				if (!runs || runs.length === 0 || !editRate || editRate.den === 0 || editRate.num === 0) {
 					continue;
 				}
+
+				// Another container's index would answer for positions it knows nothing about.
+				const named = segments.filter(segment => segment.bodySid === bodySid);
+				const unnamed = segments.filter(segment => segment.bodySid === 0);
+				const trackSegments = named.length > 0 ? named : unnamed.length > 0 ? unnamed : segments;
 
 				const data: MxfTrackData = {
 					track: resolved.track,
@@ -198,12 +257,12 @@ export class MxfDemuxer extends Demuxer {
 					picture: resolved.track.kind === 'picture' ? readPictureInfo(resolved.descriptor) : null,
 					sound: resolved.track.kind === 'sound' ? readSoundInfo(resolved.descriptor) : null,
 					wrapping: wrappingOf(
-						elementCounts.get(fileTrack.trackNumber) ?? 0,
+						elementCounts.get(`${bodySid}:${fileTrack.trackNumber}`) ?? 0,
 						resolved.track.duration,
 					),
 				};
 
-				this.buildSamples(data, segments, base, editRate, fileSize);
+				this.buildSamples(data, trackSegments, runs, editRate, fileSize);
 				if (data.samples.length > 0) {
 					this.trackDatas.push(data);
 				}
@@ -220,7 +279,7 @@ export class MxfDemuxer extends Demuxer {
 	private buildSamples(
 		data: MxfTrackData,
 		segments: MxfIndexSegment[],
-		base: number,
+		runs: MxfEssenceRun[],
 		editRate: { num: number; den: number },
 		fileSize: number,
 	) {
@@ -241,12 +300,11 @@ export class MxfDemuxer extends Demuxer {
 				break;
 			}
 
-			const keyPosition = base + located.streamOffset;
-			if (keyPosition >= fileSize) {
+			const keyPosition = fileOffsetOf(runs, located.streamOffset);
+			if (keyPosition === null || keyPosition >= fileSize) {
 				break;
 			}
 
-			// The index is in stored order; a reordering coding presents this unit somewhere else
 			const display = ordering.get(position) ?? position;
 			data.samples.push({
 				timestamp: (display - origin) * perUnit,
@@ -258,7 +316,6 @@ export class MxfDemuxer extends Demuxer {
 			});
 		}
 
-		// The samples are built in stored order, which is the order a decoder wants them in
 		data.samples.sort((a, b) => a.decodeTimestamp - b.decodeTimestamp);
 		data.byPresentation = data.samples
 			.map((_, index) => index)
@@ -351,6 +408,10 @@ abstract class MxfTrackBacking {
 		return this.data.trackNumber;
 	}
 
+	getContainerId() {
+		return this.data.trackNumber;
+	}
+
 	getName() {
 		return this.data.track.name;
 	}
@@ -412,7 +473,6 @@ abstract class MxfTrackBacking {
 			return null;
 		}
 
-		// MXF states a frame count since midnight at the rounded rate, which is exactly what this takes
 		return startTimecodeOf(timecode.startFrame, timecode.base, timecode.dropFrame);
 	}
 
@@ -484,10 +544,6 @@ abstract class MxfTrackBacking {
 	}
 
 	getKeyPacket(timestamp: number, options: PacketRetrievalOptions) {
-		// Back through presentation order, which is what the contract states: the last key packet whose
-		// own start time is at or before this one. Stepping back in decode order instead finds the key
-		// frame a decoder needs as a reference, which in a reordered stream is presented *later* - for
-		// a B-frame between two GOPs that is the next GOP's I-frame, and seeking there runs forward.
 		let slot = this.presentationSlotAt(timestamp);
 		while (slot >= 0 && !this.data.samples[this.data.byPresentation[slot]!]!.isKeyFrame) {
 			slot--;
@@ -574,10 +630,33 @@ class MxfVideoTrackBacking extends MxfTrackBacking implements InputVideoTrackBac
 			return null;
 		}
 
-		// No description: MXF carries the parameter sets in the essence itself, so an AVC or HEVC track
-		// is in Annex B form and a decoder reads its own headers out of the first packet.
+		let avcCodecInfo: AvcDecoderConfigurationRecord | null = null;
+		let hevcCodecInfo: HevcDecoderConfigurationRecord | null = null;
+		if (codec === 'avc' || codec === 'hevc') {
+			const first = this.data.samples[0];
+			const bytes = first ? await this.demuxer.readSample(first, this.data.trackNumber) : null;
+			if (bytes) {
+				avcCodecInfo = codec === 'avc' ? extractAvcDecoderConfigurationRecord(bytes) : null;
+				hevcCodecInfo = codec === 'hevc' ? extractHevcDecoderConfigurationRecord(bytes) : null;
+			}
+		}
+
 		return {
-			codec,
+			codec: extractVideoCodecString({
+				width: this.info.codedWidth,
+				height: this.info.codedHeight,
+				codec,
+				codecDescription: null,
+				colorSpace: null,
+				avcType: 1,
+				hevcType: 'hev1',
+				avcCodecInfo,
+				hevcCodecInfo,
+				vp9CodecInfo: null,
+				av1CodecInfo: null,
+				mpeg2CodecInfo: null,
+				proresFormat: null,
+			}),
 			codedWidth: this.info.codedWidth,
 			codedHeight: this.info.codedHeight,
 			displayAspectWidth: this.info.displayWidth,

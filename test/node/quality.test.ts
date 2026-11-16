@@ -37,3 +37,10 @@ test('a demanded bitrate mode is readable, where otherwise the encoder default s
 test('preferBitrate is readable on a qualitative quality', () => {
 	expect(new Quality({ quality: 'medium', preferBitrate: true }).preferBitrate).toBe(true);
 });
+
+test('VP9 takes the full 0-255 quantizer scale off Chromium', () => {
+	// The 0-63 scale is a legacy Chromium (<145) quirk, not the codec's range; under Node there is no
+	// Chromium version, so the full scale must apply. See Vanilagy/mediabunny#566.
+	const quality = new Quality({ quantizer: 200 });
+	expect(quality._toVideoRateControl('vp9', 1920, 1080, undefined).quantizer).toBe(200);
+});

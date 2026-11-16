@@ -63,7 +63,6 @@ export const hlsVersionOf = (playlist: HlsPlaylist): number => {
 	}
 
 	for (const segment of playlist.segments) {
-		// Asks the serializer's own decision rather than guessing what it will write
 		if (EXTINF_IS_DECIMAL) {
 			require(3);
 		}
@@ -71,7 +70,6 @@ export const hlsVersionOf = (playlist: HlsPlaylist): number => {
 			require(4);
 		}
 		if (segment.map !== null) {
-			// MAP alone is 5; MAP in a playlist without I-FRAMES-ONLY is 6
 			require(playlist.iFramesOnly ? 5 : 6);
 		}
 		for (const key of segment.keys) {
@@ -90,8 +88,6 @@ const keyVersion = (key: HlsKey) => {
 	if (key.method === 'SAMPLE-AES') {
 		return 5;
 	}
-	// KEYFORMAT defaults to 'identity' when absent and KEYFORMATVERSIONS to empty, so anything else
-	// means the attribute was actually written.
 	const statesKeyFormat = key.keyFormat !== 'identity' || key.keyFormatVersions.length > 0;
 	if (statesKeyFormat) {
 		return 5;

@@ -31,7 +31,7 @@ export const wakePendingAccept = async (url: string) => {
 	try {
 		await peer.open2(target.toString(), AVIO_FLAG_WRITE);
 	} catch {
-		// The accept may have already failed or been satisfied; either way there is nothing to wake.
+		// Unreachable peer is the normal case here
 	}
 
 	await peer.closep().catch(() => {});
@@ -113,7 +113,6 @@ let logRedactionInstalled = false;
  * @internal
  */
 export const installSecretRedactingLog = (): void => {
-	// One process-wide slot: a callback left behind by an exited worker aborts the process
 	if (logRedactionInstalled || !isMainThread) {
 		return;
 	}
@@ -136,14 +135,10 @@ export const throwFailedOpen = async (
 	ret: number,
 	encrypted: boolean,
 ): Promise<never> => {
-	// Without this the native handle is left for the GC to finalize whenever it likes, and these failures
-	// come in bursts because a caller retries
 	await context.closep().catch(() => {});
 
 	throw new Error(
 		`${label}: could not open ${redactUrl(url)} (AVERROR ${ret}).`
-		// SRT reports a refused connection, an unreachable host and a rejected passphrase with the same
-		// AVERROR - measured -5 or -60 for all of them - so the passphrase is named rather than diagnosed
 		+ (encrypted
 			? ' SRT does not distinguish a rejected passphrase from any other refusal, so check that both'
 			+ ' ends agree on the passphrase and key length.'

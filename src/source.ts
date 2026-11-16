@@ -123,8 +123,6 @@ export abstract class Source extends EventEmitter<SourceEvents> {
 
 		if (typeof FinalizationRegistry !== 'undefined') {
 			this._refFinalizationRegistry = new FinalizationRegistry((source) => {
-				// HLS and DASH evict cached segment inputs without disposing them, by design, and an evicted one may
-				// still be being read — so the warning would be noise for those refs
 				if (!source._usedForHls && !source._usedForDash) {
 					Logging._warn(
 						'A SourceRef was garbage-collected without being freed. Hold on to the ref and call .free()'
@@ -2285,7 +2283,6 @@ export class ReadableStreamSource extends Source {
 			return;
 		}
 
-		// Set before the waiting reads are answered, so a read issued in response to one of them sees the end
 		this._endIndex = this._currentIndex;
 
 		for (const pendingSlice of this._pendingSlices) {
@@ -2293,7 +2290,6 @@ export class ReadableStreamSource extends Source {
 		}
 		this._pendingSlices.length = 0;
 
-		// Wakes the read parked in `_pull`, which then takes its own end-of-stream path
 		void this._reader?.cancel().catch(() => {});
 	}
 
@@ -2377,8 +2373,6 @@ const PREFETCH_PROFILES = {
 				end = Math.max(end, worker.startPos + extent);
 			}
 
-			// A read ending just before the region means the file is being walked backwards, so the start grows
-			// the same way rather than paying a request per padding step
 			if (end <= worker.startPos && end > worker.startPos - paddingStart) {
 				const size = worker.targetPos - worker.startPos;
 				const extent = Math.min(2 ** Math.ceil(Math.log2(size + 1)), maxExtensionAmount);

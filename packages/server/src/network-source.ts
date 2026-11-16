@@ -29,8 +29,6 @@ type Bounds = {
 	read: string;
 };
 
-// FFmpeg ignores an option name it does not know in silence, leaving the infinite default — so a wrong
-// name here reads as "unboundable". Units differ per protocol on purpose; see FORK.md.
 const BOUNDS_BY_SCHEME: Record<string, Bounds> = {
 	srt: { accept: { name: 'listen_timeout', perSecond: 1e6, listenQuery: ['mode', 'listener'] }, read: 'timeout' },
 	tcp: { accept: { name: 'listen_timeout', perSecond: 1e3, listenQuery: ['listen', '1'] }, read: 'timeout' },
@@ -104,14 +102,10 @@ const boundedUrl = (
 	const [listenKey, listenValue] = bounds.accept?.listenQuery ?? [];
 	const listening = listenKey !== undefined && url.searchParams.get(listenKey) === listenValue;
 
-	// Set, not defaulted: a caller-supplied value for one of these would reinstate the hang this class
-	// exists to prevent. Every other query parameter stays the caller's.
 	if (bounds.accept && listening) {
 		url.searchParams.set(bounds.accept.name, ticks(connectTimeout, bounds.accept.perSecond));
 	}
 
-	// One option governs both the connect and later reads, so a caller's connect would otherwise be
-	// bounded by readTimeout alone. Whichever is longer has to fit.
 	const readSeconds = listening ? readTimeout : Math.max(connectTimeout, readTimeout);
 	url.searchParams.set(bounds.read, ticks(readSeconds, READ_BOUND_PER_SECOND));
 
@@ -168,8 +162,6 @@ class RtpStreamReader {
 			return;
 		}
 
-		// A UDP socket has no EOF, so silence is the only thing that can end the stream. Until the first
-		// datagram the deadline is connectTimeout; after it, readTimeout.
 		this.lastByteAt = Date.now();
 		let receivedAny = false;
 
@@ -216,7 +208,7 @@ class RtpStreamReader {
 		try {
 			this.socket?.close();
 		} catch {
-			// Never bound, or already closed
+			// Already closed
 		}
 		this.socket = undefined;
 	}
@@ -282,12 +274,10 @@ class NetworkStreamReader {
 			this.pendingRead = null;
 		}
 
-		// Cancel tore the stream down while this read was in flight and owns the context now
 		if (this.canceled) {
 			return;
 		}
 
-		// A number is an AVERROR, EOF included: the sender went away, which ends the stream
 		if (typeof result === 'number' || result.length === 0) {
 			await this.closeIo();
 			controller.close();
@@ -300,13 +290,11 @@ class NetworkStreamReader {
 	async cancel() {
 		this.canceled = true;
 
-		// A pending accept outlives a close
 		if (this.listening && !this.opened && this.pendingOpen) {
 			await wakePendingAccept(this.url);
 		}
 
 		await this.pendingOpen?.catch(() => {});
-		// Freeing the context under a blocked read aborts the process; nothing can interrupt one
 		await this.pendingRead?.catch(() => {});
 		await this.closeIo();
 	}
@@ -315,7 +303,6 @@ class NetworkStreamReader {
 const openRtpStream = (url: string, connectTimeout: number, readTimeout: number) => {
 	const reader = new RtpStreamReader(new URL(url), connectTimeout, readTimeout);
 
-	// Pushed rather than pulled: datagrams arrive when they arrive, and a socket cannot be asked for one.
 	return new ReadableStream<Uint8Array>({
 		start: controller => reader.start(controller),
 		cancel: () => reader.cancel(),
@@ -328,8 +315,6 @@ const openStream = (url: string, listening: boolean): ReadableStream<Uint8Array>
 	return new ReadableStream<Uint8Array>({
 		pull: controller => reader.pull(controller),
 		cancel: () => reader.cancel(),
-	// Room to run ahead of the consumer: on UDP or SRT a stalled reader means a dropped packet rather
-	// than backpressure.
 	}, { highWaterMark: 32 });
 };
 

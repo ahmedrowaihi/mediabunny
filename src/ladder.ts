@@ -134,7 +134,6 @@ export const encodeVideoLadder = async (options: VideoLadderOptions): Promise<vo
 				throw options.signal.reason as Error;
 			}
 
-			// Clone for every rung up front: they share one backing resource, and the first add closes it
 			const clones = rigs.map(() => sample.clone());
 			sample.close();
 

@@ -159,6 +159,8 @@ describe('serializeMpd', () => {
 			schemeIdUri: 'urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed',
 			value: 'Widevine',
 			keyId: '1234567890abcdef1234567890abcdef',
+			refId: null,
+			ref: null,
 			psshBoxes: [new Uint8Array([0, 1, 2, 3])],
 			foreignXml: [],
 		};
@@ -741,5 +743,75 @@ describe('ServiceDescription on the writer path', () => {
 
 		expect(xml).toMatch(/<ServiceDescription[^>]*id="1"/);
 		expect(xml).toMatch(/<Latency[^>]*target="3000"/);
+	});
+});
+
+// Five pieces of signalling MediaPackage emits that the model dropped: a parse/serialize round trip
+// silently deleted them, so a manifest rewritten through this library lost DRM references, DVB mirror
+// selection, DVB reporting, the font-download descriptor's own attributes, and Period-level properties.
+describe('MPD round-trip keeps DRM references, DVB extensions and Period properties', () => {
+	const SOURCE = `<?xml version="1.0" encoding="utf-8"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" xmlns:cenc="urn:mpeg:cenc:2013" xmlns:dvb="urn:dvb:dash:dash-extensions:2014" profiles="urn:mpeg:dash:profile:isoff-live:2011" type="static" minBufferTime="PT2S">
+  <BaseURL dvb:priority="1" dvb:weight="10">https://a.example/</BaseURL>
+  <BaseURL dvb:priority="2" dvb:weight="5">https://b.example/</BaseURL>
+  <Period id="0" start="PT0S">
+    <SupplementalProperty schemeIdUri="urn:example:period-supplemental" value="per"/>
+    <EssentialProperty schemeIdUri="urn:dvb:dash:fontdownload:2014" value="1" dvb:url="fonts/sub.woff" dvb:fontFamily="SubtitleFont" dvb:mimeType="application/font-woff"/>
+    <AdaptationSet id="1" contentType="video" mimeType="video/mp4" codecs="avc1.64001f">
+      <ContentProtection schemeIdUri="urn:mpeg:dash:mp4protection:2011" value="cenc" cenc:default_KID="12345678-1234-1234-1234-123456789012" refId="drm-1"/>
+      <ContentProtection schemeIdUri="urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed" ref="drm-1"/>
+      <Representation id="v0" bandwidth="1200000"/>
+    </AdaptationSet>
+  </Period>
+  <Metrics metrics="BufferLevel">
+    <Reporting schemeIdUri="urn:dvb:dash:reporting:2014" value="1" dvb:reportingUrl="https://metrics.example/r" dvb:probability="500"/>
+  </Metrics>
+</MPD>`;
+
+	const round = () => serializeMpd(parseMpd(SOURCE));
+
+	test('the model carries each of them, rather than the serializer re-inventing them', () => {
+		const mpd = parseMpd(SOURCE);
+
+		expect(mpd.baseURLs.map(b => [b.dvbPriority, b.dvbWeight])).toEqual([[1, 10], [2, 5]]);
+
+		const period = mpd.periods[0]!;
+		expect(period.supplementalProperties.map(p => p.schemeIdUri)).toEqual(['urn:example:period-supplemental']);
+		const font = period.essentialProperties[0]!;
+		expect(font.foreignAttributes).toEqual({
+			'dvb:url': 'fonts/sub.woff',
+			'dvb:fontFamily': 'SubtitleFont',
+			'dvb:mimeType': 'application/font-woff',
+		});
+
+		const protections = period.adaptationSets[0]!.contentProtections;
+		expect(protections.map(p => [p.refId, p.ref])).toEqual([['drm-1', null], [null, 'drm-1']]);
+
+		expect(mpd.metrics[0]!.reporting[0]!.foreignAttributes).toEqual({
+			'dvb:reportingUrl': 'https://metrics.example/r',
+			'dvb:probability': '500',
+		});
+	});
+
+	test('every attribute survives serialization, and a second pass changes nothing', () => {
+		const out = round();
+
+		for (const attribute of [
+			'dvb:priority="1"', 'dvb:weight="10"', 'dvb:priority="2"', 'dvb:weight="5"',
+			'refId="drm-1"', 'ref="drm-1"',
+			'dvb:url="fonts/sub.woff"', 'dvb:fontFamily="SubtitleFont"',
+			'dvb:mimeType="application/font-woff"',
+			'dvb:reportingUrl="https://metrics.example/r"', 'dvb:probability="500"',
+			'urn:example:period-supplemental',
+		]) {
+			expect(out, `${attribute} was dropped`).toContain(attribute);
+		}
+
+		// xmlns:dvb has to be declared or the prefixed attributes are not well-formed
+		expect(out).toContain('xmlns:dvb="urn:dvb:dash:dash-extensions:2014"');
+
+		// Byte-stable: parsing the output and serializing again is a fixed point, which is what makes the
+		// model lossless rather than merely non-empty
+		expect(serializeMpd(parseMpd(out))).toBe(out);
 	});
 });

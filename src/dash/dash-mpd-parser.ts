@@ -37,6 +37,10 @@ export type MpdBaseURL = {
 	availabilityTimeOffset?: number;
 	/** `@availabilityTimeComplete`. Absent and `true` both mean the spec default. */
 	availabilityTimeComplete?: boolean;
+	/** `@dvb:priority` — lower wins when a client chooses between mirrors (DVB A168). */
+	dvbPriority?: number;
+	/** `@dvb:weight` — relative share among equal priorities. */
+	dvbWeight?: number;
 };
 
 /**
@@ -200,6 +204,10 @@ export type MpdPeriod = {
 	}[];
 	/** `<GroupLabel>` children. */
 	groupLabels: MpdLabel[];
+	/** Period-level `<SupplementalProperty>` descriptors. */
+	supplementalProperties: DashDescriptor[];
+	/** Period-level `<EssentialProperty>` descriptors. */
+	essentialProperties: DashDescriptor[];
 	/** `<Preselection>` children. */
 	preselections: {
 		/** `@id`. */
@@ -296,6 +304,13 @@ export type DashDescriptor = {
 	value: string | null;
 	/** `@id`. */
 	id: string | null;
+	/**
+	 * Prefixed attributes this library does not model, verbatim and keyed by their qualified name —
+	 * a DVB `<Reporting dvb:reportingUrl dvb:probability>`, a font-download
+	 * `<EssentialProperty dvb:url dvb:fontFamily dvb:mimeType>`, anything else an extension puts on a
+	 * descriptor. Written back as they came, so a descriptor survives a round trip whole.
+	 */
+	foreignAttributes?: Record<string, string>;
 };
 
 /** A `<URL>`-shaped element (`<RepresentationIndex>`, `<BitstreamSwitching>`). @group DASH @public */
@@ -865,6 +880,14 @@ export type ContentProtection = {
 	value: string | null;
 	/** Normalised CENC default key id (32 lowercase hex chars), or `null`. */
 	keyId: string | null;
+	/**
+	 * `@refId`, the identifier another `<ContentProtection>` points at with `@ref`. This is the
+	 * REFERENCED form of DRM signalling in 23009-1: one element carries the system's data and the
+	 * others name it instead of repeating it.
+	 */
+	refId: string | null;
+	/** `@ref`, naming the `@refId` this element takes its protection data from. */
+	ref: string | null;
 	/** `<cenc:pssh>` boxes (may be content-only or full wire form). */
 	psshBoxes: Uint8Array[];
 	/**
@@ -1011,6 +1034,8 @@ const parsePeriod = (el: Element): MpdPeriod => {
 		id: el.getAttribute('id'),
 		start: parseISODuration(el.getAttribute('start')),
 		duration: parseISODuration(el.getAttribute('duration')),
+		supplementalProperties: collectProperties(el, 'SupplementalProperty'),
+		essentialProperties: collectProperties(el, 'EssentialProperty'),
 		baseURLs: collectBaseURLs(el),
 		serviceDescriptions: childrenByLocalName(el, 'ServiceDescription').map(parseServiceDescription),
 		adaptationSets: [],
@@ -1330,10 +1355,14 @@ const collectBaseURLs = (parent: Element): MpdBaseURL[] => {
 	for (const el of childrenByLocalName(parent, 'BaseURL')) {
 		const text = el.textContent?.trim();
 		if (text) {
+			const dvbPriority = numericAttr(el, 'dvb:priority');
+			const dvbWeight = numericAttr(el, 'dvb:weight');
 			result.push({
 				value: text,
 				serviceLocation: el.getAttribute('serviceLocation'),
 				...availabilityAttrs(el),
+				...(dvbPriority === null ? {} : { dvbPriority }),
+				...(dvbWeight === null ? {} : { dvbWeight }),
 			});
 		}
 	}
@@ -1376,12 +1405,46 @@ const collectAudioChannelConfigurations = (parent: Element): { schemeIdUri: stri
 	return result;
 };
 
+// These functions take either the DOM's Element or this package's own XmlElement, whose `attributes` is
+// a Map rather than a NamedNodeMap, so enumerating them needs both shapes
+const attributeEntries = (el: Element): [string, string][] => {
+	const bag: unknown = el.attributes;
+	if (bag instanceof Map) {
+		return [...(bag as Map<string, string>)];
+	}
+
+	const named = bag as NamedNodeMap | undefined;
+	if (!named) {
+		return [];
+	}
+	return Array.from({ length: named.length }, (_, index) => {
+		const attribute = named.item(index)!;
+		return [attribute.name, attribute.value] as [string, string];
+	});
+};
+
+/** Prefixed attributes other than the ones this library models, so an extension's survive a round trip. */
+const foreignAttributesOf = (el: Element): Record<string, string> => {
+	const kept: Record<string, string> = {};
+	for (const [name, value] of attributeEntries(el)) {
+		if (name.includes(':') && !name.startsWith('xmlns:')) {
+			kept[name] = value;
+		}
+	}
+	return kept;
+};
+
 const collectProperties = (parent: Element, localName: string): DashDescriptor[] => {
 	const result: DashDescriptor[] = [];
 	for (const el of childrenByLocalName(parent, localName)) {
 		const schemeIdUri = el.getAttribute('schemeIdUri');
 		if (schemeIdUri) {
-			result.push({ schemeIdUri, value: el.getAttribute('value'), id: el.getAttribute('id') });
+			result.push({
+				schemeIdUri,
+				value: el.getAttribute('value'),
+				id: el.getAttribute('id'),
+				foreignAttributes: foreignAttributesOf(el),
+			});
 		}
 	}
 	return result;
@@ -1389,8 +1452,6 @@ const collectProperties = (parent: Element, localName: string): DashDescriptor[]
 
 const textOf = (el: Element) => (el.textContent ?? '').trim();
 
-// Renders a foreign-namespace subtree back to text. The built-in parser already serializes itself; a real DOM
-// (global or xmldom) does not, and exposes no outerHTML here, so that case walks childNodes.
 const serializeForeignElement = (el: Element): string => {
 	const builtIn = el as unknown as { toXml?: () => string };
 	if (typeof builtIn.toXml === 'function') {
@@ -1423,7 +1484,6 @@ const serializeForeignElement = (el: Element): string => {
 	return `${out}>${parts.join('')}</${el.nodeName}>`;
 };
 
-// `<Event>` content is `xs:any namespace="##other"`, so anything inside it is kept verbatim.
 const foreignChildrenOf = (el: Element): string[] => {
 	const out: string[] = [];
 	for (let i = 0; i < el.children.length; i++) {
@@ -1565,6 +1625,8 @@ const collectContentProtections = (parent: Element): ContentProtection[] => {
 			schemeIdUri,
 			value: el.getAttribute('value'),
 			keyId: normaliseKeyId(el.getAttributeNS(DASH_NS.cenc, 'default_KID') || el.getAttribute('default_KID')),
+			refId: el.getAttribute('refId'),
+			ref: el.getAttribute('ref'),
 			psshBoxes,
 			foreignXml: foreignChildrenOf(el).filter(xml => !/^<\s*(?:\w+:)?pssh[\s>]/.test(xml)),
 		});
@@ -1644,7 +1706,6 @@ const parseServiceDescription = (el: Element): MpdServiceDescription => ({
 	})),
 });
 
-// ConditionalUintType: a boolean, or an unsigned integer naming the group within which the property holds
 const conditionalUintAttr = (el: Element, name: string): boolean | number | null => {
 	const value = el.getAttribute(name);
 	if (value === 'true') {
@@ -1656,8 +1717,6 @@ const conditionalUintAttr = (el: Element, name: string): boolean | number | null
 	return numericAttr(el, name);
 };
 
-// The schema gives most of these a default, so an absent attribute and an explicit value are not interchangeable:
-// a dropped `bitstreamSwitching="true"` reads back as the default `false`, inverting it.
 const boolAttr = (el: Element, name: string): boolean | null => {
 	const raw = el.getAttribute(name);
 	if (raw === null) {

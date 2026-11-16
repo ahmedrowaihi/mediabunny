@@ -32,6 +32,10 @@ const TAG_INSTANCE_UID = 0x3c0a;
 const TAG_CONTENT_STORAGE = 0x3b03;
 const TAG_PACKAGES = 0x1901;
 const TAG_PACKAGE_UID = 0x4401;
+const TAG_ESSENCE_CONTAINERS = 0x1902;
+const TAG_LINKED_PACKAGE_UID = 0x2701;
+const TAG_INDEX_SID = 0x3f06;
+const TAG_BODY_SID = 0x3f07;
 const TAG_PACKAGE_NAME = 0x4402;
 const TAG_PACKAGE_TRACKS = 0x4403;
 const TAG_DESCRIPTOR = 0x4701;
@@ -70,7 +74,6 @@ const dataDefinitionKind = (ul: Uint8Array | undefined): MxfTrackKind => {
 		return 'unknown';
 	}
 
-	// 06.0e.2b.34.04.01.01.xx.01.03.02.02.yy.zz: yy picks the kind
 	switch (ul[12]) {
 		case 0x01: return 'picture';
 		case 0x02: return 'sound';
@@ -133,6 +136,11 @@ export type MxfHeaderMetadata = {
 	materialPackage: MxfPackage | null;
 	/** What the file holds, by PackageUID. A SourceClip in the material package names one of these. */
 	sourcePackages: Map<string, MxfPackage>;
+	/**
+	 * Which essence container each file package's essence lives in, by PackageUID. An essence element
+	 * key is only unique within a container, so this is what tells two containers' tracks apart.
+	 */
+	essenceContainers: Map<string, { bodySid: number; indexSid: number }>;
 };
 
 /** MXF writes strings as UTF-16BE, with a trailing null that is not part of the text. */
@@ -185,7 +193,6 @@ const asPosition = (bytes: Uint8Array | undefined): number | null => {
 
 	const data = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
 	const value = data.getBigInt64(0);
-	// -1 is MXF's "not known yet", written by anything that could not seek back to fill it in
 	return value < 0n ? null : Number(value);
 };
 
@@ -258,9 +265,6 @@ export const readHeaderMetadata = (
 		track.kind = dataDefinitionKind(sequence.get(TAG_DATA_DEFINITION));
 		track.duration = asPosition(sequence.get(TAG_DURATION));
 
-		// A sequence holds the components in order. Only the first is read: a track built from several
-		// clips is an edit list this demuxer does not present, and reading the first still gives the
-		// package the essence lives in, which is the same for every component of a well-formed file.
 		for (const componentUid of asKeyBatch(sequence.get(TAG_STRUCTURAL_COMPONENTS))) {
 			const component = sets.get(componentUid);
 			if (!component) {
@@ -320,8 +324,6 @@ export const readHeaderMetadata = (
 		};
 	};
 
-	// The Preface names the ContentStorage, which lists the packages. A file whose Preface is missing is
-	// not readable as MXF, but one whose storage merely lists nothing is - it just has no tracks.
 	const preface = bySetType(MxfSetType.Preface)[0];
 	if (!preface) {
 		throw new MalformedInputError('MXF header metadata states no Preface.');
@@ -346,7 +348,21 @@ export const readHeaderMetadata = (
 		}
 	}
 
-	return { sets, materialPackage, sourcePackages };
+	const essenceContainers = new Map<string, { bodySid: number; indexSid: number }>();
+	for (const uid of storage ? asKeyBatch(storage.get(TAG_ESSENCE_CONTAINERS)) : []) {
+		const set = sets.get(uid);
+		const linked = set?.get(TAG_LINKED_PACKAGE_UID);
+		if (!set || !linked) {
+			continue;
+		}
+
+		essenceContainers.set(asKey(linked), {
+			bodySid: asUint(set.get(TAG_BODY_SID) ?? new Uint8Array()),
+			indexSid: asUint(set.get(TAG_INDEX_SID) ?? new Uint8Array()),
+		});
+	}
+
+	return { sets, materialPackage, sourcePackages, essenceContainers };
 };
 
 /**
@@ -363,7 +379,6 @@ export const descriptorForTrack = (pkg: MxfPackage, trackId: number): LocalSet |
 		}
 	}
 
-	// A file with one essence track states its descriptor directly, and may well omit LinkedTrackID
 	if (pkg.subDescriptors.length === 0) {
 		return pkg.descriptor;
 	}

@@ -1,0 +1,198 @@
+name: Build libsrt prebuilds
+
+# libsrt with ENABLE_BONDING, built per platform and shipped inside @mediabunny/server so a host needs
+# nothing installed. Homebrew's libsrt carries no bonding and a distro's may not either, so a system
+# library cannot be relied on for the feature this package exists for.
+#
+# One package holds every platform rather than one optionalDependency each: a build is under a megabyte,
+# so all of them together cost a few MB, where node-av splits because each FFmpeg prebuild is 50-100 MB.
+# That also means no new npm package names, and so no new trusted-publisher configuration.
+#
+# **darwin-x64 is deliberately absent.** `macos-13` is the last Intel image and no runner is ever
+# assigned for it on this account: the job sat `queued` for over eight hours on every run, and because
+# the publish job needs this one to succeed, that held five releases indefinitely. An Intel Mac
+# therefore falls back to a system libsrt, or to `MEDIABUNNY_LIBSRT`, and says so by name when it finds
+# neither. Building it as a universal2 slice from the arm64 runner needs an x86_64 mbedTLS and is the
+# way back to covering it.
+#
+# Callable on its own for iterating on the build, and called by the publish workflow for the real thing.
+
+on:
+  workflow_call:
+    inputs:
+      srt-version:
+        required: false
+        type: string
+        default: v1.5.6
+    outputs:
+      srt-version:
+        # So a caller names the prebuilds release tag from the version actually built rather than from
+        # a second copy of the default that can drift away from this one
+        description: The libsrt version these prebuilds were built from.
+        value: ${{ inputs.srt-version }}
+  workflow_dispatch:
+    inputs:
+      srt-version:
+        required: false
+        type: string
+        default: v1.5.6
+
+permissions:
+  # write, so a built library can be kept on the prebuilds release - see the upload step below
+  contents: write
+
+jobs:
+  build:
+    name: libsrt ${{ matrix.key }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      # One platform failing must not cost the others: a partial set still tells us which build is wrong,
+      # and the publish job checks for the set it needs.
+      fail-fast: false
+      matrix:
+        include:
+          # `macos-latest`, not a pinned image: `macos-14` was cancelled within a second with no runner
+          # ever assigned, which is what a retired label looks like rather than a build failure.
+          #
+          # `glob` is what the build actually leaves behind, which is not the name the package loads.
+          # macOS puts the version *before* the extension (`libsrt.1.5.6.dylib`) and `libsrt.dylib` is a
+          # symlink to it, so a `libsrt.dylib*` pattern with `-type f` matched nothing and the collect
+          # step failed on a build that had succeeded.
+          - key: darwin-arm64
+            runner: macos-latest
+            glob: 'libsrt*.dylib'
+            library: libsrt.dylib
+          - key: linux-x64
+            runner: ubuntu-22.04
+            glob: 'libsrt.so*'
+            library: libsrt.so
+          - key: linux-arm64
+            runner: ubuntu-22.04-arm
+            glob: 'libsrt.so*'
+            library: libsrt.so
+          - key: win32-x64
+            runner: windows-2022
+            glob: 'srt.dll'
+            library: srt.dll
+
+    steps:
+      - name: Cache the built library
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: out
+          key: libsrt-${{ inputs.srt-version }}-${{ matrix.key }}-mbedtls-v1
+
+      - name: Check out libsrt
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: Haivision/srt
+          ref: ${{ inputs.srt-version }}
+          path: srt
+
+      # mbedTLS rather than OpenSSL: SRT supports both, and mbedTLS is small enough to link statically
+      # without the binary growing into the tens of megabytes. Apache-2.0, so redistributing it is clear.
+      - name: Install mbedTLS (macOS)
+        if: steps.cache.outputs.cache-hit != 'true' && runner.os == 'macOS'
+        run: brew install mbedtls@3 cmake
+
+      - name: Install mbedTLS (Linux)
+        if: steps.cache.outputs.cache-hit != 'true' && runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake libmbedtls-dev
+
+      - name: Install mbedTLS (Windows)
+        if: steps.cache.outputs.cache-hit != 'true' && runner.os == 'Windows'
+        run: vcpkg install mbedtls:x64-windows-static
+
+      - name: Configure and build
+        if: steps.cache.outputs.cache-hit != 'true'
+        shell: bash
+        working-directory: srt
+        run: |
+          set -euo pipefail
+          EXTRA=()
+          if [ "${RUNNER_OS}" = "macOS" ]; then
+            PREFIX="$(brew --prefix mbedtls@3)"
+            EXTRA+=("-DCMAKE_PREFIX_PATH=${PREFIX}" "-DCMAKE_OSX_DEPLOYMENT_TARGET=11.0")
+          fi
+          if [ "${RUNNER_OS}" = "Windows" ]; then
+            EXTRA+=("-DCMAKE_TOOLCHAIN_FILE=${VCPKG_INSTALLATION_ROOT}/scripts/buildsystems/vcpkg.cmake")
+            EXTRA+=("-DVCPKG_TARGET_TRIPLET=x64-windows-static")
+          fi
+
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DENABLE_BONDING=ON \
+            -DENABLE_ENCRYPTION=ON \
+            -DUSE_ENCLIB=mbedtls \
+            -DENABLE_SHARED=ON \
+            -DENABLE_STATIC=OFF \
+            -DENABLE_APPS=OFF \
+            -DENABLE_UNITTESTS=OFF \
+            "${EXTRA[@]}"
+          cmake --build build --config Release --parallel
+
+      # The build leaves versioned names and symlinks; the package wants one real file under a fixed name
+      - name: Collect the library
+        if: steps.cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          # Longest name first: the versioned file is the real one, the short name is a symlink to it
+          found="$(find srt/build -name '${{ matrix.glob }}' -type f | awk '{ print length, $0 }' \
+            | sort -rn | cut -d' ' -f2- | head -1)"
+          if [ -z "${found}" ]; then
+            echo "nothing matching ${{ matrix.glob }} produced by the build:" >&2
+            find srt/build -name 'libsrt*' -o -name 'srt*' | head -20 >&2
+            exit 1
+          fi
+          cp "${found}" "out/${{ matrix.library }}"
+
+      - name: State what was built
+        shell: bash
+        run: |
+          set -euo pipefail
+          ls -l out
+          # A build without bonding exports the group API as stubs, so the symbol alone proves nothing on
+          # a platform with nm; this only states what shipped. The runtime probe in libsrt.ts is the test.
+          if command -v nm > /dev/null 2>&1; then
+            nm -g "out/${{ matrix.library }}" 2>/dev/null | grep -c srt_create_group || true
+          fi
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: libsrt-${{ matrix.key }}
+          path: out/${{ matrix.library }}
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Keep a copy on the prebuilds release
+        # So a release stops needing every platform's runner to exist on the day it ships. GitHub
+        # provides macOS runners unreliably - twice on 2026-11-17 the darwin job sat queued from the
+        # start of the run and was cancelled at 15 minutes, which skipped the publish and failed the
+        # release, with the other three platforms built and fine. A publish now falls back to this copy.
+        #
+        # The tag carries the libsrt version, so this can never serve a build of a different one: bump
+        # `srt-version` and the fallback is empty until a runner has actually built it.
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="libsrt-prebuilds-${{ inputs.srt-version }}"
+
+          # Four jobs race to create it; whichever loses finds it already there
+          gh release view "$tag" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1 \
+            || gh release create "$tag" --repo "$GITHUB_REPOSITORY" --prerelease \
+              --title "libsrt prebuilds ${{ inputs.srt-version }}" \
+              --notes "Built by build-libsrt.yml. A publish downloads from here when a platform's runner is unavailable, so the release does not wait on one." \
+            || gh release view "$tag" --repo "$GITHUB_REPOSITORY" > /dev/null
+
+          cp "out/${{ matrix.library }}" "${{ matrix.key }}-${{ matrix.library }}"
+          gh release upload "$tag" "${{ matrix.key }}-${{ matrix.library }}" \
+            --repo "$GITHUB_REPOSITORY" --clobber

@@ -61,10 +61,8 @@ type SeiFraming = {
  */
 export const SEI_FRAMINGS: Record<SeiCodec, SeiFraming> = {
 	avc: {
-		// forbidden_zero_bit = 0, nal_ref_idc = 0 (an SEI is never a reference picture), nal_unit_type = 6.
 		get nalHeader() { return [AvcNalUnitType.SEI]; },
 		isSeiNalUnit: firstByte => extractNalUnitTypeForAvc(firstByte) === AvcNalUnitType.SEI,
-		// AVC VCL NAL unit types are 1..5; the parameter sets, AUD and SEI that may precede them are all above.
 		isVcl: (firstByte) => {
 			const type = extractNalUnitTypeForAvc(firstByte);
 			return type >= AvcNalUnitType.NON_IDR_SLICE && type <= AvcNalUnitType.IDR;
@@ -73,13 +71,11 @@ export const SEI_FRAMINGS: Record<SeiCodec, SeiFraming> = {
 		concatNalUnits: (nalUnits, decoderConfig) => concatAvcNalUnits(nalUnits, decoderConfig),
 	},
 	hevc: {
-		// nuh_layer_id = 0, nuh_temporal_id_plus1 = 1
 		get nalHeader() { return [HevcNalUnitType.PREFIX_SEI_NUT << 1, 1]; },
 		isSeiNalUnit: (firstByte) => {
 			const type = extractNalUnitTypeForHevc(firstByte);
 			return type === HevcNalUnitType.PREFIX_SEI_NUT || type === HevcNalUnitType.SUFFIX_SEI_NUT;
 		},
-		// HEVC VCL NAL unit types are 0..31; everything at or above VPS_NUT precedes them in an access unit.
 		isVcl: firstByte => extractNalUnitTypeForHevc(firstByte) < HevcNalUnitType.VPS_NUT,
 		iterateNalUnits: (packetData, decoderConfig) => iterateHevcNalUnits(packetData, decoderConfig),
 		concatNalUnits: (nalUnits, decoderConfig) => concatHevcNalUnits(nalUnits, decoderConfig),

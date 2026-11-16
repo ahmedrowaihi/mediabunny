@@ -193,7 +193,6 @@ export const locateEditUnit = (
 			streamOffset: entry.streamOffset,
 			isKeyFrame: entry.isKeyFrame,
 			temporalOffset: entry.temporalOffset,
-			// The last entry of a segment states no end, so its size is only known from the essence
 			size: next ? next.streamOffset - entry.streamOffset : null,
 		};
 	}
@@ -211,7 +210,6 @@ export const keyEditUnitBefore = (segments: MxfIndexSegment[], position: number)
 
 	for (const segment of segments) {
 		if (segment.editUnitByteCount > 0) {
-			// Every unit is a key frame, so the answer is the position itself where the segment holds it
 			const offset = position - segment.startPosition;
 			const bounded = segment.duration !== null && segment.duration > 0;
 			if (offset >= 0 && (!bounded || offset < segment.duration!)) {

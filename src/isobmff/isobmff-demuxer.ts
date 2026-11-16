@@ -552,12 +552,8 @@ export class IsobmffDemuxer extends Demuxer {
 						&& this.reader.fileSize !== null
 						&& this.reader.fileSize > startPos + boxInfo.totalSize; // There's more after the moov box
 					foundMovieBoxes = true;
-
-					// No break: a `sidx` after `moov` (on-demand layout) is captured too
 				} else if (boxInfo.name === 'moof') {
 					if (this.movieTimescale !== -1) {
-						// `moov` was already parsed earlier in the same file; the rest is
-						// fragments which are read lazily.
 						break;
 					}
 
@@ -660,8 +656,6 @@ export class IsobmffDemuxer extends Demuxer {
 		for (const sidx of this.sidxBoxes) {
 			const offsets = getSidxSegmentOffsets(sidx);
 
-			// A subsegment boundary is a `moof` boundary, and every track in the fragment shares that
-			// `moof` — so an index naming one track locates the fragments of all of them.
 			for (const track of this.tracks) {
 				if (track.fragmentLookupTable.length > 0) {
 					// A `tfra` already filled this one in; it states each fragment's offset outright rather
@@ -675,7 +669,6 @@ export class IsobmffDemuxer extends Demuxer {
 					entriesByTrack.set(track, entries);
 				}
 
-				// Durations are in the sidx's own timescale; the lookup table is in the track's.
 				const timeRatio = track.timescale / sidx.timescale;
 				let timeInSidxTimescale = sidx.earliestPresentationTime;
 
@@ -689,7 +682,6 @@ export class IsobmffDemuxer extends Demuxer {
 					entries.push({
 						timestamp: Math.round(timeInSidxTimescale * timeRatio),
 						moofOffset: offsets[i]!,
-						// A subsegment boundary is the fragment's first sample.
 						trunNumber: 1,
 						sampleNumber: 1,
 					});
@@ -700,8 +692,6 @@ export class IsobmffDemuxer extends Demuxer {
 		}
 
 		for (const [track, entries] of entriesByTrack) {
-			// Chained sidx boxes need not be ordered by presentation time, and the table is
-			// binary-searched by timestamp.
 			entries.sort((a, b) => a.timestamp - b.timestamp);
 			track.fragmentLookupTable = entries;
 		}
@@ -1123,7 +1113,6 @@ export class IsobmffDemuxer extends Demuxer {
 						// its presentation end: this stands in for `tfdt`, and composition offsets part the two.
 						offsetFragmentTrackDataByTimestamp(trackData, precedingTrackData.endDecodeTimestamp);
 					} else if (cached?.moofOffset === fragment.moofOffset) {
-						// We have read this very fragment before and measured where it begins.
 						offsetFragmentTrackDataByTimestamp(trackData, cached.startTimestamp);
 					} else if (lookupEntryIsValid) {
 						// We ignore traf number here, since we've already matched based on track ID
@@ -1278,8 +1267,6 @@ export class IsobmffDemuxer extends Demuxer {
 		const contentStartPos = slice.filePos;
 		const boxEndPos = startPos + boxInfo.totalSize;
 
-		// Every slice handed to this method spans the box it starts with, so a box reaching past its end
-		// is lying about its size. Stop here rather than slice outside the parent, which reads as a bug.
 		if (boxEndPos > slice.end) {
 			return false;
 		}
@@ -1366,8 +1353,6 @@ export class IsobmffDemuxer extends Demuxer {
 
 				this.readContiguousBoxes(slice.slice(contentStartPos, boxInfo.contentSize));
 
-				// A timecode track is not one a caller sees, so it never joins `tracks`; what it carries is
-				// kept for the video tracks to read a start timecode from.
 				if (track.timecode && track.timecode.timescale > 0) {
 					this.timecodeTracks.push(track.timecode);
 				}
@@ -1570,8 +1555,6 @@ export class IsobmffDemuxer extends Demuxer {
 						pcmSampleSize: null,
 					};
 				} else if (handlerType === 'tmcd') {
-					// QuickTime timecode. `info` stays null, so it is not a track a caller sees; what it
-					// carries is a start timecode for the video it accompanies.
 					track.timecode = {
 						dropFrame: false,
 						timescale: 0,
@@ -1580,8 +1563,6 @@ export class IsobmffDemuxer extends Demuxer {
 						firstSampleOffset: null,
 					};
 				} else if (handlerType === 'subt' || handlerType === 'sbtl' || handlerType === 'text') {
-					// The handler alone doesn't say the track is readable - 'text' also covers QuickTime text
-					// tracks. Only a sample entry we can actually decode fills in the codec below.
 					track.info = {
 						type: 'subtitle',
 						codec: null,
@@ -1608,8 +1589,6 @@ export class IsobmffDemuxer extends Demuxer {
 				}
 
 				if (track.timecode) {
-					// QTFF Timecode Sample Description: reserved(6) + data_reference_index(2), then flags,
-					// timescale, frame duration and the frame count one second rounds to.
 					slice.skip(4); // Version + flags
 					const entries = readU32Be(slice);
 					if (entries > 0 && readBoxHeader(slice)) {
@@ -1651,7 +1630,6 @@ export class IsobmffDemuxer extends Demuxer {
 						track.info.squarePixelWidth = track.info.width;
 						track.info.squarePixelHeight = track.info.height;
 
-						// Horizontal and vertical resolution, reserved, frame count, then the compressor name
 						slice.skip(4 + 4 + 4 + 2 + 32);
 						track.info.sampleEntryDepth = readU16Be(slice);
 						slice.skip(2); // Pre-defined
@@ -1673,17 +1651,12 @@ export class IsobmffDemuxer extends Demuxer {
 							track.info.codec = 'avc';
 							track.info.avcType = codecName === 'avc1' ? 1 : 3;
 						} else if (AVC_INTRA_FOURCCS.has(codecName!)) {
-							// AVC-Intra and XAVC, as cameras and Avid write them. These sample entries carry
-							// no `avcC` at all and their samples are Annex B with the parameter sets in band,
-							// so the type is reported as in-band and the configuration record is read off the
-							// first packet - the path `avc` with no description already takes.
 							track.info.codec = 'avc';
 							track.info.avcType = 3;
 						} else if (codecName === 'hvc1' || codecName === 'hev1') {
 							track.info.codec = 'hevc';
 							track.info.hevcType = codecName;
 						} else if (codecName === 'dvh1' || codecName === 'dvhe') {
-							// A Dolby Vision entry is an HEVC one; the suffix states the same thing hvc1/hev1 does
 							track.info.codec = 'hevc';
 							track.info.hevcType = codecName === 'dvh1' ? 'hvc1' : 'hev1';
 						} else if (codecName === 'dva1' || codecName === 'dvav') {
@@ -1696,13 +1669,10 @@ export class IsobmffDemuxer extends Demuxer {
 						} else if (codecName === 'av01') {
 							track.info.codec = 'av1';
 						} else if (codecName === 'm2v1') {
-							// QuickTime's own MPEG-2 entry, which carries no esds
 							track.info.codec = 'mpeg2';
 						} else if (codecName === 'mp4v') {
-							// The codec is set by the esds box: only its object type tells MPEG-2 video
-							// from MPEG-4 Part 2
+							// Matched so it is not unknown; the codec comes from the esds below
 						} else if (codecName === 'rle ') {
-							// QuickTime Animation. Its depth field is the whole configuration: 32 is ARGB
 							track.info.codec = 'qtrle';
 						} else if (codecName === 'png ') {
 							track.info.codec = 'png';
@@ -2293,7 +2263,6 @@ export class IsobmffDemuxer extends Demuxer {
 						);
 					}
 
-					// No video object type here carries a DecoderSpecificInfo
 					break;
 				}
 
@@ -2318,8 +2287,6 @@ export class IsobmffDemuxer extends Demuxer {
 				slice.skip(1 + 3 + 4 + 4);
 
 				if (decoderConfigDescriptorLength > slice.filePos - payloadStart) {
-					// There's a DecoderSpecificInfo at the end, let's read it
-
 					const decoderSpecificInfoTag = readU8(slice);
 					assert(decoderSpecificInfoTag === 0x05); // DecoderSpecificInfo
 
@@ -2790,7 +2757,6 @@ export class IsobmffDemuxer extends Demuxer {
 				}
 
 				if (track.timecode) {
-					// A timecode track has one sample, the start timecode, so its first chunk is where it is
 					slice.skip(4); // Version + flags
 					if (readU32Be(slice) > 0) {
 						track.timecode.firstSampleOffset = readU32Be(slice);
@@ -2820,7 +2786,6 @@ export class IsobmffDemuxer extends Demuxer {
 				}
 
 				if (track.timecode) {
-					// A timecode track has one sample, the start timecode, so its first chunk is where it is
 					slice.skip(4); // Version + flags
 					if (readU32Be(slice) > 0) {
 						track.timecode.firstSampleOffset = readU64Be(slice);
@@ -2938,7 +2903,6 @@ export class IsobmffDemuxer extends Demuxer {
 
 				try {
 					this.readContiguousBoxes(slice.slice(contentStartPos, boxInfo.contentSize));
-					// Settled here so the hot path that returns a cached fragment stays a boolean check
 					this.currentFragment.basesRealigned = ![...this.currentFragment.trackData.values()]
 						.some(trackData => trackData.implicitBaseShift !== null && trackData.samples.length > 0);
 				} catch (error) {
@@ -2965,16 +2929,12 @@ export class IsobmffDemuxer extends Demuxer {
 
 				const fragmentTrackState = this.currentFragmentTrackState;
 				this.currentFragmentTrackState = null;
-				// Applied here rather than in the `sbgp` case: a `trun` may follow the group boxes, so the
-				// samples they describe need not exist yet while they are being read
 				const seig = this.takeTrafSeig();
 				if (seig.runs && this.currentTrack) {
 					const trackData = this.currentFragment.trackData.get(this.currentTrack.id);
 					const entries = seig.entries;
 					let sampleIndex = 0;
 					for (const run of seig.runs) {
-						// Index 0 means the sample belongs to no group, and a movie-level one names an `sgpd`
-						// of the sample table rather than of this fragment; both leave the `tenc` default
 						const local = run.descriptionIndex - TRACK_FRAGMENT_DESCRIPTION_INDEX_BASE - 1;
 						const unprotected = entries !== null && local >= 0 && entries[local] === false;
 						for (let i = 0; i < run.sampleCount; i++, sampleIndex++) {
@@ -3126,8 +3086,6 @@ export class IsobmffDemuxer extends Demuxer {
 					break;
 				}
 
-				// Below the lookup, because the tfhd defaults are read before the track is resolved: the first
-				// default a track states is what a decode-time shift is measured in
 				if (fragmentTrackState.defaultSampleDuration !== null) {
 					track.sampleDurationForShift ??= fragmentTrackState.defaultSampleDuration;
 				}
@@ -3381,7 +3339,6 @@ export class IsobmffDemuxer extends Demuxer {
 				const entryCount = readU32Be(slice);
 				const entries: boolean[] = [];
 				for (let i = 0; i < entryCount; i++) {
-					// A version 1 box may state each entry's length instead of one for all of them
 					const length = version === 1 && defaultLength === 0 ? readU32Be(slice) : defaultLength;
 					if (length < SEIG_ENTRY_MIN_SIZE || length > slice.remainingLength) {
 						throw new Error(
@@ -3885,7 +3842,6 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 			}
 		}
 
-		// No timecode track, so fall back to the bitstream's own
 		const info = this.internalTrack.info;
 		if (info === null || info.type !== 'video' || (info.codec !== 'hevc' && info.codec !== 'avc')) {
 			return null;
@@ -3902,7 +3858,6 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 			return null;
 		}
 
-		// The SEI states no rate of its own, and the timecode counts at the nominal one
 		const frameRate = Math.round(1 / firstPacket.duration);
 
 		if (info.codec === 'hevc') {
@@ -4423,9 +4378,7 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 
 			let currentPos: number;
 			let currentFragment: Fragment | null = null;
-			// A fragment stating no decode time of its own is placed from its predecessor in the scan
 			let precedingFragment: Fragment | null = null;
-			// A lookup entry can point into an `mdat`, and such a scan reads no `moof` and proves nothing
 			let scanReachedFragment = false;
 
 			if (!startFragment) {
@@ -4502,9 +4455,6 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 			if (scanReachedFragment) {
 				stopPos = scanStartPos; // So we don't read the same fragments again
 			} else {
-				// The scan read no `moof`, so it says nothing about what lies after it and capping there would
-				// hide the rest of the file. Drop just the entry that sent us there, which is what advances the
-				// loop in place of the bound.
 				if (fragmentLookupTable[lookupEntryIndex]?.moofOffset === lookupEntryPosition) {
 					lookupEntryIndex--;
 				}
@@ -4593,8 +4543,6 @@ class IsobmffVideoTrackBacking extends IsobmffTrackBacking implements InputVideo
 	}
 
 	getMetadataCodecParameterString(): string | null {
-		// A non-cross-compatible base layer is not decodable as plain HEVC or AVC, so a manifest must not
-		// state the sample entry's codec for it
 		const dovi = this.internalTrack.info.doviConfig;
 		const codec = this.internalTrack.info.codec;
 		if (!dovi || dovi.blSignalCompatibilityId !== 0 || (codec !== 'hevc' && codec !== 'avc')) {
@@ -4712,8 +4660,6 @@ class IsobmffVideoTrackBacking extends IsobmffTrackBacking implements InputVideo
 				this.internalTrack.info.proresCodecInfo
 					= firstPacket && extractProresCodecInfoFromPacket(firstPacket.data);
 			} else if (this.internalTrack.info.codec === 'mpeg2' && !this.internalTrack.info.mpeg2CodecInfo) {
-				// The profile is in the sequence extension and nowhere else: `m2v1` carries no box for it, and
-				// the object type an `esds` states is only what a writer claimed
 				const firstPacket = await this.getFirstPacket({});
 				this.internalTrack.info.mpeg2CodecInfo
 					= firstPacket && extractMpeg2CodecInfoFromPacket(firstPacket.data);
@@ -4749,8 +4695,6 @@ class IsobmffVideoTrackBacking extends IsobmffTrackBacking implements InputVideo
 				config.bitsPerCodedSample = this.internalTrack.info.sampleEntryDepth;
 			}
 
-			// An x265 HDR10 master written by ffmpeg states its metadata only in the first access unit, so the SEI
-			// fills what no box did. Gated on an HDR transfer, since the probe costs a packet fetch.
 			const codec = this.internalTrack.info.codec;
 			if (
 				(codec === 'hevc' || codec === 'avc')
@@ -4874,7 +4818,6 @@ const parseWvttSample = (data: Uint8Array, timestamp: number, duration: number):
 			return;
 		}
 
-		// A vtte box is an explicitly empty cue, and anything else is not a cue at all.
 		if (name !== 'vttc') {
 			return;
 		}
@@ -4939,7 +4882,6 @@ class IsobmffSubtitleTrackBacking extends IsobmffTrackBacking implements InputSu
 			return parseWvttSample(packet.data, packet.timestamp, packet.duration);
 		}
 
-		// A TTML document states its own cue timings, so the sample's timing is not used.
 		return parseTtmlDocument(textDecoder.decode(packet.data))
 			.map(cue => ({ cue, continuationId: null }));
 	}
@@ -5009,7 +4951,6 @@ const deriveDecodeTimestampShift = (track: InternalTrack): number => {
 
 	let reorderDepth = 0;
 	if (track.info?.type === 'video' && track.info.codec === 'avc') {
-		// avcCodecInfo is only filled in on the encode side; the init's own avcC is what a reader has
 		const record = track.info.avcCodecInfo
 			?? (track.info.codecDescription && deserializeAvcDecoderConfigurationRecord(track.info.codecDescription));
 		const avcSps = record ? record.sequenceParameterSets[0] : undefined;
@@ -5217,8 +5158,6 @@ const offsetFragmentTrackDataByTimestamp = (trackData: FragmentTrackData, timest
 
 	for (const sample of trackData.samples) {
 		sample.presentationTimestamp += timestamp;
-		// The decode timestamp sits on the same timeline and shifts with it; leaving it behind made
-		// every fragment after the first restart its decode time at zero.
 		sample.decodeTimestamp += timestamp;
 	}
 	for (const entry of trackData.presentationTimestamps) {

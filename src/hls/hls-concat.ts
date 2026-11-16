@@ -127,8 +127,6 @@ type SplitResult = {
 	targetDuration: number | null;
 };
 
-// The header ends at the first segment-bearing line; MEDIA-SEQUENCE resets to 0 for a stitched VOD
-// output, so it carries no per-input meaning and stays
 const BODY_STARTERS: readonly string[] = [
 	TAG_EXTINF,
 	TAG_MAP,
@@ -209,7 +207,6 @@ const setOrInsertTargetDuration = (header: string, targetDuration: number, hadAn
 			return lines.join('\n');
 		}
 	}
-	// Insert after #EXTM3U (or as the first line if absent).
 	const insertAt = lines.findIndex(l => l.startsWith('#EXTM3U'));
 	if (insertAt === -1) {
 		return [`${TAG_TARGETDURATION}${value}`, ...lines].join('\n');

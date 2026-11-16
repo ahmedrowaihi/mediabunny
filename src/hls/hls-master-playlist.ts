@@ -56,12 +56,10 @@ const groupCodecs = (group: MediaPlaylist[]): string[] => {
 	for (const p of group) {
 		codecs.add(p.getCodec());
 	}
-	// Apple compatibility: drop `wvtt`; map `ttml` → `stpp.ttml.im1t`.
 	codecs.delete('wvtt');
 	if (codecs.delete('ttml')) {
 		codecs.add('stpp.ttml.im1t');
 	}
-	// shaka's GetGroupCodecString returns a std::set — alphabetically sorted.
 	return [...codecs].sort();
 };
 
@@ -120,8 +118,6 @@ const buildMediaTag = (
 	}
 
 	if (p.getStreamType() === 'audio') {
-		// Spec: an ordered, slash-separated list of params. First is channel count.
-		// Dolby EC3-JOC and AC4-IMSA/CBI use "n/JOC" or "n/IMSA" forms.
 		if (p.getEC3JocComplexity() !== 0) {
 			tag.addQuotedString('CHANNELS', `${p.getEC3JocComplexity()}/JOC`);
 		} else if (p.getAC4ImsFlag() || p.getAC4CbiFlag()) {
@@ -335,8 +331,6 @@ export class MasterPlaylist {
 		}
 
 		if (this.options.createSessionKeys) {
-			// Mirror shaka: collect every EXT-X-KEY across registered playlists,
-			// deduplicate by rendered tag, and emit each as #EXT-X-SESSION-KEY.
 			const sessionKeys = new Set<string>();
 			for (const p of this.playlists) {
 				for (const entry of p.getEntries()) {
@@ -350,8 +344,6 @@ export class MasterPlaylist {
 			}
 		}
 
-		// Emit #EXT-X-MEDIA in input order (shaka b1580dd); rebuild group map
-		// after for buildVariants.
 		type MediaTagInfo = {
 			playlist: MediaPlaylist;
 			groupId: string;
@@ -363,8 +355,6 @@ export class MasterPlaylist {
 		const videoPlaylists: MediaPlaylist[] = [];
 		const iframePlaylists: MediaPlaylist[] = [];
 
-		// First pass: classify and capture group ids; the flags are assigned after sorting, so "first
-		// rendition per (group, language)" means first in output order
 		let hasIndex = true;
 		for (const p of this.playlists) {
 			hasIndex = hasIndex && p.hasIndex();
@@ -384,8 +374,6 @@ export class MasterPlaylist {
 			}
 		}
 
-		// Sorted before the flags are assigned: by index where every playlist carries one, else audio and
-		// subtitle by group id to match shaka's std::map order, leaving video and I-frame as given
 		const byPlaylistIndex = (a: MediaPlaylist, b: MediaPlaylist): number =>
 			a.getIndex() - b.getIndex();
 		const byTagIndex = (a: MediaTagInfo, b: MediaTagInfo): number =>
@@ -409,8 +397,6 @@ export class MasterPlaylist {
 			subtitleTags.sort(byTagGroupId);
 		}
 
-		// Second pass, in emission order: HLS 4.3.4.1.1 allows one DEFAULT=YES per group, so the first
-		// rendition of a (group, language) is AUTOSELECT, and DEFAULT too when the language is the default one
 		const audioGroupLanguages = new Map<string, Set<string>>();
 		for (const t of audioTags) {
 			// Apple HLS authoring §2.13: a DVS rendition is always AUTOSELECT and never the per-language default
@@ -484,7 +470,6 @@ export class MasterPlaylist {
 			}
 		}
 
-		// Variant streams
 		const variants = buildVariants(audioGroups, subtitleGroups, closedCaptions.length > 0);
 		for (const variant of variants) {
 			if (videoPlaylists.length === 0) {
@@ -496,7 +481,6 @@ export class MasterPlaylist {
 			}
 		}
 
-		// I-frame streams
 		if (iframePlaylists.length > 0) {
 			lines.push('');
 			const empty: Variant = {
@@ -511,7 +495,6 @@ export class MasterPlaylist {
 			}
 		}
 
-		// Audio-only master (no video, no subtitle).
 		if (audioGroups.size > 0 && videoPlaylists.length === 0 && subtitleGroups.size === 0) {
 			lines.push('');
 			for (const [id, group] of audioGroups) {

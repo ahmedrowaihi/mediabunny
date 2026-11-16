@@ -65,7 +65,6 @@ const buildPlaylistHeader = (
 ): string[] => {
 	const lines: string[] = ['#EXTM3U', '#EXT-X-VERSION:6'];
 	if (generatorBanner) {
-		// Shaka places the generator banner between EXT-X-VERSION and EXT-X-TARGETDURATION.
 		lines.push(generatorBanner);
 	}
 	lines.push(`#EXT-X-TARGETDURATION:${targetDuration}`);
@@ -92,11 +91,9 @@ const buildPlaylistHeader = (
 	}
 
 	if (startTimeOffset !== undefined) {
-		// Mirror shaka's `absl::StrFormat("...=%f...")`: printf %f is fixed 6 decimals.
 		lines.push(`#EXT-X-START:TIME-OFFSET=${startTimeOffset.toFixed(6)}`);
 	}
 
-	// EXT-X-MAP comes last in the header — segments and key info follow.
 	appendExtXMap(info, lines);
 
 	return lines;
@@ -175,8 +172,6 @@ export class MediaPlaylist {
 		this.mediaSequenceNumber = hlsParams.mediaSequenceNumber ?? 0;
 		this.discontinuitySequenceNumber = hlsParams.discontinuitySequenceNumber ?? 0;
 
-		// Mirror shaka: when a forced media sequence number is set, the playlist
-		// starts with a discontinuity tag.
 		if (this.mediaSequenceNumber > 0) {
 			this.entries.push(new DiscontinuityEntry());
 		}
@@ -262,8 +257,6 @@ export class MediaPlaylist {
 		startByteOffset: number,
 		size: number,
 	): void {
-		// The window slides before this segment's duration is added, so the oldest stays reachable for the
-		// whole depth. Mirrors shaka's AddSegmentInfoEntry.
 		this.slideWindow();
 
 		const durationSeconds = this.timeScale > 0 ? duration / this.timeScale : 0;
@@ -274,8 +267,6 @@ export class MediaPlaylist {
 		this.bandwidthEstimator.addBlock(size, durationSeconds);
 		this.currentBufferDepth += durationSeconds;
 
-		// Out-of-order detection (matches shaka): if the most recent EXTINF has a
-		// later start_time than this segment, insert an EXT-X-DISCONTINUITY.
 		const last = this.entries[this.entries.length - 1];
 		if (last instanceof SegmentInfoEntry && last.getStartTime() > startTime) {
 			this.entries.push(new DiscontinuityEntry());
@@ -306,7 +297,6 @@ export class MediaPlaylist {
 			return;
 		}
 
-		// Holds the keys preceding a removed EXTINF so they survive it; `prevEntryType` tracks the key run
 		let extXKeys: HlsEntry[] = [];
 		let prevEntryType: HlsEntryType = 'extInf';
 
@@ -323,8 +313,6 @@ export class MediaPlaylist {
 				this.discontinuitySequenceNumber++;
 			} else if (entryType === 'extInf') {
 				const segmentInfo = entry as SegmentInfoEntry;
-				// Remove the current segment only if it falls completely out of the
-				// time shift buffer range.
 				const segmentWithinTimeShiftBuffer
 					= this.currentBufferDepth - segmentInfo.getDurationSeconds() < timeShiftBufferDepth;
 				if (segmentWithinTimeShiftBuffer) {
@@ -337,7 +325,6 @@ export class MediaPlaylist {
 			prevEntryType = entryType;
 		}
 		this.entries.splice(0, last);
-		// Add key entries back at the front.
 		this.entries.unshift(...extXKeys);
 	}
 
@@ -357,8 +344,6 @@ export class MediaPlaylist {
 			this.mediaSequenceNumber + 1,
 			this.mediaInfo?.bandwidth ?? 0,
 		));
-		// Shaka retries deletion on failure; without filesystem access we drop the
-		// front name once the preserved count is exceeded.
 		while (this.segmentsToBeRemoved.length > preserved) {
 			this.segmentsToBeRemoved.shift();
 		}
@@ -382,8 +367,6 @@ export class MediaPlaylist {
 	addKeyFrame(timestamp: number, startByteOffset: number, size: number): void {
 		if (this.streamType !== 'videoIFramesOnly') {
 			if (this.streamType !== 'video') {
-				// I-frames-only applies to video renditions only — silently drop
-				// to mirror shaka's "warn and skip" behavior.
 				return;
 			}
 			this.streamType = 'videoIFramesOnly';
@@ -436,8 +419,6 @@ export class MediaPlaylist {
 			return;
 		}
 
-		// PDT goes before the first segment AND after every discontinuity.
-		// shaka detects discontinuity by checking last entry, OR last-key-after-discontinuity.
 		let isFirstSegment = true;
 		let isDiscontinuity = false;
 		if (this.entries.length > 0) {
@@ -635,13 +616,10 @@ export class MediaPlaylist {
 	 * shaka. See https://tools.ietf.org/html/draft-pantos-hls-rfc8216bis-02#section-4.4.4.2
 	 */
 	getVideoRange(): string {
-		// Dolby Vision (dvh1/dvhe) is always HDR/PQ.
 		if (this.codec.startsWith('dvh')) {
 			return 'PQ';
 		}
 		const tc = this.mediaInfo?.videoInfo?.transferCharacteristics;
-		// Dolby Vision profile 8.4 may report 14, with the actual value in the SEI's
-		// preferred_transfer_characteristic. shaka uses the compatible brand `db4g` as a workaround.
 		if (tc === 14 && this.supplementalCodec && this.compatibleBrand === 'db4g') {
 			return 'HLG';
 		}

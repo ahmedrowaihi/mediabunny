@@ -61,7 +61,6 @@ const ceilLog2 = (n: number): number => Math.ceil(Math.log2(n));
  */
 const skipScalingListData = (bs: Bitstream): void => {
 	for (let sizeId = 0; sizeId < 4; sizeId++) {
-		// 32x32 states only the two luma matrices, so it steps over the chroma ones
 		for (let matrixId = 0; matrixId < 6; matrixId += sizeId === 3 ? 3 : 1) {
 			if (bs.readBits(1) === 0) { // scaling_list_pred_mode_flag
 				readExpGolomb(bs); // scaling_list_pred_matrix_id_delta, i.e. predict from an earlier list
@@ -300,7 +299,6 @@ export class H265VideoSliceHeaderParser implements VideoSliceHeaderParser {
 			}
 			const log2MinLumaCbSizeMinus3 = readExpGolomb(bs);
 			const log2DiffMaxMinLumaCbSize = readExpGolomb(bs);
-			// CtbSizeY = 1 << (MinCbLog2SizeY + log2_diff...); PicSizeInCtbsY sizes slice_segment_address.
 			const ctbSizeY = 1 << (log2MinLumaCbSizeMinus3 + 3 + log2DiffMaxMinLumaCbSize);
 			const picSizeInCtbsY = Math.ceil(picWidthInLumaSamples / ctbSizeY)
 				* Math.ceil(picHeightInLumaSamples / ctbSizeY);
@@ -340,7 +338,6 @@ export class H265VideoSliceHeaderParser implements VideoSliceHeaderParser {
 				}
 			}
 			const temporalMvpEnabledFlag = bs.readBits(1) === 1;
-			// Remaining SPS fields are irrelevant to slice-header parsing.
 
 			this.spsMap.set(spsId, {
 				separateColourPlaneFlag,
@@ -459,7 +456,6 @@ export class H265VideoSliceHeaderParser implements VideoSliceHeaderParser {
 			throw new MalformedInputError('Unknown SPS');
 		}
 
-		// A dependent slice segment inherits the rest of the header, so it ends right after the address
 		let dependentSliceSegment = false;
 		if (!firstSliceSegmentInPic) {
 			if (pps.dependentSliceSegmentsEnabledFlag) {

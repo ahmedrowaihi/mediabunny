@@ -45,9 +45,6 @@ export type MxfWrapping = 'frame' | 'clip';
  * unit, clip wrapping writes one element for the whole track.
  */
 export const wrappingOf = (elementCount: number, editUnitCount: number | null): MxfWrapping => {
-	// A single element covering a track that runs for more than one edit unit can only be clip wrapped.
-	// A track that is one edit unit long is both at once, and frame is the answer that then reads it
-	// correctly either way.
 	if (elementCount === 1 && editUnitCount !== null && editUnitCount > 1) {
 		return 'clip';
 	}
@@ -75,7 +72,6 @@ export const walkEssenceElements = (
 
 		const trackNumber = essenceTrackNumber(header.key);
 		if (trackNumber === null) {
-			// Fill, an index segment, metadata repeated in a body partition - anything but essence
 			slice.skip(header.length);
 			continue;
 		}

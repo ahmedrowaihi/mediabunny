@@ -69,7 +69,6 @@ export const buildAudioSetupDescriptor = (audioType: string, setupData: Uint8Arr
 	descriptor[1] = descriptor.length - 2;
 	descriptor.set(fourCc('apad'), 2);
 	descriptor.set(fourCc(audioType), 6);
-	// priming: Apple's encoder supplies it; 0 is the documented fallback
 	descriptor[10] = 0x00;
 	descriptor[11] = 0x00;
 	descriptor[12] = 0x01; // version

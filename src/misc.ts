@@ -415,6 +415,9 @@ export const COLOR_PRIMARIES_MAP = {
 	bt470bg: 5, // ITU-R BT.470BG
 	smpte170m: 6, // ITU-R BT.601 525 - SMPTE 170M
 	bt2020: 9, // ITU-R BT.202
+	// Neither of the next two is in WebCodecs' own enums, so a caller states them as a string the type
+	// widens to; everything downstream reads these maps rather than the enum
+	smpte431: 11, // SMPTE RP 431-2 — DCI-P3, which is what MediaConvert's FORCE_P3DCI asks for
 	smpte432: 12, // SMPTE EG 432-1
 };
 export const COLOR_PRIMARIES_MAP_INVERSE = /* #__PURE__ */ invertObject(COLOR_PRIMARIES_MAP);
@@ -425,6 +428,7 @@ export const TRANSFER_CHARACTERISTICS_MAP = {
 	'linear': 8, // Linear transfer characteristics
 	'iec61966-2-1': 13, // IEC 61966-2-1
 	'pq': 16, // Rec. ITU-R BT.2100-2 perceptual quantization (PQ) system
+	'smpte428': 17, // SMPTE ST 428-1 — digital cinema's 2.6 gamma over X'Y'Z'
 	'hlg': 18, // Rec. ITU-R BT.2100-2 hybrid loggamma (HLG) system
 };
 // CICP transfer characteristics (ISO/IEC 23091-2) that a player treats as HDR. Anything else the
@@ -457,6 +461,40 @@ export const MATRIX_COEFFICIENTS_MAP = {
 };
 export const MATRIX_COEFFICIENTS_MAP_INVERSE = /* #__PURE__ */ invertObject(MATRIX_COEFFICIENTS_MAP);
 
+/**
+ * A color space in the terms this library can state, which is a superset of WebCodecs'
+ * `VideoColorSpaceInit`: that enum names neither DCI-P3 primaries nor digital cinema's 2.6 gamma, and
+ * both are ordinary requests for a mastering or cinema deliverable.
+ *
+ * The CICP maps above stay the runtime source of truth — `validateVideoColorSpaceInit` checks against
+ * them — so a value added to one of them belongs in this union too, and a drift is rejected at
+ * validation rather than silently accepted. Only the paths that take a color space *from a caller* use
+ * this; everything that hands one to WebCodecs keeps
+ * `VideoColorSpaceInit`, because a `VideoDecoder` or `VideoFrame` rejects a value it does not know.
+ *
+ * Every field spells out `| undefined` even though it is already optional. Under
+ * `exactOptionalPropertyTypes` the two are not the same thing: `?: T | null` accepts an absent property
+ * but refuses one explicitly set to `undefined`, so a caller compiling with that flag cannot pass the
+ * `VideoColorSpaceInit` an input track hands back - `colorSpace: await track.getColorSpace()` fails on
+ * every field. Without the flag the `| undefined` changes nothing.
+ *
+ * @group Miscellaneous
+ * @public
+ */
+export type WideVideoColorSpaceInit = {
+	/** The color primaries standard. `smpte431` is DCI-P3, which WebCodecs cannot name. */
+	primaries?: 'bt709' | 'bt470bg' | 'smpte170m' | 'bt2020' | 'smpte431' | 'smpte432' | null | undefined;
+	/** The transfer characteristics. `smpte428` is digital cinema's 2.6 gamma. */
+	transfer?:
+		| 'bt709' | 'smpte170m' | 'linear' | 'iec61966-2-1' | 'pq' | 'smpte428' | 'hlg'
+		| null
+		| undefined;
+	/** The color matrix coefficients. */
+	matrix?: 'rgb' | 'bt709' | 'bt470bg' | 'smpte170m' | 'bt2020-ncl' | null | undefined;
+	/** Whether the color values use the full range rather than the limited range. */
+	fullRange?: boolean | null | undefined;
+};
+
 export type RequiredNonNull<T> = {
 	[K in keyof T]-?: NonNullable<T[K]>;
 };
@@ -473,7 +511,7 @@ export const colorSpaceIsComplete = (
 	);
 };
 
-export const colorSpaceIsEmpty = (colorSpace: VideoColorSpaceInit | undefined) => {
+export const colorSpaceIsEmpty = (colorSpace: WideVideoColorSpaceInit | undefined) => {
 	return (
 		!colorSpace
 		|| (
@@ -934,8 +972,6 @@ export const retriedFetch = async (
 
 			attempts++;
 
-			// Checked before the delay as well as after it, so an unreachable host rejects on the budget
-			// rather than on the budget plus one backoff
 			if (Date.now() >= giveUpAt) {
 				throw new RetryTimeoutError(
 					// eslint-disable-next-line @typescript-eslint/no-base-to-string
@@ -1025,7 +1061,6 @@ export class CallSerializer {
 	call(fn: () => Promise<void> | void) {
 		const result = this.currentPromise.then(fn);
 
-		// Caught, or one failed call would reject every later one without ever running it
 		this.currentPromise = result.catch(() => {});
 
 		return result;
@@ -1982,7 +2017,6 @@ export const languageToShortestForm = (language: string): string => {
 		}
 	}
 
-	// No 2-letter code exists — pass through the (presumably 3-letter) input.
 	return mainLanguage + subtag;
 };
 

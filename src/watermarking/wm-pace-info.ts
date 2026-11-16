@@ -120,7 +120,6 @@ export const readWmPaceInfo = (segment: Uint8Array): WmPaceInfo | null => {
 		if (topLevel.type !== 'wmpi' || topLevel.data === undefined) {
 			continue;
 		}
-		// A zero-padded box is one an origin has already neutered, not a malformed one.
 		if (topLevel.data.every(byte => byte === 0)) {
 			return null;
 		}

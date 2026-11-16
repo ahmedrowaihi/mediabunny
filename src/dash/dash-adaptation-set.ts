@@ -173,8 +173,6 @@ const addPictureAspectRatio = (videoInfo: VideoInfo, pictureAspectRatio: Set<str
 	const pixelWidth = videoInfo.pixelWidth ?? 0;
 	const pixelHeight = videoInfo.pixelHeight ?? 0;
 	if (width === 0 || height === 0 || pixelWidth === 0 || pixelHeight === 0) {
-		// Without SAR on every Representation we cannot calculate @par. Two
-		// bogus entries ensure further calls bail early.
 		pictureAspectRatio.add('bogus');
 		pictureAspectRatio.add('entries');
 		return;
@@ -458,8 +456,6 @@ export class AdaptationSet {
 			node.setStringAttribute('lang', this.languageValue);
 		}
 
-		// std::set is ordered ascending; mirror with sorted arrays so we pick
-		// the same min/max as shaka.
 		const widths = [...this.videoWidths].sort((a, b) => a - b);
 		const heights = [...this.videoHeights].sort((a, b) => a - b);
 
@@ -483,7 +479,6 @@ export class AdaptationSet {
 			node.setIntegerAttribute('startWithSAP', this.startWithSAP);
 		}
 
-		// std::map<double, ...> is ordered by key. We replicate by sorting.
 		const frameRateKeys = [...this.videoFrameRates.keys()].sort((a, b) => a - b);
 		if (frameRateKeys.length === 1) {
 			suppressRepresentationFrameRate = true;
@@ -514,8 +509,6 @@ export class AdaptationSet {
 			);
 		}
 
-		// Note: must be checked before checking segments_aligned_ (below). So
-		// that segments_aligned_ is set before checking below.
 		if (this.mpdOptions.mpdType === 'static') {
 			this.checkStaticSegmentAlignment();
 		}
@@ -565,8 +558,6 @@ export class AdaptationSet {
 			node.addAccessibilityElement(accessibility.scheme, accessibility.value);
 		}
 
-		// std::set<Role> is ordered by enum integer value; mirror by iterating
-		// in the original enum-declaration order.
 		const orderedRoles: AdaptationSetRole[] = [
 			'unknown', 'caption', 'subtitle', 'main', 'alternate', 'supplementary',
 			'commentary', 'dub', 'description', 'sign', 'metadata',
@@ -583,7 +574,6 @@ export class AdaptationSet {
 			node.addLabelElement(this.label);
 		}
 
-		// std::map iterates by key (the Representation id). Mirror.
 		const sortedRepIds = [...this.representationMap.keys()].sort((a, b) => a - b);
 		for (const repId of sortedRepIds) {
 			const representation = this.representationMap.get(repId)!;
@@ -934,8 +924,6 @@ export class AdaptationSet {
 		}
 
 		// TODO upstream (rkuroiwa): also check durations to disambiguate
-		// e.g. (a) 3 4 5 vs (b) 3 4 5 6 — same prefix but third segment
-		// duration may differ.
 		if (!allSegmentTimelinesSameLength) {
 			this.segmentsAligned = 'unknown';
 			return;

@@ -34,7 +34,6 @@ const avcSliceType = (nalUnit: Uint8Array): VideoSliceType | null => {
 
 	readExpGolomb(bitstream); // first_mb_in_slice
 
-	// 5..9 state that every slice in the picture has that type, so they fold onto 0..4
 	switch (readExpGolomb(bitstream) % 5) {
 		case 0: return 'p';
 		case 1: return 'b';
@@ -52,7 +51,6 @@ const hevcSliceType = (nalUnit: Uint8Array): VideoSliceType | null => {
 		bitstream.skipBits(1); // no_output_of_prior_pics_flag
 	}
 
-	// A dependent slice segment states no slice_type of its own, but the first segment of a picture never is one
 	readExpGolomb(bitstream); // slice_pic_parameter_set_id
 
 	switch (readExpGolomb(bitstream)) {
@@ -150,7 +148,6 @@ export const createAv1FilmGrainStateReader = (
 	const reader = createAv1FrameInfoReader();
 
 	if (description) {
-		// The av1C box's fixed header precedes the configOBUs that carry the sequence header
 		reader.read(toUint8Array(description).subarray(AV1C_HEADER_SIZE));
 	}
 
@@ -230,7 +227,6 @@ const createH26xQuantizerReader = (
 	const headerSize = NAL_HEADER_SIZE[codec];
 
 	if (decoderConfig.description) {
-		// Parameter sets from the config; a stream that also sends them in band updates the parser as it goes
 		parser.initialize(toUint8Array(decoderConfig.description));
 	}
 
@@ -255,7 +251,6 @@ const createH26xQuantizerReader = (
 				};
 
 				if (!isVcl) {
-					// Carries the parameter sets a slice header's QP is stated relative to
 					parser.processNalu(nalu);
 					continue;
 				}
@@ -327,8 +322,6 @@ export const createVideoQuantizerReader = (
 				return null;
 			}
 
-			// A superframe holds a hidden frame alongside the shown one, each with a quantizer of its own; a
-			// `show_existing_frame` carries no coded data and states none
 			const stated = frames.map(frame => frame.baseQIdx).filter(value => value !== null);
 			return stated.length === 0 ? null : { scale: 'qindex', value: mean(stated), values: stated };
 		},

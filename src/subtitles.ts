@@ -48,8 +48,6 @@ export type SubtitleMetadata = {
 	config?: SubtitleConfig;
 };
 
-// A cue spanning a segment boundary belongs to every segment it overlaps; a player joining
-// mid-stream only parses the segments it fetched.
 /** @internal */
 export const cueOverlapsSegment = (cue: SubtitleCue, start: number, end: number) =>
 	cue.timestamp < end && (cue.timestamp + cue.duration > start || cue.timestamp >= start);
@@ -170,6 +168,20 @@ export const formatSubtitleTimestamp = (timeInSeconds: number) => {
 
 /** @internal */
 export const TTML_NAMESPACE = 'http://www.w3.org/ns/ttml';
+/** EBU-TT Styling, Tech 3380 §2.6. @internal */
+export const EBUTTS_NAMESPACE = 'urn:ebu:tt:style';
+/** EBU-TT Metadata, Tech 3380 §2.6. @internal */
+export const EBUTTM_NAMESPACE = 'urn:ebu:tt:metadata';
+/** The value Tech 3380 §2.9 requires when signalling conformance to EBU-TT-D. @internal */
+export const EBU_TT_D_CONFORMS_TO = 'urn:ebu:tt:distribution:2018-04';
+
+/**
+ * Which TTML profile a document is written to.
+ *
+ * @group Media sources
+ * @public
+ */
+export type TtmlProfile = 'imsc1' | 'ebu-tt-d';
 
 /**
  * Serializes cues into one IMSC1 text-profile document, timed on the media timeline (`ttp:timeBase="media"`),
@@ -180,7 +192,11 @@ export const TTML_NAMESPACE = 'http://www.w3.org/ns/ttml';
 export const buildTtmlDocument = (options: {
 	cues: SubtitleCue[];
 	language: string;
+	profile?: TtmlProfile;
 }) => {
+	// No tts:extent on tt:tt: Tech 3380's Annex B does not list it, and tts: being a TT namespace puts it
+	// outside the "any attribute not in a TT namespace" allowance
+	const ebu = options.profile === 'ebu-tt-d';
 	const paragraphs = options.cues.map((cue) => {
 		const begin = formatSubtitleTimestamp(cue.timestamp);
 		const end = formatSubtitleTimestamp(cue.timestamp + cue.duration);
@@ -193,11 +209,18 @@ export const buildTtmlDocument = (options: {
 	return '<?xml version="1.0" encoding="UTF-8"?>\n'
 		+ `<tt xmlns="${TTML_NAMESPACE}" xmlns:tts="${TTML_NAMESPACE}#styling"`
 		+ ` xmlns:ttp="${TTML_NAMESPACE}#parameter" xmlns:ttm="${TTML_NAMESPACE}#metadata"`
+		+ (ebu ? ` xmlns:ebutts="${EBUTTS_NAMESPACE}" xmlns:ebuttm="${EBUTTM_NAMESPACE}"` : '')
 		+ ` xml:lang="${escapeXmlAttribute(options.language)}" xml:space="default"`
 		+ ' ttp:timeBase="media" ttp:cellResolution="32 15">\n'
 		+ '  <head>\n'
+		+ (ebu
+			? '    <metadata>\n'
+			+ `      <ebuttm:conformsToStandard>${EBU_TT_D_CONFORMS_TO}</ebuttm:conformsToStandard>\n`
+			+ '    </metadata>\n'
+			: '')
 		+ '    <styling>\n'
 		+ '      <style xml:id="s0" tts:fontFamily="sansSerif" tts:fontSize="100%" tts:color="white"'
+		+ (ebu ? ' tts:backgroundColor="black" tts:lineHeight="125%" ebutts:linePadding="0.5c"' : '')
 		+ ' tts:textAlign="center"/>\n'
 		+ '    </styling>\n'
 		+ '    <layout>\n'
@@ -241,7 +264,6 @@ const decodeXmlEntities = (text: string) => text.replace(xmlEntityRegex, (match,
 		return String.fromCodePoint(Number(entity.slice(1)));
 	}
 
-	// An entity we don't know has no XML-defined expansion; leaving it verbatim keeps the text lossless.
 	return XML_ENTITIES[entity] ?? match;
 });
 
@@ -307,7 +329,6 @@ export const parseTtmlDocument = (xml: string): SubtitleCue[] => {
 		throw new Error(`TTML time base '${timeBase}' is not supported; only 'media' is.`);
 	}
 
-	// Timing on a <body> or <div> shifts every cue below it; reading the cues as absolute would move them.
 	ttmlTimedContainerRegex.lastIndex = 0;
 	let container: RegExpExecArray | null;
 

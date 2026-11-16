@@ -311,16 +311,42 @@ test('a cue PID does not warn, but the same type without CUEI still does', async
 	const bytes = await buildStream(output => addScte35Section(output, spliceSection(0, 450_000)));
 
 	// The clean stream goes first: the demuxer warns once per stream type process-wide, so warning here
-	// would also mask the control below
+	// would also mask the control below. That one budget is why all three cases live in one test.
 	const clean = await warningsWhileDemuxing(bytes);
 	expect(clean.filter(line => line.includes('0x86'))).toEqual([]);
 
-	// Strip the registration that makes it a cue stream. The demuxer never checks the section CRC, so
-	// the identifier can be overwritten in place.
+	const hex = bytesToHexString(bytes);
+	const offsets: number[] = [];
+	for (let from = hex.indexOf('050443554549'); from !== -1; from = hex.indexOf('050443554549', from + 1)) {
+		offsets.push(from / 2);
+	}
+	// The PMT repeats and each copy carries CUEI twice - the program's own descriptor loop first, then
+	// the cue elementary stream - so the occurrences alternate program, ES, program, ES.
+	expect(offsets.length).toBeGreaterThanOrEqual(2);
+	expect(offsets.length % 2).toBe(0);
+
+	// 'ZZZZ' means nothing, deliberately not 'HDMV': at the program level that one declares a Blu-ray
+	// program, which remaps type 0x86 to DTS and makes the demuxer read the cue sections as PES.
+	const NOTHING = [0x5a, 0x5a, 0x5a, 0x5a];
+
+	// SCTE 35 §8.1 registers the cue stream at the program, and libavformat reads it only from there, so
+	// a stream carrying it there alone is conformant and must not warn either. Without this case the
+	// demuxer could read only the elementary-stream copy and nothing would notice.
+	const programOnly = bytes.slice();
+	for (const [index, at] of offsets.entries()) {
+		if (index % 2 === 1) {
+			programOnly.set(NOTHING, at + 2);
+		}
+	}
+	const programRegistered = await warningsWhileDemuxing(programOnly);
+	expect(programRegistered.filter(line => line.includes('0x86'))).toEqual([]);
+
+	// Now every occurrence, so the type is registered nowhere. The demuxer never checks the section CRC,
+	// so the identifiers can be overwritten in place.
 	const stripped = bytes.slice();
-	const at = bytesToHexString(stripped).indexOf('050443554549') / 2;
-	expect(at).toBeGreaterThan(0);
-	stripped.set([0x48, 0x44, 0x4d, 0x56], at + 2); // 'HDMV'
+	for (const at of offsets) {
+		stripped.set(NOTHING, at + 2);
+	}
 
 	const warnings = await warningsWhileDemuxing(stripped);
 	expect(warnings.filter(line => line.includes('0x86'))).toHaveLength(1);

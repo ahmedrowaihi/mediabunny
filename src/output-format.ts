@@ -667,7 +667,6 @@ export class MkvOutputFormat extends OutputFormat {
 			...NON_PCM_AUDIO_CODECS,
 			...PCM_AUDIO_CODECS.filter(codec => !['pcm-s8', 'pcm-f32be', 'pcm-f64be', 'ulaw', 'alaw'].includes(codec)),
 
-			// Matroska defines no TTML codec ID
 			'webvtt',
 		];
 	}
@@ -713,7 +712,6 @@ export class WebMOutputFormat extends MkvOutputFormat {
 			...VIDEO_CODECS.filter(codec => ['vp8', 'vp9', 'av1'].includes(codec)),
 			...AUDIO_CODECS.filter(codec => ['opus', 'vorbis'].includes(codec)),
 
-			// Matroska defines no TTML codec ID
 			'webvtt',
 		];
 	}
@@ -1515,7 +1513,6 @@ export class MpegTsOutputFormat extends OutputFormat {
 		}
 		for (const name of ['programNumber', 'transportStreamId'] as const) {
 			const value = options[name];
-			// 0 is reserved for the network information table's program in the PAT
 			if (value !== undefined && (!Number.isInteger(value) || value < 1 || value > 0xffff)) {
 				throw new TypeError(`options.${name}, when provided, must be an integer between 1 and 65535.`);
 			}
@@ -2170,7 +2167,6 @@ export class HlsOutputFormat extends OutputFormat {
 		if (this._options.singleFilePerPlaylist) {
 			uniqueCodecs.delete('webvtt');
 		} else {
-			// WebVTT rides in its own .vtt segments, independent of the configured segment formats.
 			uniqueCodecs.add('webvtt');
 		}
 

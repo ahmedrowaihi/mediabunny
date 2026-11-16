@@ -365,6 +365,10 @@ export class MpegTsDemuxer extends Demuxer {
 					// descriptor is what tells us we're looking at a Blu-ray-derived stream.
 					const programInfoEndPos = bitstream.pos + 8 * programInfoLength;
 					let isBluRayProgram = false;
+					// SCTE 35 §8.1 registers a cue stream at the program, and that is the only place
+					// libavformat looks (`mpegts.c`, `prog_reg_desc`). A stream carrying it there and not on
+					// the elementary stream is conformant, so both are accepted.
+					let isCueProgram = false;
 
 					while (bitstream.pos < programInfoEndPos) {
 						const descriptorTag = bitstream.readBits(8);
@@ -375,6 +379,7 @@ export class MpegTsDemuxer extends Demuxer {
 							const formatIdentifier = bitstream.readBits(32);
 							isBluRayProgram ||= formatIdentifier === HDMV_FORMAT_IDENTIFIER
 								|| formatIdentifier === HDPR_FORMAT_IDENTIFIER;
+							isCueProgram ||= formatIdentifier === CUEI_FORMAT_IDENTIFIER;
 						}
 
 						bitstream.pos = descriptorEndPos;
@@ -395,7 +400,7 @@ export class MpegTsDemuxer extends Demuxer {
 						let hasAc3Descriptor = false;
 						let hasEac3Descriptor = false;
 						let hasDtsDescriptor = false;
-						let hasCueiDescriptor = false;
+						let hasCueiDescriptor = isCueProgram;
 						let languageCode = UNDETERMINED_LANGUAGE;
 						while (bitstream.pos < esInfoEndPos) {
 							const descriptorTag = bitstream.readBits(8);
@@ -410,8 +415,6 @@ export class MpegTsDemuxer extends Demuxer {
 									bitstream.readBits(8),
 								];
 
-								// Anything else is a writer filling the field with junk, and `und` says more
-								// than a code no consumer can match
 								if (characters.every(code => code >= 0x61 && code <= 0x7a)) {
 									languageCode = String.fromCharCode(...characters);
 								}
@@ -480,8 +483,6 @@ export class MpegTsDemuxer extends Demuxer {
 									effectiveStreamType === MpegTsStreamType.MP3_MPEG1
 									|| effectiveStreamType === MpegTsStreamType.MP3_MPEG2
 								) {
-									// Provisional: these stream types name the MPEG version and cover every
-									// layer, so which codec it is comes off the first frame header below
 									codec = 'mp3';
 								} else if (effectiveStreamType === MpegTsStreamType.AAC) {
 									codec = 'aac';
@@ -542,8 +543,6 @@ export class MpegTsDemuxer extends Demuxer {
 								// If we don't recognize the codec, we don't surface the track at all. This is because
 								// we can't determine its metadata and also have no idea how to packetize its data.
 
-								// SCTE-35 cue streams are read out of band by `readScte35Sections`, so warning
-								// about them is noise on every segment that carries a cue PID
 								if (!hasCueiDescriptor && !ignoredStreamTypes.has(streamType)) {
 									Logging._warn(
 										`Note: MPEG-TS streams with stream_type 0x${streamType.toString(16)} are not`
@@ -745,11 +744,8 @@ export class MpegTsDemuxer extends Demuxer {
 									elementaryStream.info.mpeg2CodecInfo = info;
 									elementaryStream.info.width = info.width;
 									elementaryStream.info.height = info.height;
-									// The sequence header states a sample aspect ratio only as a code, and the
-									// display aspect it names is not a pixel ratio, so nothing here is squared
 									elementaryStream.info.squarePixelWidth = info.width;
 									elementaryStream.info.squarePixelHeight = info.height;
-									// B-pictures reorder by one, and a stream with none is simply never asked to
 									elementaryStream.info.reorderSize = 1;
 
 									break;
@@ -765,8 +761,6 @@ export class MpegTsDemuxer extends Demuxer {
 									codec: elementaryStream.info.codec,
 									codecDescription: null,
 									colorSpace: elementaryStream.info.colorSpace,
-									// MPEG-TS has no sample entry, so avc1/avc3 and hvc1/hev1 describe nothing
-									// here; these are the conventional strings, not a claim about storage.
 									avcType: 1,
 									hevcType: 'hev1',
 									avcCodecInfo: elementaryStream.info.avcCodecInfo,
@@ -862,8 +856,6 @@ export class MpegTsDemuxer extends Demuxer {
 									);
 								}
 
-								// The layer is the only thing that tells Layer II from Layer III, and the PMT
-								// states neither
 								elementaryStream.info.codec
 									= result.header.layer === MPEG_AUDIO_LAYER_II ? 'mp2' : 'mp3';
 								elementaryStream.info.numberOfChannels = getMp3ChannelCount(result.header.channel);
@@ -1251,8 +1243,6 @@ const readPesPacketHeader = <T extends boolean>(
 	if (ptsDtsFlags === 0b10 || ptsDtsFlags === 0b11) {
 		pts = readTimestamp();
 
-		// 0b11 means a DTS follows. Only a reordered stream sets it, and without it a B-frame's decode
-		// time is indistinguishable from its presentation time.
 		if (ptsDtsFlags === 0b11) {
 			dts = readTimestamp();
 		}
@@ -1559,7 +1549,6 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 		assert(firstPesPacketHeader);
 
 		let scanStartPos: number;
-		// No packet of this track lies at or past this position
 		let scanEndPos = reader.fileSize ?? Infinity;
 
 		const referencePesPackets = this.elementaryStream.referencePesPackets;
@@ -1575,8 +1564,6 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 			const fileSize = reader.fileSize;
 			let lastPidPos = -1;
 
-			// Stops at the first PES packet unless `findLast` is set. A scan that finds no packet has read the whole
-			// range, so only then does it count towards the position of the track's last TS packet.
 			const scanWindow = async (startPos: number, endPos: number, findLast: boolean) => {
 				let pesHeader: TimestampedPesPacketHeader | null = null;
 				let pidPos = -1;
@@ -1613,7 +1600,6 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 
 			const alignBack = (pos: number) => floorToMultiple(pos - firstPos, demuxer.packetStride) + firstPos;
 
-			// 1. Grow windows back from the end until one holds a PES packet
 			let windowEnd = fileSize;
 			let windowSize = TAIL_WINDOW_SIZE;
 			let windowStart: number;
@@ -1627,8 +1613,6 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 				windowSize *= 4;
 			}
 
-			// 2. Halve it, keeping the half the last PES packet is in. A half without one has been read in full and
-			// joins the region known to be free of this track.
 			while (windowEnd - windowStart > TAIL_WINDOW_SIZE) {
 				const mid = alignBack((windowStart + windowEnd) / 2);
 				if (await scanWindow(mid, windowEnd, false)) {
@@ -1638,7 +1622,6 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 				}
 			}
 
-			// 3. Scan what's left in full
 			const lastPesHeader = await scanWindow(windowStart, windowEnd, true);
 
 			scanStartPos = (lastPesHeader ?? firstPesPacketHeader).sectionStartPos;
@@ -1734,8 +1717,6 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 
 			const result = await buffer.readNext();
 			assert(result);
-			// The bound holds for the file as read during this lookup; iterating on from this buffer later must still
-			// see data appended to a source that grows
 			context.scanEndPos = Infinity;
 
 			const packet = this.createEncodedPacket(result.packet, result.duration, options);
@@ -2320,7 +2301,6 @@ class PacketReadingContext {
 				const startCodePos = posBeforeZero;
 				const code = chunk[i + 3]!;
 
-				// The packet only really begins at the first start code; anything before it isn't usable
 				packetStartPos ??= startCodePos;
 
 				if (
@@ -2343,12 +2323,10 @@ class PacketReadingContext {
 			}
 
 			if (remaining < chunkSize) {
-				// End of stream
 				break;
 			}
 		}
 
-		// End of stream - emit whatever's left as the final packet, unless it holds no picture
 		if (pictureFound) {
 			assert(packetStartPos !== null);
 
@@ -2840,8 +2818,6 @@ class PacketReadingContext {
 		const currentPesPacketDataStartPos = this.pesPacketDataStartPositions[pesPacketIndex]!;
 
 		let pts: number;
-		// Only the first access unit of a PES packet carries its timestamps; the rest are derived, so
-		// they have no stated decode time of their own.
 		let dts: number | null = null;
 		if (this.lastSuppliedPesPacket === currentPesPacket) {
 			assert(this.nextPts !== null);

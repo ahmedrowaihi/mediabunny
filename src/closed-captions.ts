@@ -82,7 +82,6 @@ export const buildClosedCaptionSeiMessage = (bytePairs: readonly ClosedCaptionBy
 	payload.set(ATSC_CC_DATA_HEADER, 0);
 
 	let pos = ATSC_CC_DATA_HEADER.length;
-	// process_em_data_flag = 1, process_cc_data_flag = 1, additional_data_flag = 0, then cc_count.
 	payload[pos++] = 0xc0 | bytePairs.length;
 	payload[pos++] = 0xff; // em_data, which no decoder reads while additional_data_flag is 0
 
@@ -121,7 +120,6 @@ export const parseClosedCaptionBytePairs = (ccData: Uint8Array): ClosedCaptionBy
 		});
 	}
 
-	// Null rather than a throw: one odd frame must not end a decode
 	if (bytePairs.length === 0 || bytePairs.length > MAX_CLOSED_CAPTION_BYTE_PAIRS) {
 		return null;
 	}
@@ -173,7 +171,6 @@ export const parsePacketClosedCaptions = (
 			}
 
 			const flagsAndCount = payload[ATSC_CC_DATA_HEADER.length] ?? 0;
-			// process_cc_data_flag: a decoder ignores the cc_data when it is clear, so this reader does too
 			if ((flagsAndCount & 0x40) === 0) {
 				continue;
 			}
@@ -218,7 +215,6 @@ export const validateClosedCaptionsMetadata = (metadata: ClosedCaptionsMetadata,
 
 /** @internal */
 export const validateClosedCaptionBytePairs = (bytePairs: readonly ClosedCaptionBytePair[], prefix: string) => {
-	// Array.isArray narrows a readonly array to any[], which would untype every check below it
 	const value: unknown = bytePairs;
 	if (!Array.isArray(value) || bytePairs.length === 0) {
 		throw new TypeError(`${prefix} must be a non-empty array of caption byte pairs.`);

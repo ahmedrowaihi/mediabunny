@@ -544,8 +544,6 @@ export class HlsSegmentedInput extends SegmentedInput {
 				}
 
 				const dateTime = line.slice(TAG_PROGRAM_DATE_TIME.length);
-				// Not `Date.parse`: it reads a zoneless time as local, so the same playlist got one timeline
-				// here and another through `parseHlsPlaylist`, which has always treated it as UTC.
 				const dateTimeMs = parseIsoDateTimeAsUtc(dateTime);
 
 				if (!Number.isFinite(dateTimeMs)) {
@@ -583,7 +581,6 @@ export class HlsSegmentedInput extends SegmentedInput {
 				// Counted even for known segments since the discontinuity number is absolute, derived from the
 				// playlist's discontinuity sequence
 				nextDiscontinuityNumber++;
-				// An #EXT-X-MAP lasts until the next one; an implicit I-frame init ends here
 				if (currentInitSegment && this.implicitInitSegments.has(currentInitSegment)) {
 					currentInitSegment = null;
 				}

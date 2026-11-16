@@ -277,7 +277,6 @@ export const hlsKeySpecs = (options: { systems: DrmSystem[]; fairplayKeyUri?: st
 			);
 		}
 		if (system.uuid === PLAYREADY_SYSTEM_ID) {
-			// HLS carries the PlayReady Object (the pssh's data payload), not the full pssh box.
 			const pro = parsePsshBoxData(system.pssh);
 			if (pro === null) {
 				throw new MalformedInputError(

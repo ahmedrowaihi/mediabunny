@@ -40,6 +40,7 @@ const NAMESPACE_URI_BY_PREFIX: Record<string, string> = {
 	scte35: DASH_NS.scte35,
 	scte214: DASH_NS.scte214,
 	dashif: DASH_NS.dashif,
+	dvb: DASH_NS.dvb,
 	mas: DASH_NS.mas,
 	xlink: DASH_NS.xlink,
 };
@@ -84,7 +85,6 @@ const setBool = (node: XmlNode, name: string, value: boolean | null | undefined)
 	}
 };
 
-// Shared by AdaptationSet and Representation, which both extend RepresentationBaseType.
 const setRepresentationBase = (node: XmlNode, base: {
 	profiles: string | null;
 	segmentProfiles: string | null;
@@ -107,7 +107,6 @@ const setRepresentationBase = (node: XmlNode, base: {
 	setFloat(node, 'maximumSAPPeriod', base.maximumSAPPeriod);
 	setInteger(node, 'selectionPriority', base.selectionPriority);
 	setString(node, 'tag', base.tag);
-	// On RepresentationBaseType in SCTE 214, so an AdaptationSet states them too
 	setString(node, 'scte214:supplementalCodecs', base.supplementalCodecs);
 	setString(node, 'scte214:supplementalProfiles', base.supplementalProfiles);
 };
@@ -124,6 +123,9 @@ const descriptorNodes = (parent: XmlNode, name: string, items: readonly DashDesc
 		node.setStringAttribute('schemeIdUri', item.schemeIdUri);
 		setString(node, 'value', item.value);
 		setString(node, 'id', item.id);
+		for (const [attribute, value] of Object.entries(item.foreignAttributes ?? {})) {
+			node.setStringAttribute(attribute, value);
+		}
 		parent.addChild(node);
 	}
 };
@@ -230,8 +232,6 @@ const representationBaseChildNodes = (parent: XmlNode, base: MpdRepresentationBa
 
 const baseUrlNode = (entry: MpdBaseURL): XmlNode => {
 	const node = new XmlNode('BaseURL');
-	// The parser stores the raw URI reference; emit it verbatim (XML-escaped only).
-	// setPathContent would percent-encode it and corrupt query strings / already-encoded paths.
 	node.setContent(entry.value);
 	setString(node, 'serviceLocation', entry.serviceLocation);
 	if (entry.availabilityTimeOffset) {
@@ -240,6 +240,8 @@ const baseUrlNode = (entry: MpdBaseURL): XmlNode => {
 	if (entry.availabilityTimeComplete === false) {
 		node.setStringAttribute('availabilityTimeComplete', 'false');
 	}
+	setInteger(node, 'dvb:priority', entry.dvbPriority);
+	setInteger(node, 'dvb:weight', entry.dvbWeight);
 	return node;
 };
 
@@ -288,6 +290,8 @@ const contentProtectionNode = (cp: ContentProtection): XmlNode => {
 	if (cp.keyId !== null) {
 		node.setStringAttribute('cenc:default_KID', keyIdToUuid(cp.keyId));
 	}
+	setString(node, 'refId', cp.refId);
+	setString(node, 'ref', cp.ref);
 	node.addElements(cp.psshBoxes.map(generateCencPsshElement));
 	for (const raw of cp.foreignXml) {
 		node.addRawXml(raw);
@@ -659,6 +663,8 @@ const periodNode = (period: MpdPeriod): XmlNode => {
 		node.addChild(sub);
 	}
 	labelNodes(node, 'GroupLabel', period.groupLabels);
+	descriptorNodes(node, 'SupplementalProperty', period.supplementalProperties);
+	descriptorNodes(node, 'EssentialProperty', period.essentialProperties);
 	for (const preselection of period.preselections ?? []) {
 		const ps = new XmlNode('Preselection');
 		setString(ps, 'id', preselection.id);

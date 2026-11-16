@@ -10,15 +10,31 @@ import { AppendOnlyStreamTarget } from 'mediabunny';
 import { IOContext } from 'node-av';
 import { AVIO_FLAG_WRITE } from 'node-av/constants';
 import {
+	getLibsrt,
+	SRT_ERROR,
+	SrtOption,
+	SRTT_LIVE,
+	writeSockaddrIn,
+	type Libsrt,
+} from './libsrt';
+import {
 	DEFAULT_MAX_QUEUE_BYTES, checkPassphrase, checkUrlAndOptions, installSecretRedactingLog, positive,
 	redactUrl, throwFailedOpen, wakePendingAccept,
 } from './misc';
+import { type SrtCallerInfo } from './srt-bonded-source';
 
 /** 7 MPEG-TS packets, which is what SRT carries in a live-mode datagram. */
 const PAYLOAD_SIZE = 1316;
 
 /** Seconds `close` may spend delivering what is still buffered. SRT's live-mode default is 0. */
 const DEFAULT_LINGER_SECONDS = 5;
+
+const SRT_EASYNCSND = 6001;
+const SRT_EASYNCRCV = 6002;
+const SOCKADDR_IN_SIZE = 16;
+const POLL_MS = 4;
+
+const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
 
 /**
  * Options for {@link SrtTarget}.
@@ -27,6 +43,16 @@ const DEFAULT_LINGER_SECONDS = 5;
  * @public
  */
 export type SrtTargetOptions = {
+	/**
+	 * Whether to connect out to a receiver (`'caller'`, the default) or to bind the URL's port and wait
+	 * for one (`'listener'`). The URL's own `?mode=` wins if it states one, since that is how the other
+	 * SRT options are passed through too.
+	 *
+	 * A listener's wait is bounded by {@link SrtTargetOptions.connectTimeout} like a caller's, but
+	 * through libsrt's `listen_timeout` rather than `timeout` — they are different options and setting
+	 * the wrong one leaves the default standing silently.
+	 */
+	mode?: 'caller' | 'listener';
 	/**
 	 * **Seconds** to wait for a peer - for a caller to answer, or for one to arrive while listening.
 	 * Defaults to 30. Never infinite: a wait cannot be cancelled once started.
@@ -54,18 +80,264 @@ export type SrtTargetOptions = {
 	 * to 2 MiB. See {@link SrtTarget} for what dropping means.
 	 */
 	maxQueueBytes?: number;
+	/**
+	 * Decides whether a receiver that called in may have the stream, which is how a sending listener
+	 * enforces an allowlist. Called once per accepted connection, before a single byte is sent;
+	 * returning `false` closes that socket and the listener goes back to waiting.
+	 *
+	 * Implies `mode: 'listener'` - a caller has nobody to vet. Passing both this and `mode: 'caller'`
+	 * is an error rather than a silently ignored option.
+	 *
+	 * Providing it switches the socket from FFmpeg's `srt://` protocol to the libsrt build shipped in
+	 * this package, because FFmpeg offers no hook between SRT's handshake and the first byte of data.
+	 * The option mapping is the same either way; what changes is that the address must be an IPv4
+	 * literal, since the bind names it directly rather than resolving it.
+	 */
+	accept?: (peer: SrtCallerInfo) => boolean;
 };
 
 type Queued = { chunks: Uint8Array[]; bytes: number };
 
 /**
- * Owns the libav IO state, the outbound queue and the pump that drains one into the other. Separate
- * from the target so the writable can be built before `super()` runs.
+ * The socket under the sink. One implementation goes through FFmpeg's `srt://` protocol, the other
+ * through the libsrt build shipped here; the queue, the drop accounting and the datagram packing above
+ * are the same either way, and belong to the sink rather than to either socket.
+ */
+type SrtTransport = {
+	/** Opens the socket, waiting for a peer if that is what this transport does. Called once. */
+	open: () => Promise<void>;
+	write: (bytes: Uint8Array) => Promise<void>;
+	flush: () => Promise<void>;
+	/** Unblocks an `open` that is still waiting for a peer, so a close does not wait out the timeout. */
+	wake: () => Promise<void>;
+	/** Releases the socket. Called once, after the queue has drained, whether the open finished or not. */
+	close: () => Promise<void>;
+	/** Callers an allowlist turned away. Always 0 for a transport that cannot vet one. */
+	readonly refusedCallers: number;
+};
+
+/** Sends over FFmpeg's `srt://` protocol, which is every case that does not vet its peer. */
+class IoContextTransport implements SrtTransport {
+	private io: IOContext | undefined;
+	readonly refusedCallers = 0;
+
+	constructor(
+		private readonly url: string,
+		private readonly listening: boolean,
+		private readonly encrypted: boolean,
+	) {}
+
+	async open(): Promise<void> {
+		const context = new IOContext();
+		const ret = await context.open2(this.url, AVIO_FLAG_WRITE);
+		if (ret < 0) {
+			await throwFailedOpen(context, 'SrtTarget', this.url, ret, this.encrypted);
+		}
+		this.io = context;
+	}
+
+	async write(bytes: Uint8Array): Promise<void> {
+		const io = this.io!;
+		await io.write(Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength));
+
+		if (io.error < 0) {
+			throw new Error(`SrtTarget: the peer stopped accepting data (AVERROR ${io.error}).`);
+		}
+	}
+
+	async flush(): Promise<void> {
+		await this.io?.flush().catch(() => {});
+	}
+
+	async wake(): Promise<void> {
+		if (this.listening && this.io === undefined) {
+			await wakePendingAccept(this.url);
+		}
+	}
+
+	async close(): Promise<void> {
+		if (this.io) {
+			await this.io.flush().catch(() => {});
+			await this.io.closep().catch(() => {});
+			this.io = undefined;
+		}
+	}
+}
+
+/**
+ * Listens with the bundled libsrt so a receiver can be vetted between SRT's handshake and the first
+ * byte of data. The refusal is a close just after the handshake: the caller sees a connection that ends
+ * immediately rather than one that was never offered, and gets no media either way.
+ */
+class LibsrtListenerTransport implements SrtTransport {
+	private libsrt: Libsrt;
+	private listener = SRT_ERROR;
+	private connection = SRT_ERROR;
+	private cancelled = false;
+	refusedCallers = 0;
+
+	constructor(
+		private readonly host: string,
+		private readonly port: number,
+		private readonly options: SrtTargetOptions,
+	) {
+		this.libsrt = getLibsrt();
+	}
+
+	async open(): Promise<void> {
+		this.listener = this.libsrt.createSocket();
+		if (this.listener === SRT_ERROR) {
+			throw new Error(`SrtTarget: libsrt could not create a socket: ${this.libsrt.lastError()}`);
+		}
+
+		// Every call stays non-blocking: a blocking accept or send would hold the one thread koffi calls
+		// libsrt on, and nothing else in the process would run until the peer moved
+		this.setInt(SrtOption.RCVSYN, 0, 'non-blocking mode');
+		this.setInt(SrtOption.SNDSYN, 0, 'non-blocking mode');
+		this.setInt(SrtOption.TRANSTYPE, SRTT_LIVE, 'transtype');
+		this.setInt(SrtOption.PAYLOADSIZE, PAYLOAD_SIZE, 'payload size');
+		// eslint-disable-next-line @typescript-eslint/no-deprecated -- the deprecated alias is still read
+		const latencyMs = this.options.latencyMs ?? this.options.latency;
+		if (latencyMs !== undefined) {
+			this.setInt(SrtOption.RCVLATENCY, Math.round(latencyMs), 'latency');
+			this.setInt(SrtOption.PEERLATENCY, Math.round(latencyMs), 'latency');
+		}
+		if (this.options.passphrase !== undefined) {
+			this.setInt(SrtOption.PBKEYLEN, (this.options.keyLength ?? 128) / 8, 'keyLength');
+			this.setString(SrtOption.PASSPHRASE, this.options.passphrase, 'passphrase');
+		}
+
+		const address = new Uint8Array(SOCKADDR_IN_SIZE);
+		writeSockaddrIn(address, 0, this.host, this.port);
+		if (this.libsrt.bind(this.listener, address, SOCKADDR_IN_SIZE) === SRT_ERROR) {
+			const message = this.libsrt.lastError();
+			this.destroy();
+			throw new Error(`SrtTarget: libsrt could not bind ${this.host}:${this.port}: ${message}`);
+		}
+		if (this.libsrt.listen(this.listener, 5) === SRT_ERROR) {
+			const message = this.libsrt.lastError();
+			this.destroy();
+			throw new Error(`SrtTarget: libsrt could not listen: ${message}`);
+		}
+
+		const deadline = Date.now() + (this.options.connectTimeout ?? 30) * 1000;
+		while (!this.cancelled) {
+			if (Date.now() >= deadline) {
+				this.destroy();
+				throw new Error(
+					`SrtTarget: no receiver connected to ${this.host}:${this.port} within`
+					+ ` ${this.options.connectTimeout ?? 30} seconds.`,
+				);
+			}
+
+			const { socket: accepted, peer } = this.libsrt.accept(this.listener);
+			if (accepted === SRT_ERROR) {
+				if (this.libsrt.lastErrorCode() !== SRT_EASYNCRCV) {
+					const message = this.libsrt.lastError();
+					this.destroy();
+					throw new Error(`SrtTarget: libsrt could not accept: ${message}`);
+				}
+				await sleep(POLL_MS);
+				continue;
+			}
+
+			if (!this.allowed(accepted, peer)) {
+				this.libsrt.close(accepted);
+				this.refusedCallers++;
+				await sleep(POLL_MS);
+				continue;
+			}
+
+			this.libsrt.setFlagInt(accepted, SrtOption.SNDSYN, 0);
+			this.connection = accepted;
+			return;
+		}
+
+		this.destroy();
+		throw new Error('SrtTarget: closed before a receiver connected.');
+	}
+
+	/** Asks the allowlist about a caller. The stream id is read off the accepted socket, not the listener. */
+	private allowed(socket: number, peer: { address: string; port: number; family: 'ipv4' | 'ipv6' } | null): boolean {
+		const decide = this.options.accept;
+		if (!decide) {
+			return true;
+		}
+
+		const streamId = this.libsrt.getFlagString(socket, SrtOption.STREAMID);
+		return decide({
+			address: peer?.address ?? null,
+			port: peer?.port ?? null,
+			family: peer?.family ?? null,
+			streamId: streamId === null || streamId === '' ? null : streamId,
+		});
+	}
+
+	/**
+	 * Retries while the send buffer is full rather than dropping there: the sink's own queue bound is
+	 * what decides when bytes are given up on, and a second, hidden one here would make that number wrong.
+	 */
+	async write(bytes: Uint8Array): Promise<void> {
+		while (!this.cancelled) {
+			const sent = this.libsrt.send(this.connection, bytes, bytes.byteLength);
+			if (sent >= 0) {
+				return;
+			}
+			if (this.libsrt.lastErrorCode() !== SRT_EASYNCSND) {
+				throw new Error(`SrtTarget: the peer stopped accepting data: ${this.libsrt.lastError()}`);
+			}
+			await sleep(POLL_MS);
+		}
+	}
+
+	/** SRT sends each payload as it is given; there is nothing held back to flush. */
+	async flush(): Promise<void> {}
+
+	async wake(): Promise<void> {
+		this.cancelled = true;
+	}
+
+	async close(): Promise<void> {
+		this.cancelled = true;
+		this.destroy();
+	}
+
+	private setInt(option: number, value: number, name: string) {
+		if (this.libsrt.setFlagInt(this.listener, option, value) === SRT_ERROR) {
+			const message = this.libsrt.lastError();
+			this.destroy();
+			throw new Error(`SrtTarget: libsrt refused ${name}: ${message}`);
+		}
+	}
+
+	private setString(option: number, value: string, name: string) {
+		if (this.libsrt.setFlagString(this.listener, option, value) === SRT_ERROR) {
+			const message = this.libsrt.lastError();
+			this.destroy();
+			throw new Error(`SrtTarget: libsrt refused ${name}: ${message}`);
+		}
+	}
+
+	private destroy() {
+		if (this.connection !== SRT_ERROR) {
+			this.libsrt.close(this.connection);
+			this.connection = SRT_ERROR;
+		}
+		if (this.listener !== SRT_ERROR) {
+			this.libsrt.close(this.listener);
+			this.listener = SRT_ERROR;
+		}
+	}
+}
+
+/**
+ * Owns the outbound queue and the pump that drains it into the transport. Separate from the target so
+ * the writable can be built before `super()` runs.
  */
 class SrtSink {
 	readonly writable: WritableStream<Uint8Array>;
 
-	private io: IOContext | undefined;
+	private opened = false;
 	private opening = false;
 	private pumping: Promise<void> | null = null;
 	private failure: Error | null = null;
@@ -83,11 +355,13 @@ class SrtSink {
 		return this.queue.bytes;
 	}
 
+	get refusedCallers(): number {
+		return this.transport.refusedCallers;
+	}
+
 	constructor(
-		private readonly url: string,
+		private readonly transport: SrtTransport,
 		readonly maxQueueBytes: number,
-		private readonly listening: boolean,
-		private readonly encrypted: boolean,
 	) {
 		this.writable = new WritableStream<Uint8Array>({
 			write: chunk => this.enqueue(chunk),
@@ -125,35 +399,26 @@ class SrtSink {
 	}
 
 	private async writeDatagram(bytes: Uint8Array) {
-		const io = this.io!;
-		await io.write(Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength));
-
-		// write resolves without a count, so the context's own error is the only report of a dead peer
-		if (io.error < 0) {
-			throw new Error(`SrtTarget: the peer stopped accepting data (AVERROR ${io.error}).`);
-		}
-
+		await this.transport.write(bytes);
 		this.sentBytes += bytes.byteLength;
 	}
 
 	private async pump() {
 		try {
-			if (!this.io) {
-				const context = new IOContext();
+			if (!this.opened) {
 				this.opening = true;
-				const ret = await context.open2(this.url, AVIO_FLAG_WRITE);
-				if (ret < 0) {
-					await throwFailedOpen(context, 'SrtTarget', this.url, ret, this.encrypted);
+				try {
+					await this.transport.open();
+				} finally {
+					this.opening = false;
 				}
-				this.io = context;
+				this.opened = true;
 			}
 
 			while (this.queue.chunks.length > 0) {
 				const chunk = this.queue.chunks.shift()!;
 				this.queue.bytes -= chunk.byteLength;
 
-				// Datagrams are filled to exactly PAYLOAD_SIZE so each one carries whole TS packets; the
-				// remainder waits for the next chunk rather than going out short.
 				let offset = 0;
 				while (offset < chunk.byteLength) {
 					const take = Math.min(PAYLOAD_SIZE - this.partialLength, chunk.byteLength - offset);
@@ -169,7 +434,6 @@ class SrtSink {
 			}
 		} catch (error) {
 			this.failure ??= error instanceof Error ? error : new Error(String(error));
-			// Nothing queued can reach a peer that has gone, and holding it only grows memory
 			this.queue = { chunks: [], bytes: 0 };
 		}
 	}
@@ -188,15 +452,14 @@ class SrtSink {
 			await this.kick().catch(() => {});
 		}
 
-		if (this.failure || !this.io || this.partialLength === 0) {
+		if (this.failure || !this.opened || this.partialLength === 0) {
 			return;
 		}
 
-		// Copied and the length cleared before the await: the buffer is shared with the next pump
 		const datagram = this.partial.slice(0, this.partialLength);
 		this.partialLength = 0;
 		await this.writeDatagram(datagram);
-		await this.io.flush().catch(() => {});
+		await this.transport.flush();
 	}
 
 	private async finish() {
@@ -205,29 +468,21 @@ class SrtSink {
 		}
 		this.closed = true;
 
-		// A parked accept outlives a close and cannot be interrupted, so a listener with no receiver is
-		// satisfied by dialling its own URL. Without this, closing waits out the whole listen_timeout.
-		if (this.listening && this.io === undefined && this.opening) {
-			await wakePendingAccept(this.url);
+		if (this.opening) {
+			await this.transport.wake();
 		}
 
-		// Drain to empty rather than awaiting one pump: a chunk enqueued just as a pump ended starts a
-		// new one, and closing under that would cut the tail off and interleave with its writes.
 		while (this.pumping !== null || this.queue.chunks.length > 0) {
 			await this.kick().catch(() => {});
 		}
 
-		if (!this.failure && this.io && this.partialLength > 0) {
-			// A short final datagram is how a stream that is not a multiple of the payload size ends
+		if (!this.failure && this.opened && this.partialLength > 0) {
 			await this.writeDatagram(this.partial.subarray(0, this.partialLength)).catch((error: unknown) => {
 				this.failure ??= error instanceof Error ? error : new Error(String(error));
 			});
 		}
 
-		if (this.io) {
-			await this.io.flush().catch(() => {});
-			await this.io.closep().catch(() => {});
-		}
+		await this.transport.close();
 
 		if (this.failure) {
 			throw this.failure;
@@ -235,7 +490,17 @@ class SrtSink {
 	}
 }
 
-const srtUrl = (rawUrl: string, options: SrtTargetOptions): { url: string; listening: boolean } => {
+/**
+ * Resolves the `srt://` URL libsrt is actually opened with. Exported so the option-to-parameter mapping
+ * can be asserted without opening a socket: the parameter names are libsrt's, and a misnamed one leaves
+ * its default standing with no error anywhere.
+ *
+ * @internal
+ */
+export const srtUrl = (
+	rawUrl: string,
+	options: SrtTargetOptions,
+): { url: string; listening: boolean; host: string; port: number } => {
 	let url: URL;
 	try {
 		url = new URL(rawUrl);
@@ -249,8 +514,6 @@ const srtUrl = (rawUrl: string, options: SrtTargetOptions): { url: string; liste
 	const connectTimeout = options.connectTimeout ?? 30;
 	const micros = (seconds: number) => String(Math.max(1, Math.round(seconds * 1e6)));
 
-	// Live transport and a 7-packet payload are what a Smooth/MPEG-TS receiver expects; both stay the
-	// caller's if they stated them.
 	if (!url.searchParams.has('transtype')) {
 		url.searchParams.set('transtype', 'live');
 	}
@@ -258,10 +521,8 @@ const srtUrl = (rawUrl: string, options: SrtTargetOptions): { url: string; liste
 		url.searchParams.set('payload_size', String(PAYLOAD_SIZE));
 	}
 	if (!url.searchParams.has('mode')) {
-		url.searchParams.set('mode', 'caller');
+		url.searchParams.set('mode', options.mode ?? 'caller');
 	}
-	// Live mode defaults SRTO_LINGER to 0, which discards whatever is still in the send buffer the moment
-	// the socket closes - so a short stream, or the tail of any stream, never reaches the receiver.
 	if (!url.searchParams.has('linger')) {
 		url.searchParams.set('linger', String(DEFAULT_LINGER_SECONDS));
 	}
@@ -273,18 +534,20 @@ const srtUrl = (rawUrl: string, options: SrtTargetOptions): { url: string; liste
 	// eslint-disable-next-line @typescript-eslint/no-deprecated -- the one place it has to be read
 	const latencyMs = options.latencyMs ?? options.latency;
 	if (latencyMs !== undefined) {
-		// libsrt states latency in microseconds, not the milliseconds this option takes
 		url.searchParams.set('latency', String(Math.max(1, Math.round(latencyMs * 1000))));
 	}
 
-	// Set, not defaulted: a caller-supplied value here would reinstate the unbounded wait this guards
-	// against. `listen_timeout` bounds an accept, `timeout` a connect - in microseconds, both.
 	if (url.searchParams.get('mode') === 'listener') {
 		url.searchParams.set('listen_timeout', micros(connectTimeout));
 	}
 	url.searchParams.set('timeout', micros(connectTimeout));
 
-	return { url: url.toString(), listening: url.searchParams.get('mode') === 'listener' };
+	return {
+		url: url.toString(),
+		listening: url.searchParams.get('mode') === 'listener',
+		host: url.hostname,
+		port: Number(url.port),
+	};
 };
 
 /**
@@ -315,6 +578,18 @@ export class SrtTarget extends AppendOnlyStreamTarget {
 	constructor(url: string, options: SrtTargetOptions = {}) {
 		installSecretRedactingLog();
 		checkUrlAndOptions(url, options);
+		if (options.mode !== undefined && options.mode !== 'caller' && options.mode !== 'listener') {
+			throw new TypeError('options.mode, when provided, must be \'caller\' or \'listener\'.');
+		}
+		if (options.accept !== undefined && typeof options.accept !== 'function') {
+			throw new TypeError('options.accept, when provided, must be a function.');
+		}
+		if (options.accept !== undefined && options.mode === 'caller') {
+			throw new TypeError(
+				'options.accept vets a receiver that called in, so it needs \'listener\' mode; a caller has'
+				+ ' nobody to vet.',
+			);
+		}
 		positive(options.connectTimeout, 'connectTimeout');
 		checkPassphrase(options);
 		positive(options.latencyMs, 'latencyMs');
@@ -329,13 +604,21 @@ export class SrtTarget extends AppendOnlyStreamTarget {
 			);
 		}
 
-		const resolved = srtUrl(url, options);
-		const sink = new SrtSink(
-			resolved.url,
-			options.maxQueueBytes ?? DEFAULT_MAX_QUEUE_BYTES,
-			resolved.listening,
-			resolved.url.includes('passphrase='),
-		);
+		const resolved = srtUrl(url, options.accept ? { ...options, mode: 'listener' } : options);
+		if (options.accept !== undefined && !resolved.listening) {
+			throw new TypeError(
+				'options.accept vets a receiver that called in, so the URL may not state ?mode=caller.',
+			);
+		}
+
+		const transport: SrtTransport = options.accept
+			? new LibsrtListenerTransport(resolved.host, resolved.port, { ...options, mode: 'listener' })
+			: new IoContextTransport(
+				resolved.url,
+				resolved.listening,
+				resolved.url.includes('passphrase='),
+			);
+		const sink = new SrtSink(transport, options.maxQueueBytes ?? DEFAULT_MAX_QUEUE_BYTES);
 		super(sink.writable);
 		this.sink = sink;
 	}
@@ -379,5 +662,13 @@ export class SrtTarget extends AppendOnlyStreamTarget {
 	/** Datagrams' worth of dropped bytes, which is the unit a receiver sees missing. */
 	get droppedDatagrams(): number {
 		return this.sink.droppedDatagrams;
+	}
+
+	/**
+	 * Receivers {@link SrtTargetOptions.accept} turned away, which an allowlist is judged by. Stays 0
+	 * without one.
+	 */
+	get refusedCallers(): number {
+		return this.sink.refusedCallers;
 	}
 }

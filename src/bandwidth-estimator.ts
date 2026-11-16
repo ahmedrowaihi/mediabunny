@@ -66,7 +66,6 @@ export class BandwidthEstimator {
 		}
 
 		if (this.targetBlockDuration === 0) {
-			// Use the average duration of the initial blocks as target.
 			this.targetBlockDuration = this.getAverageBlockDuration();
 			for (const block of this.initialBlocks) {
 				this.maxBitrate = Math.max(
@@ -95,7 +94,6 @@ export class BandwidthEstimator {
 		if (this.maxBitrate !== 0) {
 			return this.maxBitrate;
 		}
-		// Fewer than TARGET_DURATION_THRESHOLD blocks: derive target on the fly.
 		const targetBlockDuration = this.getAverageBlockDuration();
 		let maxBitrate = 0;
 		for (const block of this.initialBlocks) {

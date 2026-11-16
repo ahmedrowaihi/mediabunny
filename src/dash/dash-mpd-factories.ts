@@ -451,12 +451,18 @@ export const mpdPeriod = (options: {
 	subsets?: MpdPeriod['subsets'];
 	/** `<GroupLabel>` children. */
 	groupLabels?: MpdPeriod['groupLabels'];
+	/** Period-level `<SupplementalProperty>` descriptors. */
+	supplementalProperties?: MpdPeriod['supplementalProperties'];
+	/** Period-level `<EssentialProperty>` descriptors. */
+	essentialProperties?: MpdPeriod['essentialProperties'];
 	/** `<Preselection>` children. */
 	preselections?: MpdPeriod['preselections'];
 	/** `<EmptyAdaptationSet>` children. */
 	emptyAdaptationSets?: MpdPeriod['emptyAdaptationSets'];
 }): MpdPeriod => ({
 	id: options.id ?? null,
+	supplementalProperties: options.supplementalProperties ?? [],
+	essentialProperties: options.essentialProperties ?? [],
 	start: options.start ?? null,
 	duration: options.duration ?? null,
 	adaptationSets: options.adaptationSets,
@@ -529,8 +535,6 @@ export const mpd = (options: {
 	suggestedPresentationDelay?: number;
 }): Mpd => ({
 	type: options.type,
-	// The on-demand profile permits SegmentBase addressing only, so stating it over a presentation
-	// addressed by SegmentTemplate or SegmentList describes something the MPD is not.
 	profiles: options.profiles ?? [
 		options.type === 'static' && usesOnlySegmentBase(options.periods)
 			? 'urn:mpeg:dash:profile:isoff-on-demand:2011'

@@ -5663,3 +5663,62 @@ describe('closing two packet sources that share a playlist', () => {
 		}
 	}
 });
+
+// CHARACTERISTICS is what a player's accessibility setting selects on (RFC 8216 §4.3.4.1). Without it a
+// described-audio or SDH rendition is indistinguishable from another language entry, so the disposition
+// has to reach the master playlist rather than only the segments.
+test('an accessibility disposition reaches EXT-X-MEDIA CHARACTERISTICS', async () => {
+	const files = new Map<string, string>();
+	const output = new Output({
+		format: new HlsOutputFormat({ segmentFormat: new MpegTsOutputFormat(), targetDuration: 2 }),
+		target: new PathedTarget('master.m3u8', (request) => {
+			const target = new BufferTarget();
+			target.on('finalized', () => files.set(request.path, new TextDecoder().decode(target.buffer!)));
+			return target;
+		}),
+	});
+
+	const video = videoSource();
+	output.addVideoTrack(video);
+
+	const described = audioSource();
+	output.addAudioTrack(described, {
+		languageCode: 'eng',
+		name: 'Described',
+		disposition: { visuallyImpaired: true },
+	});
+	// No identifier exists for a hearing-impaired audio mix, so this one must state nothing
+	const plainAudio = audioSource();
+	output.addAudioTrack(plainAudio, {
+		languageCode: 'deu',
+		name: 'German',
+		disposition: { hearingImpaired: true },
+	});
+
+	const sdh = new TextSubtitleSource('webvtt');
+	output.addSubtitleTrack(sdh, { languageCode: 'eng', name: 'SDH', disposition: { hearingImpaired: true } });
+
+	await output.start();
+	for (const timestamp of [0, 0.5, 1, 1.5, 2, 2.5, 3, 3.5]) {
+		await video.add(
+			new EncodedPacket(avcPacketData, timestamp % 2 === 0 ? 'key' : 'delta', timestamp, 0.5),
+			avcMetadata,
+		);
+		await described.add(new EncodedPacket(aacPacketData, 'key', timestamp, 0.5), aacMetadata);
+		await plainAudio.add(new EncodedPacket(aacPacketData, 'key', timestamp, 0.5), aacMetadata);
+	}
+	await sdh.add('WEBVTT\n\n00:00.100 --> 00:00.900\nHildy!\n');
+	await output.finalize();
+
+	const master = files.get('master.m3u8')!;
+	const lineFor = (name: string) =>
+		master.split('\n').find(line => line.startsWith('#EXT-X-MEDIA') && line.includes(`NAME="${name}"`))!;
+
+	expect(lineFor('Described')).toContain('CHARACTERISTICS="public.accessibility.describes-video"');
+	expect(lineFor('SDH')).toContain(
+		'CHARACTERISTICS="public.accessibility.transcribes-spoken-dialog'
+		+ ',public.accessibility.describes-music-and-sound"',
+	);
+	// An invented identifier would be worse than none
+	expect(lineFor('German')).not.toContain('CHARACTERISTICS');
+}, 60_000);

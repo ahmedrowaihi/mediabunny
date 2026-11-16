@@ -8,6 +8,7 @@
 
 import type { ClosedCaptionChannel } from '../closed-captions';
 import { Logging } from '../logging';
+import type { TrackDisposition } from '../metadata';
 import type { SubtitleCodec } from '../codec';
 import { Quality } from '../encode';
 import { declaredVideoCodec } from '../isobmff/isobmff-boxes';
@@ -64,6 +65,32 @@ const HLS_MEDIA_TYPES: Record<TrackType, string> = {
 	subtitle: 'SUBTITLES',
 };
 
+/**
+ * `CHARACTERISTICS` for an accessibility rendition (RFC 8216 §4.3.4.1), as the Universal Type
+ * Identifiers Apple defines for them. This is what a player's accessibility setting selects on: without
+ * it a described-audio or SDH rendition is just another language entry.
+ *
+ * Only the combinations Apple actually names are emitted. There is no identifier for a hearing-impaired
+ * *audio* mix, and none for a visually-impaired subtitle, so those flags state nothing here rather than
+ * being given an invented tag — MPEG-TS's `audio_type` is where a hearing-impaired mix is signalled.
+ */
+const accessibilityCharacteristics = (type: TrackType, disposition: Partial<TrackDisposition> | undefined) => {
+	const tags: string[] = [];
+
+	if (type === 'audio' && disposition?.visuallyImpaired) {
+		tags.push('public.accessibility.describes-video');
+	}
+	if (type === 'subtitle' && disposition?.hearingImpaired) {
+		// The pair is what SDH means: the dialog transcribed, and the sound that is not dialog described
+		tags.push(
+			'public.accessibility.transcribes-spoken-dialog',
+			'public.accessibility.describes-music-and-sound',
+		);
+	}
+
+	return tags;
+};
+
 // RFC 8216 §4.3.4.2 lets CLOSED-CAPTIONS name only a group an EXT-X-MEDIA declares, so a variant whose
 // bitstream carries captions gets both, under one group shared by every such variant.
 const CLOSED_CAPTIONS_GROUP_ID = 'cc';
@@ -77,14 +104,11 @@ const announcedClosedCaptionChannels = (track: OutputTrack): ClosedCaptionChanne
 	return closedCaptions?.announceInManifest ? closedCaptions.channels : [];
 };
 
-// An absent VIDEO-RANGE already implies SDR, so a transfer function we cannot name is left unstated
-// rather than asserted.
 const hlsVideoRange = (colorSpace: VideoColorSpaceInit | undefined) =>
 	colorSpace?.transfer
 		? videoRangeFromTransferCharacteristics(TRANSFER_CHARACTERISTICS_MAP[colorSpace.transfer])
 		: null;
 
-// Maps from WebCodecs to what HLS wants
 const toHlsCodecString = (codecString: string) => {
 	if (codecString === 'opus') {
 		return 'Opus';
@@ -155,7 +179,6 @@ export class HlsManifestEmitter implements ManifestEmitter {
 			for (const cue of segment.cues) {
 				const date = this.programDateTimeOf(segment.timestamp);
 				if (date === null) {
-					// Without a clock there is no START-DATE, and a DATERANGE without one is invalid
 					Logging._warn(
 						'adMarkers is \'daterange\', but this playlist states no wall clock, so an'
 						+ ' EXT-X-DATERANGE has no START-DATE to carry. Set programDateTime.',
@@ -183,15 +206,11 @@ export class HlsManifestEmitter implements ManifestEmitter {
 			return text;
 		}
 
-		// The Elemental family states a break as a run of tags: one CUE-OUT, a CONT on every segment
-		// inside it, and a CUE-IN at its end.
 		const breakState = segment.breakState;
 
 		let opensOrCloses = false;
 		for (const cue of segment.cues) {
 			if (cue.outOfNetwork === null) {
-				// Opens no break, so it gets no cue tags at all - and no OATCLS either, which only ever
-				// accompanies one. A DATERANGE with SCTE35-CMD is where such a section is stated.
 				continue;
 			}
 
@@ -207,9 +226,6 @@ export class HlsManifestEmitter implements ManifestEmitter {
 			}
 		}
 
-		// Inside a break and neither opening nor closing it here. Keyed on what the segment's cues *do*
-		// rather than on it having none: a segment carrying an unrelated section - a Program Start, a
-		// heartbeat - is still inside the break, and a player joining there needs its position.
 		if (breakState !== null && !opensOrCloses) {
 			text += `#EXT-X-CUE-OUT-CONT:${+breakState.elapsed.toFixed(3)}`
 				+ `/${+breakState.duration.toFixed(3)}\n`;
@@ -228,7 +244,6 @@ export class HlsManifestEmitter implements ManifestEmitter {
 	}
 
 	async onPlaylistDone(playlist: Playlist): Promise<void> {
-		// Re-emitted only so the trailing `#EXT-X-ENDLIST` is written; the text is already current
 		await this.writePlaylist(playlist);
 		if (this.host.isLive && playlist.writtenSegments.length === 0) {
 			await this.tryWriteMasterPlaylist();
@@ -256,11 +271,6 @@ export class HlsManifestEmitter implements ManifestEmitter {
 		const upper = 1.5 * gtd;
 		const cache = playlist.bitrateCache;
 
-		// Peak bitrate is the largest over any run of segments lasting 0.5–1.5 × target duration; the cache
-		// extends only the windows ending at each new segment, making n appends O(n · W) rather than O(n² · W)
-
-		// `writtenSegments` slides under live, so count segments ever appended rather than the length
-		// of what is currently held — which eviction pins, freezing the cache forever.
 		const totalAppended = playlist.mediaSequence + segments.length;
 
 		const fresh = (cache && cache.cachedGtd === gtd && cache.processedCount <= totalAppended)
@@ -290,7 +300,6 @@ export class HlsManifestEmitter implements ManifestEmitter {
 		playlist.bitrateCache = fresh;
 
 		let peakBitrate = fresh.peakBitrate;
-		// Fallback: if no contiguous set falls within the range, use per-segment max
 		if (peakBitrate === 0) {
 			for (const segment of segments) {
 				const segmentDuration = segment.duration || 1; // To catch 0-duration segments which can happen
@@ -301,8 +310,6 @@ export class HlsManifestEmitter implements ManifestEmitter {
 		let averageBitrate = (8 * fresh.totalBytes) / (fresh.totalDuration || 1);
 
 		if (segments.length === 0) {
-			// No data to measure, meaning a bandwidth of zero. This breaks some HLS players, so let's use a sensible
-			// default instead
 			for (const track of playlist.tracks) {
 				const trackData = this.host.trackDatas.find(x => x.track === track);
 				let trackPeakBitrate = track.source._nominalBitrate ?? track.metadata.bitrate ?? 0;
@@ -312,7 +319,6 @@ export class HlsManifestEmitter implements ManifestEmitter {
 					const mediumQuality = new Quality('medium');
 
 					if (track.isVideoTrack()) {
-						// Our info union also covers subtitles, so narrow rather than cast
 						const decoderConfig = trackData?.info.type === 'video'
 							? trackData.info.decoderConfig
 							: undefined;
@@ -322,8 +328,6 @@ export class HlsManifestEmitter implements ManifestEmitter {
 							decoderConfig?.codedHeight ?? 1080,
 						);
 					} else if (track.isAudioTrack()) {
-						// The estimate is per channel count, so a stereo guess stands in where the track has not
-						// declared one yet
 						const channels = trackData?.info.type === 'audio'
 							? trackData.info.decoderConfig.numberOfChannels
 							: 2;
@@ -366,14 +370,12 @@ export class HlsManifestEmitter implements ManifestEmitter {
 			version = 5;
 		}
 		if (playlist.initSegment && !isKeyPacketsOnly) {
-			// "if it contains the EXT-X-MAP tag in a Media Playlist that does not contain EXT-X-I-FRAMES-ONLY"
 			version = 6;
 		}
 		if (listsParts) {
 			version = 9; // RFC 8216bis §8: EXT-X-PART requires version 9
 		}
 
-		// In live mode, target duration is not allowed to change, so we use the nominal value
 		const targetDuration = this.host.isLive ? this.host.targetSegmentDuration : this.host.globalTargetDuration;
 		const targetDurationInt = Math.round(targetDuration);
 
@@ -397,8 +399,6 @@ export class HlsManifestEmitter implements ManifestEmitter {
 			})
 			.join('');
 
-		// The hint names where the next part will land: the same file under singleFilePerPlaylist, else the
-		// segment the muxer will write next, whose path comes from the very call it will make itself.
 		let preloadHint = '';
 		if (listsParts && this.options.preloadHint) {
 			if (playlist.singleFile) {
@@ -411,7 +411,6 @@ export class HlsManifestEmitter implements ManifestEmitter {
 					isSingleFile: false,
 					playlist: this.toPlaylistInfo(playlist),
 					parts: null,
-					// A path lookup for a segment that does not exist yet, so nothing is known about it.
 					isLast: false,
 				});
 				preloadHint = `#EXT-X-PRELOAD-HINT:TYPE=PART,URI="${nextPath}"\n`;
@@ -564,9 +563,7 @@ export class HlsManifestEmitter implements ManifestEmitter {
 				}
 			}
 
-			// FRAME-RATE is not defined for EXT-X-I-FRAME-STREAM-INF
 			if (!isKeyPacketsOnly && videoTrack.metadata.frameRate !== undefined) {
-				// Spec requires that frame rate be rounded to 3 decimal places
 				text += `,FRAME-RATE=${+videoTrack.metadata.frameRate.toFixed(3)}`;
 			}
 		}
@@ -583,14 +580,12 @@ export class HlsManifestEmitter implements ManifestEmitter {
 				text += `,${HLS_MEDIA_TYPES[type]}="${id}"`;
 			}
 
-			// CLOSED-CAPTIONS is not defined for EXT-X-I-FRAME-STREAM-INF, hence the shared guard.
 			if (videoTrack && announcedClosedCaptionChannels(videoTrack).length > 0) {
 				text += `,CLOSED-CAPTIONS="${CLOSED_CAPTIONS_GROUP_ID}"`;
 			}
 		}
 
 		if (isKeyPacketsOnly) {
-			// EXT-X-I-FRAME-STREAM-INF is standalone with a URI attribute
 			text += `,URI="${decl.playlist.path}"`;
 			text += '\n';
 		} else {
@@ -631,7 +626,6 @@ export class HlsManifestEmitter implements ManifestEmitter {
 			name = null;
 		}
 
-		// Name is required, so we have to set it to SOMETHING
 		name ??= `${languageCode ?? decl.groupId}-${state.trackCount}`;
 
 		text += `,NAME="${name}"`;
@@ -645,7 +639,6 @@ export class HlsManifestEmitter implements ManifestEmitter {
 		const dispositionForced = disposition?.forced ?? false;
 
 		if (dispositionPrimary && !state.hasDefault) {
-			// HLS's "DEFAULT" behaves like our "primary"
 			text += ',DEFAULT=YES';
 			state.hasDefault = true; // Only one DEFAULT label per group allowed
 		}
@@ -656,6 +649,11 @@ export class HlsManifestEmitter implements ManifestEmitter {
 
 		if (dispositionForced) {
 			text += ',FORCED=YES';
+		}
+
+		const characteristics = accessibilityCharacteristics(type, disposition);
+		if (characteristics.length > 0) {
+			text += `,CHARACTERISTICS="${characteristics.join(',')}"`;
 		}
 
 		if (type === 'audio') {
@@ -680,10 +678,6 @@ export class HlsManifestEmitter implements ManifestEmitter {
 		assert(this.host.output._target instanceof PathedTarget);
 		const pathedTarget = this.host.output._target;
 
-		// The master states every playlist's bandwidth, so it settles them itself rather than relying on
-		// each having had its own media playlist written first. A rendition that has produced nothing
-		// yet - a live subtitle track whose first cue has not arrived - reaches here with no bitrate at
-		// all otherwise, and the tag asserts on one.
 		for (const playlist of this.host.playlists) {
 			this.updatePlaylistBitrates(playlist);
 		}
@@ -732,12 +726,8 @@ export class HlsManifestEmitter implements ManifestEmitter {
 		try {
 			let writer: Writer;
 			if (this.host.numWrittenMasterPlaylists === 0) {
-				// For the first master playlist write, we use the normal root writer getter, so that the target
-				// returned by Output.target emits valid write events.
 				writer = await this.host.output._getRootWriter(true);
 			} else {
-				// For subsequent master playlist writes, we *must* obtain a different target in order to overwrite
-				// the file.
 				const target = await this.host.output._getTarget({
 					path: pathedTarget.rootPath,
 					isRoot: true,
@@ -761,7 +751,6 @@ export class HlsManifestEmitter implements ManifestEmitter {
 	async tryWriteMasterPlaylist(): Promise<void> {
 		assert(this.host.isLive);
 
-		// The master playlist is written once all playlists have either produced at least one segment or are done
 		for (const playlist of this.host.playlists) {
 			if (playlist.writtenSegments.length === 0 && !playlist.done) {
 				return;

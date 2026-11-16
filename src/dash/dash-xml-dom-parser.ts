@@ -8,7 +8,6 @@
 
 import { MalformedInputError, UnsupportedMediaError } from '../errors';
 import { escapeXmlText } from '../misc';
-// A minimal XML DOM for runtimes without `DOMParser`; it builds only what `parseMpd` reads
 
 /** @internal */
 export class XmlElement {
@@ -93,7 +92,6 @@ const decodeReferences = (text: string) => {
 export class MinimalDomParser {
 	parseFromString(source: string) {
 		const text = source
-			// CDATA first: its content may contain what would otherwise look like markup or comments
 			.replace(
 				/<!\[CDATA\[([\s\S]*?)\]\]>/g,
 				(_, data: string) => data.replaceAll('&', '&amp;').replaceAll('<', '&lt;'),

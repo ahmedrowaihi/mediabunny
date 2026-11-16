@@ -85,7 +85,6 @@ export const extractTimecodeFromHevcSei = (
 			const droppedFlag = bitstream.readBits(1);
 			const frames = bitstream.readBits(9);
 
-			// A partial timestamp states only the units it needs, each gated by the flag before it
 			let seconds = 0;
 			let minutes = 0;
 			let hours = 0;
@@ -150,8 +149,6 @@ export const extractTimecodeFromAvcSei = (
 
 			const bitstream = new Bitstream(payload);
 
-			// The delays come first and are only present when the VUI declared an HRD, which is also the
-			// only thing that states their width
 			if (sps.hrd) {
 				bitstream.skipBits(sps.hrd.cpbRemovalDelayLength + sps.hrd.dpbOutputDelayLength);
 			}
@@ -162,7 +159,6 @@ export const extractTimecodeFromAvcSei = (
 				continue;
 			}
 
-			// Only the first: the rest are the other fields of the same picture, at the same instant
 			if (!bitstream.readBits(1)) { // clock_timestamp_flag
 				continue;
 			}

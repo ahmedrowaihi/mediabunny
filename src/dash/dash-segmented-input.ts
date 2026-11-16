@@ -198,8 +198,6 @@ export class DashSegmentedInput extends SegmentedInput {
 		return result <= 50 ? 0 : result;
 	}
 
-	// A static MPD may carry availabilityStartTime for archival reasons but its segments are still
-	// presentation-time-relative; only dynamic MPDs anchor to the wall clock.
 	isWallClockTimeline(): boolean {
 		return this.context.isDynamic && this.context.availabilityStartTime !== null;
 	}
@@ -302,8 +300,6 @@ export class DashSegmentedInput extends SegmentedInput {
 			}
 
 			if (availabilityWindow !== null) {
-				// The window is stated against availabilityStartTime, so the period's own start has to be
-				// added back: a later period's segments are period-relative and would all fall before it.
 				const presentationStart = this.context.periodStart + (timeTicks - periodStartTicks) / timescale;
 				const presentationEnd = presentationStart + durationTicks / timescale;
 				if (presentationEnd < availabilityWindow.earliestPresentationTime) {
@@ -657,8 +653,6 @@ const liveSegmentWindow = (
 		elapsedSec,
 		context.timeShiftBufferDepth ?? LIVE_WINDOW_WITHOUT_BUFFER_DEPTH,
 	);
-	// The window ends at the live edge, so a stream whose availabilityStartTime is far in the past begins
-	// at the depth's worth before now rather than at the number the first segment ever had.
 	return {
 		firstIndex: Math.max(0, Math.floor(((elapsedSec - windowSec) * timescale) / segDuration)),
 		count: Math.max(0, Math.floor((windowSec * timescale) / segDuration)),

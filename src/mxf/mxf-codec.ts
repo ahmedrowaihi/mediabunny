@@ -28,9 +28,12 @@ const TAG_SOUND_ESSENCE_COMPRESSION = 0x3d06;
 
 const TAG_STORED_WIDTH = 0x3203;
 const TAG_STORED_HEIGHT = 0x3202;
+const TAG_SAMPLED_WIDTH = 0x3205;
+const TAG_SAMPLED_HEIGHT = 0x3204;
 const TAG_DISPLAY_WIDTH = 0x3209;
 const TAG_DISPLAY_HEIGHT = 0x3208;
 const TAG_FRAME_LAYOUT = 0x320c;
+const TAG_ASPECT_RATIO = 0x320e;
 
 const TAG_AUDIO_SAMPLING_RATE = 0x3d03;
 const TAG_CHANNEL_COUNT = 0x3d07;
@@ -53,7 +56,6 @@ const isCompressedPicture = (ul: Uint8Array) =>
  */
 export const pictureCodecOf = (ul: Uint8Array | undefined): VideoCodec | null => {
 	if (!ul || !isCompressedPicture(ul)) {
-		// Uncompressed picture (`04 01 02 01`) included: there is no codec name for raw frames here
 		return null;
 	}
 
@@ -91,7 +93,6 @@ export const pictureCodecOf = (ul: Uint8Array | undefined): VideoCodec | null =>
  */
 export const soundCodecOf = (descriptor: LocalSet): AudioCodec | null => {
 	const compression = descriptor.get(TAG_SOUND_ESSENCE_COMPRESSION);
-	// A label that is all zeroes is how some writers say "none" rather than omitting the field
 	const compressed = compression !== undefined && compression.some(byte => byte !== 0);
 	if (compressed) {
 		return null;
@@ -122,29 +123,35 @@ export type MxfPictureInfo = {
 /** @internal */
 export const readPictureInfo = (descriptor: LocalSet): MxfPictureInfo => {
 	const ul = descriptor.get(TAG_PICTURE_ESSENCE_CODING);
-	const codedWidth = asUint(descriptor.get(TAG_STORED_WIDTH) ?? new Uint8Array());
-	const codedHeight = asUint(descriptor.get(TAG_STORED_HEIGHT) ?? new Uint8Array());
-	const displayWidth = descriptor.has(TAG_DISPLAY_WIDTH)
-		? asUint(descriptor.get(TAG_DISPLAY_WIDTH)!)
-		: codedWidth;
-	const displayHeight = descriptor.has(TAG_DISPLAY_HEIGHT)
-		? asUint(descriptor.get(TAG_DISPLAY_HEIGHT)!)
-		: codedHeight;
 
-	// FrameLayout: 0 full frame, 1 separate fields, 2 one field, 3 mixed fields, 4 segmented frame
+	const pick = (display: number, sampled: number, stored: number) =>
+		descriptor.has(display)
+			? asUint(descriptor.get(display)!)
+			: descriptor.has(sampled)
+				? asUint(descriptor.get(sampled)!)
+				: asUint(descriptor.get(stored) ?? new Uint8Array());
+
+	const codedWidth = pick(TAG_DISPLAY_WIDTH, TAG_SAMPLED_WIDTH, TAG_STORED_WIDTH);
+	const codedHeight = pick(TAG_DISPLAY_HEIGHT, TAG_SAMPLED_HEIGHT, TAG_STORED_HEIGHT);
+
 	const layout = asUint(descriptor.get(TAG_FRAME_LAYOUT) ?? new Uint8Array([0]));
-	// Where the fields of a frame are stored apart, every height in the descriptor is a *field* height,
-	// so a frame is twice as tall. Measured on DV PAL: 720x288 stated for a 720x576 picture. A layout
-	// that stores one field only (2) is genuinely half a frame tall, so it is not doubled.
 	const fieldsPerFrame = layout === 1 || layout === 4 ? 2 : 1;
+	const frameHeight = codedHeight * fieldsPerFrame;
+
+	const aspect = descriptor.has(TAG_ASPECT_RATIO)
+		? asRational(descriptor.get(TAG_ASPECT_RATIO)!)
+		: null;
+	const displayWidth = aspect && aspect.num > 0 && aspect.den > 0
+		? Math.round(frameHeight * aspect.num / aspect.den)
+		: codedWidth;
 
 	return {
 		codec: pictureCodecOf(ul),
 		internalId: ul ? asKey(ul) : null,
 		displayWidth,
-		displayHeight: displayHeight * fieldsPerFrame,
+		displayHeight: frameHeight,
 		codedWidth,
-		codedHeight: codedHeight * fieldsPerFrame,
+		codedHeight: frameHeight,
 		interlaced: layout !== 0,
 	};
 };

@@ -67,7 +67,6 @@ export type PipelineTrackData = {
 	track: OutputTrack;
 	packets: EncodedPacket[];
 	playlist: Playlist;
-	// We must store it on the TrackData, reading it directly from the track leads to async race conditions!
 	closed: boolean;
 	info: {
 		type: 'video';
@@ -208,8 +207,6 @@ export type Playlist = {
 	mediaSequence: number;
 	done: boolean;
 
-	// Subtitle playlists only: their segments are cut on exactly these media boundaries, so a player
-	// can switch renditions at any segment.
 	subtitleBoundaries: { timestamp: number; duration: number }[] | null;
 
 	singleFile: {
@@ -232,9 +229,6 @@ export type Playlist = {
 		peakBitrate: number;
 	} | null;
 
-	// For HLS, having a single mutex is too coarse. Every playlist is basically independent and therefore we can have
-	// a per-playlist mutex instead of a per-muxer one. This means two packets from different playlists coming in don't
-	// block each other.
 	mutex: AsyncMutex;
 };
 
@@ -258,8 +252,6 @@ type FragmentedIsobmffOutput = {
 
 const segmentVideoMetadata = (videoTrack: PipelineVideoTrackData): VideoTrackMetadata => ({
 	...videoTrack.track.metadata,
-	// A segment output re-muxes packets whose SEI is already spliced in, so it must not inherit the
-	// track-wide caption declaration: a segment may legitimately hold none.
 	closedCaptions: undefined,
 	decoderConfig: videoTrack.info.decoderConfig,
 	primingPacket: videoTrack.info.primingPacket ?? undefined,
@@ -271,8 +263,6 @@ const segmentAudioMetadata = (audioTrack: PipelineAudioTrackData): AudioTrackMet
 	primingPacket: audioTrack.info.primingPacket ?? undefined,
 });
 
-// One output for a playlist's whole single file, rather than one per segment. The caller adds the
-// tracks and starts it.
 const openFragmentedIsobmffOutput = (segmentFormat: OutputFormat, target: Target): FragmentedIsobmffOutput => {
 	const fragmentedIsobmffOutput: FragmentedIsobmffOutput = {
 		output: new Output({ format: segmentFormat, target }),
@@ -287,12 +277,9 @@ const openFragmentedIsobmffOutput = (segmentFormat: OutputFormat, target: Target
 		fragmentedIsobmffOutput.currentFileSize = Math.max(fragmentedIsobmffOutput.currentFileSize, end);
 	});
 
-	// Make sure it never auto-finalizes fragments for us; we take full control of fragment
-	// finalization to line it up perfectly with segments
 	const muxer = fragmentedIsobmffOutput.output._muxer as IsobmffMuxer;
 	muxer.minimumFragmentDuration = Infinity;
 
-	// Intercept the first moof to determine init segment size
 	const originalOnMoof = muxer.formatOptions.onMoof;
 	muxer.formatOptions.onMoof = (data, position, timestamp) => {
 		fragmentedIsobmffOutput.firstMoofPosition = position;
@@ -303,8 +290,6 @@ const openFragmentedIsobmffOutput = (segmentFormat: OutputFormat, target: Target
 	return fragmentedIsobmffOutput;
 };
 
-// Cuts one fragment and returns its size. Everything before the first `moof` is the init segment, so
-// its extent is only known once that fragment exists.
 const finalizeFragmentedIsobmffSegment = async (playlist: Playlist): Promise<number> => {
 	const singleFile = playlist.singleFile;
 	assert(singleFile?.fragmentedIsobmffOutput);
@@ -428,7 +413,6 @@ export class SegmentPipelineMuxer extends Muxer implements HlsManifestEmitterHos
 	 * pipeline, multiple manifest formats fed off the same lifecycle.
 	 */
 	private manifestEmitters: ManifestEmitter[];
-	// Fixed per emitter class, and read for every packet, so it is settled once the emitters exist.
 	private mediaIsAddressedByItsOwnTimestamps: boolean;
 
 	constructor(
@@ -516,7 +500,6 @@ export class SegmentPipelineMuxer extends Muxer implements HlsManifestEmitterHos
 		this.placeUnpairedTracks('video', unpairedVideoTracks, groups, variantStreams);
 		this.placeUnpairedTracks('audio', unpairedAudioTracks, groups, variantStreams);
 
-		// Each declaration maps to one #EXT-X-MEDIA or #EXT-X-STREAM-INF tag in the final master playlist.
 		await this.declareGroupRenditions(groups);
 		const subtitleDeclarations = await this.declareSubtitleRenditions();
 		await this.declareVariants(variantStreams, subtitleDeclarations);
@@ -551,7 +534,6 @@ export class SegmentPipelineMuxer extends Muxer implements HlsManifestEmitterHos
 				hasVideo = true;
 			}
 
-			// Subtitles are never muxed into a media segment, so they take no part in pairing.
 			if (track.isSubtitleTrack()) {
 				continue;
 			}
@@ -579,7 +561,6 @@ export class SegmentPipelineMuxer extends Muxer implements HlsManifestEmitterHos
 					continue;
 				}
 
-				// Key-packets-only tracks can neither pair with nor be paired with other tracks
 				if (
 					(track.isVideoTrack() && track.metadata.hasOnlyKeyPackets)
 					|| (otherTrack.isVideoTrack() && otherTrack.metadata.hasOnlyKeyPackets)
@@ -748,8 +729,6 @@ export class SegmentPipelineMuxer extends Muxer implements HlsManifestEmitterHos
 			codecs.push(track.source._codec);
 		}
 
-		// WebVTT comes first so it wins the tie for a subtitle playlist against a configured format
-		// that also takes subtitle tracks; its zero media capacity keeps it out of every other playlist.
 		for (const format of [WEBVTT_SEGMENT_FORMAT, ...toArray(this.options.segmentFormat)]) {
 			const supportedCodecs = format.getSupportedCodecs();
 			const trackCounts = format.getSupportedTrackCounts();
@@ -781,8 +760,6 @@ export class SegmentPipelineMuxer extends Muxer implements HlsManifestEmitterHos
 			}
 		}
 
-		// We must find a format. If no format is found, that means we incorrectly gated track creation and
-		// assignment at an earlier step.
 		assert(candidate);
 
 		return candidate;
@@ -796,8 +773,6 @@ export class SegmentPipelineMuxer extends Muxer implements HlsManifestEmitterHos
 
 		let format = this.deduceSegmentFormat(tracks);
 
-		// This pipeline places media by mediaTimestampBase, so a segment muxer must not move it again.
-		// Stated on a copy: the format belongs to the caller, who may reuse it for another output.
 		if (format instanceof MpegTsOutputFormat && format._options.timestampOffset === undefined) {
 			format = new MpegTsOutputFormat({ ...format._options, timestampOffset: 0 });
 		}
@@ -885,7 +860,6 @@ export class SegmentPipelineMuxer extends Muxer implements HlsManifestEmitterHos
 
 	private async declareVariants(variantStreams: VariantStream[], subtitleDeclarations: PlaylistDeclaration[]) {
 		for (const variant of variantStreams) {
-			// Since tracks can only be assigned to one playlist, the first track's ID acts as a "playlist key"
 			let playlist = this.playlists.find(x => x.tracks[0]!.id === variant.tracks[0]!.id);
 			playlist ??= await this.registerPlaylist(variant.tracks);
 
@@ -934,8 +908,6 @@ export class SegmentPipelineMuxer extends Muxer implements HlsManifestEmitterHos
 					{ decoderConfig: track.metadata.decoderConfig },
 				);
 			} else if (track.isSubtitleTrack()) {
-				// Registered up front so a track that never produces a cue still yields an (empty) rendition
-				// instead of silently vanishing from the manifests.
 				this.getSubtitleTrackData(track);
 			}
 		}
@@ -971,11 +943,6 @@ export class SegmentPipelineMuxer extends Muxer implements HlsManifestEmitterHos
 		const release = await playlist.mutex.acquire();
 
 		try {
-			// Checked here rather than above: tracks are marked closed before the mutex is taken, so when a
-			// playlist holds several, the first close in already sees them all closed and finishes the
-			// playlist - flushing every queued packet, since nothing is added after a close - while the rest
-			// are still waiting on the mutex. `advancePlaylist` asserts a playlist is not done, so without
-			// this the second close of a video+audio playlist throws.
 			if (playlist.done) {
 				return;
 			}
@@ -1012,8 +979,6 @@ export class SegmentPipelineMuxer extends Muxer implements HlsManifestEmitterHos
 			info: {
 				type: 'video',
 				decoderConfig: meta.decoderConfig,
-				// No description means the sets can only be in band, whatever was stated; otherwise the
-				// caller's own word, and `'unstated'` where they gave none
 				parameterSets: !meta.decoderConfig.description
 					? 'inBand'
 					: track.metadata.parameterSets ?? 'unstated',
@@ -1175,8 +1140,6 @@ export class SegmentPipelineMuxer extends Muxer implements HlsManifestEmitterHos
 		const trackDatas = this.trackDatas.filter(x => playlist.tracks.includes(x.track));
 
 		if (playlist.currentSegmentStartTimestamp === null) {
-			// All tracks are known but we never received any data. Tracks that declared themselves up front are known
-			// before their first packet, so we can only call it a day once they're actually closed.
 			if (trackDatas.every(x => x.closed)) {
 				await this.onPlaylistDone(playlist);
 			}
@@ -1187,7 +1150,6 @@ export class SegmentPipelineMuxer extends Muxer implements HlsManifestEmitterHos
 		const videoTrack = trackDatas.find(x => x.info.type === 'video') as PipelineVideoTrackData | undefined;
 		const audioTrack = trackDatas.find(x => x.info.type === 'audio') as PipelineAudioTrackData | undefined;
 
-		// Same rule as the muxers, through the same base method.
 		const audioHasGoneQuiet = () => {
 			if (!audioTrack || !videoTrack || videoTrack.packets.length === 0) {
 				return false;
@@ -1196,7 +1158,6 @@ export class SegmentPipelineMuxer extends Muxer implements HlsManifestEmitterHos
 			return this.quietTrackMayBeSkipped(trackDatas, x => x.packets, x => x.timestamp);
 		};
 
-		// Loop in case we can finalize multiple segments
 		while (true) {
 			const cut = this.chooseSegmentCut(playlist, videoTrack, audioTrack, audioHasGoneQuiet);
 			if (cut === null) {
@@ -1204,7 +1165,6 @@ export class SegmentPipelineMuxer extends Muxer implements HlsManifestEmitterHos
 			}
 
 			if (cut.videoEndIndex === 0 && cut.audioEndIndex === 0) {
-				// No more segments to write - if all tracks are closed, this playlist is done
 				if (trackDatas.every(x => x.closed)) {
 					await this.onPlaylistDone(playlist);
 				}
@@ -1212,7 +1172,6 @@ export class SegmentPipelineMuxer extends Muxer implements HlsManifestEmitterHos
 				return;
 			}
 
-			// We can finalize a new segment!
 			const { segmentInfo, relativeSegmentPath, fullSegmentPath } = await this.openSegmentTarget(
 				playlist,
 				videoTrack,
@@ -1256,7 +1215,6 @@ export class SegmentPipelineMuxer extends Muxer implements HlsManifestEmitterHos
 		const currentSegmentEndTimestamp = statedBoundary
 			?? playlist.currentSegmentStartTimestamp + this.targetSegmentDuration;
 
-		// Anchored to the first segment's start; re-anchoring on each cut would compound the error.
 		if (playlist.segmentGridOrigin === null || playlist.nextSegmentId === 1) {
 			playlist.segmentGridOrigin = playlist.currentSegmentStartTimestamp;
 		}
@@ -1266,12 +1224,10 @@ export class SegmentPipelineMuxer extends Muxer implements HlsManifestEmitterHos
 		);
 		const gridBoundary = statedBoundary ?? gridOrigin + (elapsedGrids + 1) * this.targetSegmentDuration;
 
-		// These store the index (exclusive) until when packets can be added to the next segment
 		let videoEndIndex = 0;
 		let audioEndIndex = 0;
 
 		if (videoTrack && (!videoTrack.closed || videoTrack.packets.length > 0)) {
-			// A video track is active (and maybe an audio track too)
 			const allBelow = videoTrack.packets.every(x => x.timestamp < currentSegmentEndTimestamp);
 
 			let bestKeyPacket: EncodedPacket | null = null;
@@ -1279,11 +1235,9 @@ export class SegmentPipelineMuxer extends Muxer implements HlsManifestEmitterHos
 
 			if (allBelow) {
 				if (!videoTrack.closed) {
-					// Not enough data yet
 					return null;
 				}
 			} else {
-				// Find the best key packet timestamp
 				for (let i = 0; i < videoTrack.packets.length; i++) {
 					const packet = videoTrack.packets[i]!;
 
@@ -1302,7 +1256,6 @@ export class SegmentPipelineMuxer extends Muxer implements HlsManifestEmitterHos
 				videoEndIndex = bestKeyPacketIndex;
 
 				if (audioTrack) {
-					// The audio track must go at least until the video key frame
 					const index = audioTrack.packets.findIndex(x => x.timestamp >= bestKeyPacket!.timestamp);
 					if (index !== -1) {
 						audioEndIndex = index;
@@ -1319,15 +1272,12 @@ export class SegmentPipelineMuxer extends Muxer implements HlsManifestEmitterHos
 					return null;
 				}
 
-				// Include the entire rest of the video (since there's no key frame to split it on)
 				videoEndIndex = videoTrack.packets.length;
 				const maxIndex = arrayArgmax(videoTrack.packets, x => x.timestamp);
 				const maxPacket = videoTrack.packets[maxIndex];
 				assert(maxPacket);
 
 				if (audioTrack) {
-					// The audio must reach the next segment's start, or past the last video packet when
-					// that one lands later still
 					const index = maxPacket.timestamp < currentSegmentEndTimestamp
 						? audioTrack.packets.findIndex(x => x.timestamp >= currentSegmentEndTimestamp)
 						: audioTrack.packets.findIndex(x => x.timestamp > maxPacket.timestamp);
@@ -1342,21 +1292,15 @@ export class SegmentPipelineMuxer extends Muxer implements HlsManifestEmitterHos
 				}
 			}
 		} else if (audioTrack && (!audioTrack.closed || audioTrack.packets.length > 0)) {
-			// There's only an audio track active
-
 			const allBelow = audioTrack.packets.every(x => x.timestamp < gridBoundary);
 
 			if (allBelow) {
 				if (audioTrack.closed) {
-					// We can write all packets since they're all below
 					audioEndIndex = audioTrack.packets.length;
 				} else {
-					// We don't know enough packets yet
 					return null;
 				}
 			} else {
-				// Nearest the grid point, not the last that fits: a frame rarely divides the target, and
-				// always rounding the same way accumulates. See FORK.md.
 				const after = audioTrack.packets.findIndex(x => x.timestamp >= gridBoundary);
 				assert(after !== -1);
 				const earlier = audioTrack.packets[after - 1];
@@ -1389,9 +1333,6 @@ export class SegmentPipelineMuxer extends Muxer implements HlsManifestEmitterHos
 
 		if (this.singleFilePerPlaylist) {
 			if (playlist.singleFile === null) {
-				// INTENTIONALLY shadow the outside `segmentInfo` because we don't want to set it.
-				// In single-file mode, onSegment is called once in onPlaylistDone instead of per-segment,
-				// so the outer `segmentInfo` intentionally stays null in this case.
 				const segmentInfo: HlsOutputSegmentInfo = {
 					n: playlist.nextSegmentId,
 					format: playlist.segmentFormat,
@@ -1424,7 +1365,6 @@ export class SegmentPipelineMuxer extends Muxer implements HlsManifestEmitterHos
 
 					fragmentedIsobmffOutput = openFragmentedIsobmffOutput(playlist.segmentFormat, target);
 
-					// Add video track
 					if (videoTrack) {
 						fragmentedIsobmffOutput.videoSource = new EncodedVideoPacketSource(
 							(videoTrack.track as OutputVideoTrack).source._codec,
@@ -1435,7 +1375,6 @@ export class SegmentPipelineMuxer extends Muxer implements HlsManifestEmitterHos
 						);
 					}
 
-					// Add audio track
 					if (audioTrack) {
 						fragmentedIsobmffOutput.audioSource = new EncodedAudioPacketSource(
 							(audioTrack.track as OutputAudioTrack).source._codec,
@@ -1499,7 +1438,6 @@ export class SegmentPipelineMuxer extends Muxer implements HlsManifestEmitterHos
 		let cues: Scte35Section[] = [];
 		let mediaWindow: SegmentWindow | null = null;
 		const partStarts: { timestamp: number; independent: boolean }[] = [];
-		// Writer positions at the end of every part but the last, which ends with the segment
 		const partEnds: number[] = [];
 
 		let output: Output | null = null;
@@ -1513,7 +1451,6 @@ export class SegmentPipelineMuxer extends Muxer implements HlsManifestEmitterHos
 				videoSource = playlist.singleFile.fragmentedIsobmffOutput.videoSource;
 				audioSource = playlist.singleFile.fragmentedIsobmffOutput.audioSource;
 			} else {
-				// Create the output for this segment
 				output = new Output({
 					format: playlist.segmentFormat,
 					target: new PathedTarget(
@@ -1546,7 +1483,6 @@ export class SegmentPipelineMuxer extends Muxer implements HlsManifestEmitterHos
 				});
 
 				if (videoTrack) {
-					// Always add the track, no matter if it has packets or not (maintains underlying IDs)
 					videoSource = new EncodedVideoPacketSource(
 						(videoTrack.track as OutputVideoTrack).source._codec,
 					);
@@ -1554,15 +1490,12 @@ export class SegmentPipelineMuxer extends Muxer implements HlsManifestEmitterHos
 				}
 
 				if (audioTrack) {
-					// Always add the track, no matter if it has packets or not (maintains underlying IDs)
 					audioSource = new EncodedAudioPacketSource(
 						(audioTrack.track as OutputAudioTrack).source._codec,
 					);
 					output.addAudioTrack(audioSource, segmentAudioMetadata(audioTrack));
 
 					if (!playlist.segmentFormat.supportsTimestampedMediaData && audioEndIndex > 0) {
-						// The media itself carries no timestamps, so let's write an ID3v2 PRIV frame. The formats
-						// that the spec permits (MP3, ADTS) understand this just fine.
 						const firstTimestamp = this.toMediaTimestamp(audioTrack.packets[0]!.timestamp);
 						const pts = secondsToMpegTsTimestamp(firstTimestamp);
 
@@ -1579,12 +1512,7 @@ export class SegmentPipelineMuxer extends Muxer implements HlsManifestEmitterHos
 				await this.startInnerOutput(output, privTags);
 			}
 
-			// Add all of the packets
-
 			const muxer = output._muxer;
-			// The decode anchor is a property of the track, not of this segment: one muxer per segment
-			// would otherwise settle on zero for every segment after the first, whose `elst` then
-			// presents them all early by the first one's reorder delay
 			if (muxer instanceof IsobmffMuxer) {
 				muxer._seedDecodeAnchors(this.decodeAnchors);
 			}
@@ -1613,8 +1541,6 @@ export class SegmentPipelineMuxer extends Muxer implements HlsManifestEmitterHos
 					partEnds,
 				);
 
-			// After the packets, so an item lands behind the tables the segment's own muxer has by then
-			// written, and before the finalize that closes it
 			mediaWindow = this.segmentWindow(
 				playlist,
 				videoTrack,
@@ -1634,8 +1560,6 @@ export class SegmentPipelineMuxer extends Muxer implements HlsManifestEmitterHos
 				await output.finalize();
 			}
 
-			// After finalizing, not before: a track's anchor is only settled once its own queue has been
-			// flushed, and one track of a segment can be settled while another is not
 			if (muxer instanceof IsobmffMuxer) {
 				for (const [trackId, anchor] of muxer._decodeAnchors()) {
 					if (!this.decodeAnchors.has(trackId)) {
@@ -1682,19 +1606,15 @@ export class SegmentPipelineMuxer extends Muxer implements HlsManifestEmitterHos
 			audioTrack.packets.splice(0, audioEndIndex);
 		}
 
-		// The same window the segment's items were placed against, so what the playlist announces and
-		// where a cue went are one decision rather than two that agree by coincidence
 		const segmentDuration = mediaWindow
 			? mediaWindow.end - mediaWindow.start
 			: maxEndTimestamp - playlist.currentSegmentStartTimestamp;
 		assert(Number.isFinite(segmentDuration) && segmentDuration >= 0);
 
-		// On the input timeline, which is what the cut and the parts are expressed in
 		const nextSegmentStartTimestamp = playlist.currentSegmentStartTimestamp + segmentDuration;
 
 		let parts: SegmentPart[] | null = null;
 		if (partStarts.length > 0) {
-			// Only the shared single-file fMP4 output writes absolute positions; a per-segment output starts at 0
 			const segmentStartPos = playlist.singleFile?.fragmentedIsobmffOutput
 				? playlist.singleFile.nextOffset
 				: 0;
@@ -1736,7 +1656,6 @@ export class SegmentPipelineMuxer extends Muxer implements HlsManifestEmitterHos
 		if (playlist === this.subtitleBoundarySource) {
 			const boundary = { timestamp: playlist.currentSegmentStartTimestamp, duration: segmentDuration };
 
-			// Lock order: a media playlist's mutex is held here, so subtitle work must never take one back.
 			for (const subtitlePlaylist of this.subtitlePlaylists) {
 				subtitlePlaylist.subtitleBoundaries!.push(boundary);
 
@@ -1815,7 +1734,6 @@ export class SegmentPipelineMuxer extends Muxer implements HlsManifestEmitterHos
 		let videoIndex = 0;
 		let audioIndex = 0;
 
-		// Tracks go in by timestamp so that each fragment holds every track's samples for its span
 		while (videoIndex < videoEndIndex || audioIndex < audioEndIndex) {
 			const videoPacket = videoIndex < videoEndIndex ? videoTrack!.packets[videoIndex]! : null;
 			const audioPacket = audioIndex < audioEndIndex ? audioTrack!.packets[audioIndex]! : null;
@@ -1834,14 +1752,12 @@ export class SegmentPipelineMuxer extends Muxer implements HlsManifestEmitterHos
 					partEnds.push(await muxer.forceFragmentFinalization());
 				}
 
-				// A segment always begins on a key frame
 				partStarts.push({
 					timestamp: packet.timestamp,
 					independent: partStarts.length === 0 || !videoTrack || packet.type === 'key',
 				});
 			} else {
 				const partStart = partStarts[partStarts.length - 1]!;
-				// Presentation order differs from decode order with B-frames
 				partStart.timestamp = Math.min(partStart.timestamp, packet.timestamp);
 			}
 
@@ -1867,7 +1783,6 @@ export class SegmentPipelineMuxer extends Muxer implements HlsManifestEmitterHos
 			const pathedTarget = this.output._target;
 
 			if (playlist.initSegment) {
-				// We already have an init segment from a previous segment
 				return new NullTarget();
 			}
 
@@ -1975,10 +1890,7 @@ export class SegmentPipelineMuxer extends Muxer implements HlsManifestEmitterHos
 			const boundary = boundaries[0]!;
 			const segmentEnd = boundary.timestamp + boundary.duration;
 
-			// A cue starting at or after the boundary proves every cue of this segment has arrived. Writing
-			// before that point would drop cues that are still in flight.
 			if (!trackData.closed && !cues.some(cue => cue.timestamp >= segmentEnd)) {
-				// Unless the media ran on without them, which the muxers' own bound decides
 				const newestBoundary = last(boundaries)!;
 				const mediaRanAhead = newestBoundary.timestamp + newestBoundary.duration - segmentEnd;
 				if (mediaRanAhead <= this.maxInterleaveDelta) {
@@ -1996,7 +1908,6 @@ export class SegmentPipelineMuxer extends Muxer implements HlsManifestEmitterHos
 		}
 
 		if (cues.length > 0) {
-			// Cues may outlast the media; they get one trailing segment rather than being dropped.
 			const start = playlist.currentSegmentStartTimestamp ?? cues[0]!.timestamp;
 			const end = cues.reduce((max, cue) => Math.max(max, cue.timestamp + cue.duration), start);
 			await this.writeSubtitleSegment(playlist, trackData, start, end - start);
@@ -2005,8 +1916,6 @@ export class SegmentPipelineMuxer extends Muxer implements HlsManifestEmitterHos
 		await this.onPlaylistDone(playlist);
 	}
 
-	// A format writing its init inline repeats it per segment, so that playlist gets the same
-	// standalone-fMP4 treatment as media: one output for the file, one fragment per segment
 	private async openSubtitleSingleFile(playlist: Playlist, trackData: PipelineSubtitleTrackData) {
 		assert(this.output._target instanceof PathedTarget);
 		const pathedTarget = this.output._target;
@@ -2062,7 +1971,6 @@ export class SegmentPipelineMuxer extends Muxer implements HlsManifestEmitterHos
 		const pathedTarget = this.output._target;
 
 		const segmentEnd = timestamp + duration;
-		// The first segment swallows anything starting before the media did, so early cues aren't lost.
 		const segmentStart = playlist.nextSegmentId === 1 ? -Infinity : timestamp;
 		const cues = trackData.info.cues.filter(cue => cueOverlapsSegment(cue, segmentStart, segmentEnd));
 
@@ -2074,7 +1982,6 @@ export class SegmentPipelineMuxer extends Muxer implements HlsManifestEmitterHos
 		let relativeSegmentPath: string;
 
 		if (playlist.singleFile) {
-			// In single-file mode, onSegment is called once in onPlaylistDone instead of per-segment.
 			relativeSegmentPath = playlist.singleFile.path;
 		} else {
 			segmentInfo = {
@@ -2131,8 +2038,6 @@ export class SegmentPipelineMuxer extends Muxer implements HlsManifestEmitterHos
 			output.addSubtitleTrack(source, trackData.track.metadata);
 		}
 
-		// Where in the media timeline this segment sits is known to the playlist, not to any track,
-		// so it reaches the muxer directly rather than through a source.
 		if (playlist.segmentFormat instanceof WebvttSegmentFormat) {
 			const webvttMuxer = output._muxer as WebvttMuxer;
 			webvttMuxer.segmentStartTimestamp = timestamp;
@@ -2167,8 +2072,6 @@ export class SegmentPipelineMuxer extends Muxer implements HlsManifestEmitterHos
 			await this.options.onSegment?.(outputTarget, segmentInfo);
 		}
 
-		// Retain every cue that can still overlap a later segment; they must be repeated there. Dropping
-		// only a prefix would let one long cue pin every cue behind it in the buffer for its whole span.
 		trackData.info.cues = trackData.info.cues.filter(cue => cueOverlapsSegment(cue, segmentEnd, Infinity));
 
 		this.appendSegment(playlist, {
@@ -2213,9 +2116,6 @@ export class SegmentPipelineMuxer extends Muxer implements HlsManifestEmitterHos
 
 		playlist.writtenSegments.push({
 			...segment,
-			// Read before this segment's own cues are folded in: the segment that opens a break states
-			// it with a CUE-OUT of its own and is not yet "inside" one. A break with no stated duration
-			// has no position to report, and so gets no CONT.
 			breakState: open !== null && open.duration > 0 && elapsed < open.duration
 				? { elapsed, duration: open.duration }
 				: null,
@@ -2254,10 +2154,6 @@ export class SegmentPipelineMuxer extends Muxer implements HlsManifestEmitterHos
 			return null;
 		}
 
-		// The first packet left over by the cut, which is where the next segment opens. Not
-		// `maxEndTimestamp`: that is the furthest any track's last packet *reaches*, and an audio frame
-		// routinely overhangs the cut by a few milliseconds - measured on demo.mp4, cuts at 11.0000 and
-		// 13.0000 against ends of 11.0027 and 13.0080.
 		const nextStart = Math.min(
 			videoTrack && videoTrack.packets.length > videoEndIndex
 				? videoTrack.packets[videoEndIndex]!.timestamp
@@ -2268,12 +2164,7 @@ export class SegmentPipelineMuxer extends Muxer implements HlsManifestEmitterHos
 		);
 
 		return {
-			// The cut's own start, not the first packet's: a track can open the segment ahead of the
-			// others - audio priming runs some 20 ms before the first video frame - and the playlist
-			// states its duration from here. Taking one track's packet instead puts every later item
-			// that much past the boundary the player computes.
 			start: this.toMediaTimestamp(playlist.currentSegmentStartTimestamp),
-			// The last segment has no next packet, and then everything still queued belongs to it
 			end: this.toMediaTimestamp(Number.isFinite(nextStart) ? nextStart : maxEndTimestamp),
 		};
 	}
@@ -2290,10 +2181,6 @@ export class SegmentPipelineMuxer extends Muxer implements HlsManifestEmitterHos
 		const carriesInBand = muxer instanceof MpegTsMuxer;
 
 		placeInSegment(this.pendingScte35, playlist, window, (pending) => {
-			// One segment behind is a cue stated late, which `placeInSegment` puts here on purpose.
-			// Further behind is a different thing - a splice time on the caller's own timeline rather
-			// than the one the segments carry - and saying so is the difference between a late cue and a
-			// silently misplaced one.
 			if (
 				carriesInBand
 				&& pending.time !== null
@@ -2330,8 +2217,6 @@ export class SegmentPipelineMuxer extends Muxer implements HlsManifestEmitterHos
 	 */
 	writeScte35Section(section: Uint8Array, options: Scte35SectionOptions = {}) {
 		const read = parseSpliceInfoSection(section);
-		// The caller's own decision wins where it made one: which segmentation types open an avail is
-		// an origin's rule rather than this library's
 		const parsed: Scte35Section = {
 			...read,
 			outOfNetwork: options.outOfNetwork === undefined ? read.outOfNetwork : options.outOfNetwork,
@@ -2373,8 +2258,6 @@ export class SegmentPipelineMuxer extends Muxer implements HlsManifestEmitterHos
 
 				muxer.writePrivatePesPayload(pid, pending.time, pending.data);
 			} else if (muxer instanceof IsobmffMuxer) {
-				// Relative to the segment's own start, which is what a version 0 box states and what lets
-				// the segment be read without knowing where it sits in the presentation
 				muxer._addEmsg(buildEmsgBox({
 					schemeIdUri: ID3_EMSG_SCHEME,
 					timescale: MPEG_TS_TIMESCALE,
@@ -2421,7 +2304,6 @@ export class SegmentPipelineMuxer extends Muxer implements HlsManifestEmitterHos
 	}
 
 	private toMediaTimestamp(timestamp: number) {
-		// The media's own timestamps are decoupled from the input timestamps (which may well be huge Unix timestamps)
 		assert(this.firstPacketTimestamp !== null);
 		return timestamp - this.firstPacketTimestamp + this.mediaTimestampBase;
 	}
@@ -2434,7 +2316,6 @@ export class SegmentPipelineMuxer extends Muxer implements HlsManifestEmitterHos
 			if (playlist.singleFile.fragmentedIsobmffOutput) {
 				await playlist.singleFile.fragmentedIsobmffOutput.output.finalize();
 
-				// The index is only written during finalization, so it can't be read before this point.
 				const muxer = playlist.singleFile.fragmentedIsobmffOutput.output._muxer as IsobmffMuxer;
 				playlist.indexRange = muxer.sidxByteRange;
 			} else {
@@ -2453,8 +2334,6 @@ export class SegmentPipelineMuxer extends Muxer implements HlsManifestEmitterHos
 		const releases = await Promise.all(this.playlists.map(p => p.mutex.acquire()));
 		releases.forEach(release => release());
 
-		// Every track, not just those that produced data: a track that never received a sample has no
-		// trackData, and leaving it unclosed keeps its playlist waiting for a packet that cannot arrive.
 		for (const track of this.output.tracks) {
 			this.closedTracks.add(track);
 		}
@@ -2462,7 +2341,6 @@ export class SegmentPipelineMuxer extends Muxer implements HlsManifestEmitterHos
 			trackData.closed = true;
 		}
 
-		// Media playlists first: subtitles finish only once the boundary source is done.
 		await Promise.all(this.playlists.map(playlist => (
 			playlist.done || playlist.subtitleBoundaries ? Promise.resolve() : this.advancePlaylist(playlist)
 		)));
@@ -2471,9 +2349,6 @@ export class SegmentPipelineMuxer extends Muxer implements HlsManifestEmitterHos
 			playlist.done ? Promise.resolve() : this.advanceSubtitlePlaylist(playlist)
 		)));
 
-		// A cue whose splice never fell inside a segment: the stream ended before it, or its time was
-		// never on the timeline the segments carry. Saying so beats leaving a packager to wonder why its
-		// ad break never appeared.
 		const unplaced = this.pendingScte35.filter(pending => pending.placedIn.size === 0);
 		if (unplaced.length > 0) {
 			Logging._warn(
@@ -2522,8 +2397,6 @@ const validateInitPath = (path: string) => {
 	}
 };
 
-// No further segment can be cut from a playlist whose every track is closed and drained, so a segment
-// written in that state is its playlist's last. Checked after the segment's packets are consumed.
 const playlistIsDrained = (trackDatas: PipelineTrackData[]) =>
 	trackDatas.every(x => x.closed && x.packets.length === 0);
 

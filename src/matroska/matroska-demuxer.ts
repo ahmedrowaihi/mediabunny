@@ -1418,7 +1418,6 @@ export class MatroskaDemuxer extends Demuxer {
 						this.currentSegment.tracks.push(this.currentTrack);
 						this.currentSegment.idToTrack.set(this.currentTrack.id, this.currentTrack);
 					} else if (this.currentTrack.info.type === 'subtitle') {
-						// Matroska defines no TTML codec ID, so WebVTT is the only subtitle codec we can serve.
 						if (this.currentTrack.codecId === CODEC_STRING_MAP.webvtt) {
 							this.currentTrack.info.codec = 'webvtt';
 							this.currentTrack.info.config = {
@@ -3084,8 +3083,6 @@ class MatroskaSubtitleTrackBacking extends MatroskaTrackBacking implements Input
 
 		const block = location.cluster.trackData.get(this.internalTrack.id)!.blocks[location.blockIndex]!;
 
-		// Matroska's WebVTT mapping puts the cue settings, identifier and comment in BlockAddition 1,
-		// separated by line feeds, in that order.
 		const [settings, identifier, notes] = block.mainAdditional
 			? textDecoder.decode(block.mainAdditional).split('\n')
 			: [];

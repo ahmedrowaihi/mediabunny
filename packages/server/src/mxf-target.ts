@@ -165,14 +165,10 @@ class MxfSink {
 			muxerOptions['store_user_comments'] = this.options.storeUserComments ? '1' : '0';
 		}
 		if (this.options.bitexact) {
-			// The format flag, not a codec one: it is the muxer's random UMIDs that make two runs differ
 			muxerOptions['fflags'] = '+bitexact';
 		}
 
 		const startTimecode = this.options.startTimecode;
-		// `bitexact` fixes the UMIDs but not these: mxfenc stamps the Preface's LastModifiedDate and every
-		// Identification set's ModificationDate from the wall clock unless `creation_time` states one, so
-		// two runs either side of a second differ. Measured, and the default is the epoch for that reason.
 		const creationTime = this.options.creationTime === undefined ? new Date(0) : this.options.creationTime;
 		const metadata: Record<string, string> = {};
 		if (creationTime !== null) {
@@ -185,9 +181,6 @@ class MxfSink {
 		const muxer = await Muxer.open(this.path, {
 			format: 'mxf',
 			options: muxerOptions,
-			// The muxer's own `mxf` AVOptions carry neither of these; FFmpeg's CLI writes them as format
-			// metadata, which is what becomes the timecode track and the file's dates. `configure` is the
-			// one hook that runs after the streams exist and before the header is written.
 			configure: (context) => {
 				context.metadata = Dictionary.fromObject(metadata);
 			},
@@ -210,10 +203,6 @@ class MxfSink {
 		for (const stream of demuxer.streams) {
 			const index = muxer.addStream(stream);
 
-			// MXF reads its edit rate off the video stream, and `addStream` copies the input's *average*
-			// rate. Over a short or trimmed fragmented MP4 that average is a ratio like 300/13, which the
-			// muxer refuses outright: `Unsupported frame rate 300/13`. ffmpeg's own CLI fails the same way
-			// on the same file, so taking the base rate is the truth rather than a workaround.
 			if (stream.codecpar.codecType === AVMEDIA_TYPE_VIDEO) {
 				const output = muxer.getStream(index);
 				if (output && stream.rFrameRate.num > 0) {
@@ -221,8 +210,6 @@ class MxfSink {
 					output.rFrameRate = stream.rFrameRate;
 				}
 
-				// The muxer takes the descriptor's BitRate off the output stream, so this has to be the
-				// output's rather than the input's
 				if (output && this.options.videoBitRate !== undefined) {
 					output.codecpar.bitRate = BigInt(Math.round(this.options.videoBitRate));
 				}

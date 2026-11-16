@@ -232,7 +232,6 @@ export class H264VideoSliceHeaderParser implements VideoSliceHeaderParser {
 			readExpGolomb(bs); // pic_width_in_mbs_minus1
 			readExpGolomb(bs); // pic_height_in_map_units_minus1
 			const frameMbsOnlyFlag = bs.readBits(1) === 1;
-			// Remaining SPS fields are irrelevant to slice-header parsing.
 
 			this.spsMap.set(spsId, {
 				separateColourPlaneFlag,
@@ -260,7 +259,6 @@ export class H264VideoSliceHeaderParser implements VideoSliceHeaderParser {
 			const bottomFieldPicOrderInFramePresentFlag = bs.readBits(1) === 1;
 			const numSliceGroupsMinus1 = readExpGolomb(bs);
 			if (numSliceGroupsMinus1 > 1) {
-				// Slice groups (FMO) not supported — matches shaka.
 				return false;
 			}
 			const numRefIdxL0DefaultActiveMinus1 = readExpGolomb(bs);
@@ -417,7 +415,6 @@ export class H264VideoSliceHeaderParser implements VideoSliceHeaderParser {
 			} else if (idc === 2) {
 				readExpGolomb(bs); // long_term_pic_num
 			} else {
-				// idc === 3: end of list.
 				if (i === 0) {
 					throw new MalformedInputError('Empty ref_pic_list_modification');
 				}

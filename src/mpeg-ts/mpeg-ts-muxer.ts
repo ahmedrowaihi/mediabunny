@@ -217,8 +217,6 @@ export class MpegTsMuxer extends Muxer {
 		this.sdtInterval = format._options.sdtInterval ?? 0.5;
 		this.muxRate = format._options.muxRate ?? null;
 		this.service = format._options.service ?? null;
-		// The timed-metadata stream is an ordinary private stream whose descriptors this library knows,
-		// so it joins the declared ones rather than being a second mechanism
 		const timedMetadataPid = format._options.timedMetadataPid;
 		this.timedMetadataPid = timedMetadataPid ?? null;
 		this.privateStreams = [
@@ -489,7 +487,6 @@ export class MpegTsMuxer extends Muxer {
 		const codec = (trackData.track as OutputVideoTrack).source._codec;
 
 		if (codec === 'mpeg2') {
-			// Not a NAL stream: an AVC or HEVC access unit delimiter prepended here reads as a slice
 			return packet.data;
 		}
 
@@ -513,7 +510,6 @@ export class MpegTsMuxer extends Muxer {
 			? this.prepareAnnexBVideoPacket(packet.data, codec as 'avc' | 'hevc')
 			: this.prepareLengthPrefixedVideoPacket(trackData, packet, codec as 'avc' | 'hevc');
 
-		// After Annex B framing, so the parameter sets and AUD this adds stay clear, as the spec requires
 		const encryption = this.format._options.sampleAesEncryption;
 		return encryption ? sampleAesEncryptAnnexBAccessUnit(annexB, encryption) : annexB;
 	}
@@ -688,10 +684,6 @@ export class MpegTsMuxer extends Muxer {
 			.map(packet => packet.presentationTimestamp)
 			.sort((a, b) => a - b);
 
-		// Nothing stated: the i'th packet to decode presents no earlier than the i'th smallest presentation
-		// time, so that ladder is the decode order. It is lowered by the reorder delay, once for the whole
-		// batch, because clamping each packet to its own presentation time instead would hand two of them
-		// the same decode time, and no two access units decode at the same instant.
 		let reorderDelay = 0;
 		for (let i = 0; i < trackData.timestampProcessingQueue.length; i++) {
 			const queuedPacket = trackData.timestampProcessingQueue[i]!;
@@ -733,8 +725,6 @@ export class MpegTsMuxer extends Muxer {
 			for (const trackData of this.trackDatas) {
 				const head = trackData.packetQueue[0];
 				if (head) {
-					// sourceDecodeTimestamp too: a reordered track's own decode time is still provisional
-					// until enough of it has been seen, and the source may already state the real one
 					const decode = Math.min(
 						head.decodeTimestamp ?? head.presentationTimestamp,
 						head.sourceDecodeTimestamp,
@@ -800,8 +790,6 @@ export class MpegTsMuxer extends Muxer {
 			const queuedPacket = trackWithMinTimestamp.packetQueue.shift()!;
 			this.repeatTablesIfDue(queuedPacket);
 			this.writePcrIfDue(
-				// The decode timestamp, which is the clock the track's own PCRs are stamped from and the
-				// only one that rises monotonically in the order packets are written
 				queuedPacket.decodeTimestamp ?? queuedPacket.presentationTimestamp,
 				trackWithMinTimestamp.pid,
 			);
@@ -857,7 +845,6 @@ export class MpegTsMuxer extends Muxer {
 	private repeatTablesIfDue(packet: QueuedPacket) {
 		const now = packet.presentationTimestamp;
 
-		// `writeTables` has just written them, so each period starts here rather than at zero
 		this.lastPatTimestamp ??= now;
 		this.lastPmtTimestamp ??= now;
 		this.lastSdtTimestamp ??= now;
@@ -908,16 +895,12 @@ export class MpegTsMuxer extends Muxer {
 			return;
 		}
 
-		// A PCR track that has not written its first packet stamps the first PCR itself
 		if (this.lastPcrTimestamp === null && this.trackDatas.some(x => x.pid === this.pcrPid)) {
 			return;
 		}
 
-		// No track carries the clock, so the first PCR goes out here
 		let last: number = this.lastPcrTimestamp ?? now - this.pcrInterval;
 
-		// Where the clock will be next: the PCR track's own packet, or the interleave's position when
-		// that track has nothing left to say
 		const until = this.nextPcrTrackTimestamp() ?? now;
 
 		const field = this.adaptationFieldBuffer;
@@ -944,7 +927,6 @@ export class MpegTsMuxer extends Muxer {
 	private writeTables() {
 		assert(!this.tablesWritten);
 
-		// Track PIDs are handed out as tracks arrive, so a declared one can only be checked now
 		const used = new Map<number, string>([[PAT_PID, 'the PAT'], [this.pmtPid, 'the PMT']]);
 		if (this.service !== null) {
 			used.set(SDT_PID, 'the SDT');
@@ -973,7 +955,6 @@ export class MpegTsMuxer extends Muxer {
 		this.writeTableSections();
 		this.tablesWritten = true;
 
-		// Right behind the first PMT, which is where "before the first media packet" puts a cue
 		this.flushScte35Sections();
 	}
 
@@ -992,8 +973,6 @@ export class MpegTsMuxer extends Muxer {
 			);
 		}
 
-		// Queued either way, then written if the tables are already out. One path rather than two: the
-		// PMT cannot be built before a track has data, or it would name this cue stream and no media.
 		this.pendingScte35Sections.push(section);
 		this.flushScte35Sections();
 	}
@@ -1136,9 +1115,6 @@ export class MpegTsMuxer extends Muxer {
 			);
 		}
 
-		// One per access unit stays well inside the 0.1 s the spec allows. Only video states a decode
-		// timestamp, and the PCR track is whatever `pcrPid` names - an audio one would otherwise stamp
-		// every PCR NaN.
 		const carriesPcr = trackData.pid === this.pcrPid;
 		const pcrTimestamp = queuedPacket.decodeTimestamp ?? queuedPacket.presentationTimestamp;
 
@@ -1266,9 +1242,6 @@ export class MpegTsMuxer extends Muxer {
 		const elapsed = streamTime - (this.firstWrittenTimestamp ?? streamTime);
 		const target = Math.floor(elapsed * this.muxRate / (TS_PACKET_SIZE * 8));
 
-		// A burst runs ahead of the rate and the buffer absorbs it; past the allowance the media simply
-		// needs more than the rate, and writing it anyway would produce a stream that is not the rate it
-		// claims to be
 		const allowance = CBR_LEAD_ALLOWANCE * this.muxRate / (TS_PACKET_SIZE * 8);
 		if (this.packetsWritten > target + allowance) {
 			const needed = this.packetsWritten * TS_PACKET_SIZE * 8 / elapsed;
@@ -1374,8 +1347,6 @@ export class MpegTsMuxer extends Muxer {
 
 		await this.interleavePackets(true);
 
-		// Without this the file's last fraction of a second is missing, so its size over its duration
-		// comes out under the rate it claims
 		this.padTo(this.lastWrittenEndTimestamp);
 		await this.writer.flush();
 
@@ -1424,7 +1395,6 @@ const buildSdt = (
 	const view = toDataView(section);
 
 	section[0] = 0x42; // table_id: SDT for the actual transport stream
-	// section_syntax_indicator=1, reserved_future_use=1, reserved=11, section_length
 	view.setUint16(1, 0xF000 | (sectionLength & 0x0FFF), false);
 	view.setUint16(3, transportStreamId, false);
 	section[5] = 0xC1; // reserved=11, version_number=0, current_next_indicator=1
@@ -1434,9 +1404,7 @@ const buildSdt = (
 	section[10] = 0xFF; // reserved_future_use
 
 	view.setUint16(11, programNumber, false); // service_id, which is the program_number
-	// reserved_future_use=111111, EIT_schedule_flag=0, EIT_present_following_flag=0
 	section[13] = 0xFC;
-	// running_status=4 (running), free_CA_mode=0, descriptors_loop_length
 	view.setUint16(14, 0x8000 | (2 + descriptorLength), false);
 
 	section[16] = 0x48; // descriptor_tag: service_descriptor
@@ -1519,14 +1487,39 @@ const writePcr27Into = (buf: Uint8Array, offset: number, ticks27MHz: number) => 
 const writePcrInto = (buf: Uint8Array, offset: number, base90kHz: number) =>
 	writePcr27Into(buf, offset, base90kHz * 300);
 
+/**
+ * `audio_type` for an audio track, from ISO/IEC 13818-1 Table 2-61. This is the only place a track's
+ * accessibility disposition reaches a transport stream: there is no other field for it, and a receiver
+ * choosing between an ordinary mix and an accessible one reads this.
+ *
+ * The field holds **one** value, and the standard's codes are mutually exclusive, so a track flagged
+ * both ways has to collapse to one. Visual-impaired wins because it names a distinct programme element
+ * — an audio description is its own mix — where hearing-impaired describes how an ordinary mix is
+ * balanced.
+ */
+const audioTypeOf = (trackData: MpegTsTrackData): number => {
+	if (trackData.track.type !== 'audio') {
+		return 0x00;
+	}
+
+	const disposition = trackData.track.metadata.disposition;
+	if (disposition?.visuallyImpaired) {
+		return 0x03; // visual_impaired_commentary
+	}
+	if (disposition?.hearingImpaired) {
+		return 0x02; // hearing_impaired
+	}
+	return 0x00; // undefined
+};
+
 /** ISO/IEC 13818-1 2.6.18: tag, length, three ISO 639-2 characters, and `audio_type`. */
-const languageDescriptor = (languageCode: string) => new Uint8Array([
+const languageDescriptor = (languageCode: string, audioType: number) => new Uint8Array([
 	LANGUAGE_DESCRIPTOR_TAG,
 	4,
 	languageCode.charCodeAt(0),
 	languageCode.charCodeAt(1),
 	languageCode.charCodeAt(2),
-	0x00, // audio_type: undefined, which is what a track that only states a language means
+	audioType,
 ]);
 
 /**
@@ -1546,8 +1539,11 @@ const esDescriptorsOf = (trackData: MpegTsTrackData) => {
 	}
 
 	const languageCode = trackData.track.metadata.languageCode;
-	if (languageCode !== undefined && languageCode !== UNDETERMINED_LANGUAGE) {
-		descriptors.push(languageDescriptor(languageCode));
+	const audioType = audioTypeOf(trackData);
+	// An accessible track with no stated language still needs the descriptor: `und` is a language and
+	// the audio_type beside it is the part a receiver selects on
+	if ((languageCode !== undefined && languageCode !== UNDETERMINED_LANGUAGE) || audioType !== 0x00) {
+		descriptors.push(languageDescriptor(languageCode ?? UNDETERMINED_LANGUAGE, audioType));
 	}
 
 	return descriptors;
@@ -1582,7 +1578,15 @@ const buildPmt = (
 		totalEsBytes += 5 + CUEI_REGISTRATION_DESCRIPTOR.length;
 	}
 
-	const sectionLength = 9 + totalEsBytes + 4;
+	// SCTE 35 §8.1 puts the CUEI registration in the program's own descriptor loop, not only on the cue
+	// elementary stream, and a receiver reads it from there. libavformat keys on exactly that: its
+	// `prog_reg_desc` is filled from the program_info loop, and stream type 0x86 maps to SCTE-35 only
+	// when it equals "CUEI" (mpegts.c, `if (stream_type == STREAM_TYPE_SCTE_DATA_SCTE_35 &&
+	// prog_reg_desc == AV_RL32("CUEI"))`). With the registration on the ES alone, ffprobe shows the
+	// stream with codec_tag CUEI and no codec at all — the type is read and then not placed.
+	const programInfoLength = scte35Pid !== null ? CUEI_REGISTRATION_DESCRIPTOR.length : 0;
+
+	const sectionLength = 9 + programInfoLength + totalEsBytes + 4;
 	const section = new Uint8Array(3 + sectionLength - 4);
 	const view = toDataView(section);
 
@@ -1594,9 +1598,13 @@ const buildPmt = (
 	section[6] = 0x00; // section_number
 	section[7] = 0x00; // last_section_number
 	view.setUint16(8, 0xE000 | ((pcrPid ?? 0x1FFF) & 0x1FFF), false); // reserved=111, PCR_PID
-	view.setUint16(10, 0xF000, false); // reserved=1111, program_info_length=0
+	view.setUint16(10, 0xF000 | programInfoLength, false); // reserved=1111, program_info_length
 
 	let offset = 12;
+	if (scte35Pid !== null) {
+		section.set(CUEI_REGISTRATION_DESCRIPTOR, offset);
+		offset += CUEI_REGISTRATION_DESCRIPTOR.length;
+	}
 	for (const trackData of [...trackDatas].sort((a, b) => a.pid - b.pid)) { // In PID order
 		section[offset++] = trackData.streamType; // stream_type
 		view.setUint16(offset, 0xE000 | (trackData.pid & 0x1FFF), false); // reserved=111, elementary_PID

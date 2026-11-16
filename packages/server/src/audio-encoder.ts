@@ -74,7 +74,6 @@ export class NodeAvAudioEncoder extends CustomAudioEncoder {
 			codec === 'mp3' && numberOfChannels >= 1 && numberOfChannels <= 2
 			&& MP3_SAMPLE_RATES.includes(sampleRate)
 		) || (
-			// Layer II shares MPEG audio's rates and channel modes
 			codec === 'mp2' && numberOfChannels >= 1 && numberOfChannels <= 2
 			&& MP3_SAMPLE_RATES.includes(sampleRate)
 		) || (

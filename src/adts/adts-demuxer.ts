@@ -168,7 +168,6 @@ export class AdtsDemuxer extends Demuxer {
 		}
 
 		const sample: Sample = {
-			// Zero unless the file's leading ID3 PRIV frame stated a transport-stream timestamp
 			timestamp: this.firstTimestamp + this.nextTimestampInSamples / sampleRate,
 			duration: SAMPLES_PER_AAC_FRAME / sampleRate,
 			dataStart: header.startPos,

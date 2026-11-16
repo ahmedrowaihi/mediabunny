@@ -41,8 +41,6 @@ class RtmpSink {
 	publishedPackets = 0;
 
 	constructor(private readonly url: string) {
-		// Paused until read: ffmpeg pulls at its own rate, and pushing ahead of it would buffer the
-		// whole stream in this process rather than in the socket
 		this.source = new Readable({ read: () => this.wake() });
 
 		this.writable = new WritableStream<Uint8Array>({
@@ -71,7 +69,6 @@ class RtmpSink {
 			this.wake();
 		});
 
-		// push returns false when ffmpeg is behind, which is the backpressure a live publish needs
 		if (!this.source.push(Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength))) {
 			await new Promise<void>((resolve) => {
 				this.drained = resolve;
@@ -86,11 +83,7 @@ class RtmpSink {
 
 	/** @internal */
 	private async run() {
-		// The format is stated because a stream cannot be probed by seeking, and `options` is also what
-		// selects the Readable overload rather than the path/Buffer one
 		const demuxer = await Demuxer.open(this.source, { format: 'mp4' });
-		// No write bound to pass: `rw_timeout` is not an option the flv muxer takes, and rtmp ignores URL
-		// query options, so the connect and the writes are bounded by the protocol itself.
 		const muxer = await Muxer.open(this.url, { format: 'flv' });
 
 		const outputIndices = new Map<number, number>();
@@ -111,8 +104,6 @@ class RtmpSink {
 				}
 			}
 		} catch (error) {
-			// A server dropping the publish closes the socket, which libavformat reports as EIO: that is
-			// the end of a publish rather than a failure to make one
 			if (!isPeerClosed(error)) {
 				throw error;
 			}
@@ -128,7 +119,6 @@ class RtmpSink {
 		}
 		this.closed = true;
 
-		// Ends the demuxer's read, which is what lets the pump finish the file it is remuxing
 		this.source.push(null);
 		this.wake();
 		await this.pump?.catch(() => {});

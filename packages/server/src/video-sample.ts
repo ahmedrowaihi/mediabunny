@@ -218,8 +218,6 @@ export class AvFrameVideoSampleResource extends VideoSampleResource {
 	}
 }
 
-// Also applied to reffed frames: one taken straight from a filter graph would otherwise keep the color of the
-// source it no longer resembles
 export const applySampleColorToFrame = (sample: VideoSample, frame: NodeAv.Frame) => {
 	frame.colorPrimaries = mapColorPrimaries(sample.colorSpace.primaries ?? 'unknown')
 		?? NodeAv.AVCOL_PRI_UNSPECIFIED;
@@ -279,7 +277,6 @@ type FilterGraphEntry = {
 	busy: boolean;
 };
 
-// Building a graph costs about a third of what running it does, and every frame reuses the same chain
 const FILTER_GRAPH_CACHE_SIZE = 16;
 const filterGraphCache: FilterGraphEntry[] = [];
 
@@ -310,7 +307,6 @@ const buildFilterGraph = (srcArgs: string, chainString: string): FilterGraphEntr
 	}
 };
 
-// Never waits: queueing on a busy graph would serialise independent transcodes
 const takeIdleFilterGraph = (srcArgs: string, chainString: string): FilterGraphEntry | null => {
 	const key = `${srcArgs}|${chainString}`;
 	const index = filterGraphCache.findIndex(entry => entry.key === key && !entry.busy);
@@ -342,8 +338,6 @@ const returnFilterGraph = (entry: FilterGraphEntry) => {
 	filterGraphCache.push(entry);
 };
 
-// Reuse without flushing is only sound because every filter built here is 1:1 and non-delaying; a
-// buffering one would strand frames in the graph
 const pushThroughFilterGraph = async (
 	entry: FilterGraphEntry,
 	sample: VideoSample,
@@ -360,9 +354,6 @@ const pushThroughFilterGraph = async (
 
 	NodeAv.FFmpegError.throwIfError(await entry.sink.buffersinkGetFrame(dstFrame), 'buffersinkGetFrame');
 
-	// A buffer source states matrix and range but has no option for primaries or transfer, so the graph
-	// cannot carry them and the output comes back unspecified. Reading them off the source is only
-	// possible because KEEP_REF left it intact.
 	if (dstFrame.colorPrimaries === NodeAv.AVCOL_PRI_UNSPECIFIED) {
 		dstFrame.colorPrimaries = srcFrame.colorPrimaries;
 	}
@@ -388,8 +379,6 @@ export const transformVideoSample = async (
 	let srcFrameOwned = false;
 
 	if (sample._data instanceof AvFrameVideoSampleResource) {
-		// buffersrcAddFrame unrefs what it is handed, which would empty the frame for every other
-		// VideoSample cloned off this resource, so push a reference and let the graph consume that
 		srcFrame = new NodeAv.Frame();
 		srcFrame.alloc();
 		srcFrameOwned = true;
@@ -446,8 +435,6 @@ export const transformVideoSample = async (
 	chain.push('setsar=1');
 
 	try {
-		// Inside the try, because a closed sample makes this throw and the frame still has to be
-		// freed; everything below reads the copied frame, so it all moves in with it.
 		if (srcFrameOwned && !(sample._data instanceof AvFrameVideoSampleResource)) {
 			await copyVideoSampleToAvFrame(sample, srcFrame, null);
 		}
@@ -472,8 +459,6 @@ export const transformVideoSample = async (
 			}
 		}
 
-		// Matrix and range are libavfilter link properties, so a buffer source not stating them unstates them;
-		// read off srcFrame here because buffersrcAddFrame below unrefs it
 		const srcArgs = `video_size=${srcFrame.width}x${srcFrame.height}`
 			+ `:pix_fmt=${srcFrame.format}`
 			+ `:time_base=1/1000000`

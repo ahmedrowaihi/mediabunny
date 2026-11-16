@@ -4,6 +4,25 @@ import PluginExternalGlobal from 'esbuild-plugin-external-global';
 import { inlineWorkerPlugin } from './esbuild/inlined-workers.js';
 
 /** Creates UMD and ESM variants, each unminified and minified. */
+const LICENCE_BANNER = `/*!
+ * Copyright (c) 2026-present, Vanilagy and contributors
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ */`;
+
+/**
+ * `__dirname` for an ESM bundle, which has none — esbuild also compiles `import.meta.url` to an empty
+ * object in the CJS output, so neither form works in both and the source uses `__dirname` alone. Only
+ * the server bundle gets this: it imports `node:url` and `node:path`, which have no place in a browser
+ * bundle, and it is the only package that reads a file from beside itself.
+ */
+const ESM_DIRNAME_BANNER = `${LICENCE_BANNER}
+import { fileURLToPath as __fileURLToPath } from 'node:url';
+import { dirname as __pathDirname } from 'node:path';
+const __dirname = __pathDirname(__fileURLToPath(import.meta.url));`;
+
 const createVariants = async (
 	entryPoint: string,
 	globalName: string,
@@ -21,15 +40,7 @@ const createVariants = async (
 		logOverride: {
 			'import-is-undefined': 'silent', // Warning caused by the disabled "node.ts" import
 		},
-		banner: {
-			js: `/*!
- * Copyright (c) 2026-present, Vanilagy and contributors
- *
- * This Source Code Form is subject to the terms of the Mozilla Public
- * License, v. 2.0. If a copy of the MPL was not distributed with this
- * file, You can obtain one at https://mozilla.org/MPL/2.0/.
- */`,
-		},
+		banner: { js: LICENCE_BANNER },
 		legalComments: 'none',
 	};
 
@@ -303,6 +314,17 @@ const proresVariants = await createVariants(
 	},
 );
 
+// `turbores` is ESM-only - its `exports` states no `require` - so leaving it external made the CJS
+// bundle emit a `__require("turbores")` that no CommonJS consumer could resolve. It carries no native
+// addon, so it is inlined instead, and `@mediabunny/prores` with it: that package ships no CJS build, so
+// requiring it loads its `.mjs` and with it a second copy of Mediabunny. `node-av` stays external
+// because it does carry an addon.
+// `koffi` stays external for the same reason `node-av` does: it resolves a platform-specific native
+// addon for itself at runtime, and inlining it leaves a bundle whose `require` cannot find the binary.
+// The CJS bundle is what catches this - `the CommonJS bundle can actually be required` in
+// server-extension.test.ts fails on a loader error rather than on anything SRT-shaped.
+const SERVER_EXTERNALS = ['mediabunny', 'node-av', 'node-av/*', 'koffi'];
+
 const serverVariants = await createVariants(
 	'packages/server/src/index.ts',
 	'MediabunnyServer',
@@ -310,13 +332,14 @@ const serverVariants = await createVariants(
 	'cjs',
 	{
 		platform: 'node',
-		packages: 'external',
-		external: ['mediabunny', '@mediabunny/prores'],
+		external: SERVER_EXTERNALS,
 	},
 	{
+		// The libsrt binding resolves the build shipped in `prebuilt/` from this module's own directory,
+		// which an ESM bundle has no `__dirname` for
+		banner: { js: ESM_DIRNAME_BANNER },
 		platform: 'node',
-		packages: 'external',
-		external: ['mediabunny', '@mediabunny/prores'],
+		external: SERVER_EXTERNALS,
 	},
 );
 

@@ -374,7 +374,6 @@ export const hlsMediaPlaylist = (options: {
 	unknownTags: options.unknownTags ?? [],
 	notes: [],
 	wmPaceInfoUri: options.wmPaceInfoUri ?? null,
-	// Low-Latency HLS consumers expect version 9 or later once parts are present
 	version: options.segments.some(segment => segment.parts.length > 0) || (options.trailingParts?.length ?? 0) > 0
 		? Math.max(options.version ?? 0, 9)
 		: options.version ?? null,

@@ -2980,11 +2980,8 @@ export class SubtitleCueSink {
 		validateTimestamp(endTimestamp);
 
 		const packetSink = new EncodedPacketSink(this._track);
-		// The parts of a cue live in the packet bodies, so cues can never be recovered from metadata alone.
 		const packetOptions: PacketRetrievalOptions = { ...options, metadataOnly: false };
 
-		// The whole track is read before anything is yielded: a cue's last part can be arbitrarily far from
-		// its first, and only once every part is in can the cues be ordered by start timestamp.
 		const cuesByKey = new Map<string, SubtitleCue>();
 
 		for await (const packet of packetSink.packets(undefined, undefined, packetOptions)) {

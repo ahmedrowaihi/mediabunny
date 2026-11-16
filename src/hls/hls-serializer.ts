@@ -170,7 +170,6 @@ const streamInf = (v: HlsVariant): Tag => {
 	if (v.subtitlesGroup) {
 		tag.addQuotedString('SUBTITLES', v.subtitlesGroup);
 	}
-	// CLOSED-CAPTIONS is either a quoted group id or the bare enum NONE.
 	if (v.closedCaptionsGroup === 'NONE') {
 		tag.addString('CLOSED-CAPTIONS', 'NONE');
 	} else if (v.closedCaptionsGroup) {
@@ -447,8 +446,6 @@ const skipTag = (skip: HlsSkip): string => {
 	const tag = new Tag('#EXT-X-SKIP');
 	tag.addNumber('SKIPPED-SEGMENTS', skip.skippedSegments);
 	if (skip.recentlyRemovedDateRanges != null) {
-		// Present but empty is meaningful: the spec allows it and REQUIRES the attribute once any
-		// daterange was skipped. The IDs are tab-delimited inside one quoted string.
 		tag.addQuotedString('RECENTLY-REMOVED-DATERANGES', skip.recentlyRemovedDateRanges.join('\t'));
 	}
 
@@ -536,8 +533,6 @@ const segmentLines = (
 	prev: { keys: HlsKey[]; map: HlsMap | null; bitrate: number | null },
 ): string[] => {
 	const out: string[] = [];
-	// Each tag counts towards the discontinuity sequence number of every segment after it, so a run
-	// of them cannot be collapsed into one
 	for (let i = 0; i < Math.max(seg.discontinuitiesBefore, Number(seg.discontinuityBefore)); i++) {
 		out.push(new DiscontinuityEntry().toString());
 	}
@@ -565,7 +560,6 @@ const segmentLines = (
 	if (seg.gap) {
 		out.push(TAG_GAP);
 	}
-	// Before the segment's own tags, which is where they were read from
 	out.push(...seg.unknownTags);
 	out.push(...seg.parts.map(partTag));
 	const range = byteRangeValue(seg.byteRange);
@@ -582,7 +576,6 @@ const segmentLines = (
 	if (seg.tiles) {
 		out.push(tilesTag(seg.tiles).toString());
 	}
-	// A URI line is the line; a break in it turns the remainder into tags nobody wrote
 	if (/[\r\n]/.test(seg.uri)) {
 		throw new InvalidUsageError(`A segment URI cannot hold a line break; got ${JSON.stringify(seg.uri)}.`);
 	}

@@ -71,8 +71,6 @@ type BoxHeader = { type: string; start: number; size: number };
  * @public
  */
 export const variantLayoutOf = async (source: Source): Promise<VariantLayout> => {
-	// Held for the duration, as Input does: a caller releasing its ref mid-walk would dispose the source
-	// and the next of these many spread-out reads would throw
 	const ref = source.ref();
 	try {
 		return await walkLayout(source);
@@ -169,7 +167,6 @@ const segmentHeaders = (
 	const lastMdat = headers.filter(header => header.type === 'mdat').at(-1);
 	const mediaEnd = lastMdat === undefined ? fileSize : lastMdat.start + lastMdat.size;
 
-	// One fragment per moof, opening at the prelude run before it and closing at its mdat.
 	const fragments: (LayoutRange & { opensSegment: boolean })[] = [];
 	for (let i = firstSegmentBox; i < headers.length; i++) {
 		const header = headers[i]!;
@@ -192,7 +189,6 @@ const segmentHeaders = (
 		});
 	}
 
-	// Without any styp every fragment is a segment; with them, a styp is what opens one.
 	const anyStyp = fragments.some(fragment => fragment.opensSegment);
 	const segments: LayoutRange[] = [];
 	for (const fragment of fragments) {

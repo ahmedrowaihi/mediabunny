@@ -44,8 +44,6 @@ export class Tag {
 
 	/** Append a quoted string value. */
 	addQuotedString(key: string, value: string): this {
-		// Quoted-strings are not escapable (4.2), so a newline or quote ends the line or string early and
-		// turns the rest into tags the caller never wrote
 		if (/[\r\n"]/.test(value)) {
 			throw new InvalidUsageError(
 				`${key} cannot hold a line break or a double quote; got ${JSON.stringify(value)}.`,

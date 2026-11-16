@@ -45,8 +45,6 @@ export class TargetWriter {
 			throw new TypeError('target must be a Target.');
 		}
 
-		// The same claim an Output's Writer stakes, so a target cannot be driven by both: whichever
-		// comes second throws rather than interleaving two position counters into one stream.
 		if (target._writerAcquired) {
 			throw new InvalidUsageError(
 				'That Target is already being written to, by an Output or another TargetWriter.',
@@ -54,7 +52,6 @@ export class TargetWriter {
 		}
 
 		this._target = target;
-		// Append-only, which is what lets an append-only target accept these writes at all
 		this._target._setMonotonicity(true);
 		this._target._writerAcquired = true;
 	}

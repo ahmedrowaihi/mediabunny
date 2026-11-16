@@ -20,8 +20,6 @@ if ((globalThis as Record<symbol, unknown>)[MEDIABUNNY_LOADED_SYMBOL]) {
 		+ ' or if something is being bundled incorrectly.',
 	);
 }
-// A count rather than a flag: a second copy is what silently strands an extension's registered codecs on
-// the instance the caller is not holding, and the conversion that then discards every track can say so.
 (globalThis as Record<symbol, unknown>)[MEDIABUNNY_LOADED_SYMBOL]
 	= ((globalThis as Record<symbol, number>)[MEDIABUNNY_LOADED_SYMBOL] ?? 0) + 1;
 
@@ -101,12 +99,14 @@ export {
 	MediaStreamVideoTrackSource,
 	type MediaStreamVideoTrackSourceOptions,
 	SubtitleCueSource,
+	type SubtitleCueSourceOptions,
 	TextSubtitleSource,
 	VideoSampleSource,
 } from './media-source';
 export {
 	type SubtitleConfig,
 	type SubtitleCue,
+	type TtmlProfile,
 	type SubtitleMetadata,
 } from './subtitles';
 export {
@@ -194,6 +194,7 @@ export {
 	type EventListenerOptions,
 	type FilePath,
 	type MaybePromise,
+	type WideVideoColorSpaceInit,
 } from './misc';
 export {
 	Logging,
@@ -880,8 +881,10 @@ export {
 	extractLayerIdForHevc,
 	extractTemporalIdForHevc,
 	inspectHevcLayers,
+	parseHevcVpsExtension,
+	parseLhvcConfigRecord,
 } from './mvhevc';
-export type { HevcLayerInfo } from './mvhevc';
+export type { HevcLayerInfo, HevcVpsLayerInfo, LhvcConfig } from './mvhevc';
 export { StatMux } from './statmux';
 export type { StatMuxOptions, StatMuxProgram } from './statmux';
 export { MptsMultiplexer } from './mpeg-ts/mpts-multiplexer';

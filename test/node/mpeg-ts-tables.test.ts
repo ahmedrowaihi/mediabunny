@@ -211,6 +211,73 @@ const esEntriesOf = (payload: Uint8Array): string[] => {
 	return entries;
 };
 
+/** The ISO 639 language descriptor on each ES, as `pid -> "lang/audio_type"`, from a PMT section. */
+const languageDescriptorsOf = (payload: Uint8Array): Map<number, string> => {
+	const programInfoLength = ((payload[10]! & 0x0f) << 8) | payload[11]!;
+	const sectionLength = ((payload[1]! & 0x0f) << 8) | payload[2]!;
+	const end = 3 + sectionLength - 4;
+	const found = new Map<number, string>();
+
+	let at = 12 + programInfoLength;
+	while (at + 5 <= end) {
+		const pid = ((payload[at + 1]! & 0x1f) << 8) | payload[at + 2]!;
+		const esInfoLength = ((payload[at + 3]! & 0x0f) << 8) | payload[at + 4]!;
+		let descriptor = at + 5;
+		const esEnd = descriptor + esInfoLength;
+		while (descriptor + 2 <= esEnd) {
+			const tag = payload[descriptor]!;
+			const length = payload[descriptor + 1]!;
+			if (tag === 0x0a && length >= 4) {
+				const language = String.fromCharCode(
+					payload[descriptor + 2]!, payload[descriptor + 3]!, payload[descriptor + 4]!,
+				);
+				found.set(pid, `${language}/${payload[descriptor + 5]!}`);
+			}
+			descriptor += 2 + length;
+		}
+		at = esEnd;
+	}
+
+	return found;
+};
+
+// audio_type is the only field a transport stream has for an accessibility mix (ISO/IEC 13818-1 Table
+// 2-61), so a disposition that never reaches it is a disposition a receiver cannot act on.
+test('an accessibility disposition reaches the language descriptor\'s audio_type', async () => {
+	const { video, audio } = await onePacketEach();
+
+	const audioTypeFor = async (disposition: { hearingImpaired?: boolean; visuallyImpaired?: boolean }) => {
+		const output = new Output({ format: new MpegTsOutputFormat(), target: new BufferTarget() });
+		const videoSource = new EncodedVideoPacketSource('avc');
+		const audioSource = new EncodedAudioPacketSource('aac');
+		output.addVideoTrack(videoSource, { languageCode: 'deu' });
+		output.addAudioTrack(audioSource, { languageCode: 'fra', disposition });
+		await output.start();
+		await videoSource.add(video.packet, { decoderConfig: video.config });
+		await audioSource.add(audio.packet, { decoderConfig: audio.config });
+		await output.finalize();
+
+		const pmt = sectionsOf(new Uint8Array(output.target.buffer!)).find(s => s.pid !== PAT_PID)!;
+		return languageDescriptorsOf(pmt.payload);
+	};
+
+	const plain = await audioTypeFor({});
+	const hearing = await audioTypeFor({ hearingImpaired: true });
+	const visual = await audioTypeFor({ visuallyImpaired: true });
+	// The field holds one value, and the standard's codes are mutually exclusive
+	const both = await audioTypeFor({ hearingImpaired: true, visuallyImpaired: true });
+
+	const audioPid = [...plain.keys()].find(pid => plain.get(pid)!.startsWith('fra'))!;
+	expect(plain.get(audioPid)).toBe('fra/0');
+	expect(hearing.get(audioPid)).toBe('fra/2');
+	expect(visual.get(audioPid)).toBe('fra/3');
+	expect(both.get(audioPid)).toBe('fra/3');
+
+	// Only audio carries an audio_type; the same flags on video state nothing
+	const videoPid = [...plain.keys()].find(pid => plain.get(pid)!.startsWith('deu'))!;
+	expect(visual.get(videoPid)).toBe('deu/0');
+}, 60_000);
+
 /** One video and one audio packet with their configs, taken from the checked-in demo file. */
 const onePacketEach = async () => {
 	using source = new Input({
@@ -684,3 +751,39 @@ test('a stream carrying cue sections and null packets is continuous too', async 
 	expect(packetsOf(bytes).some(p => p.pid === 0x1fff)).toBe(true);
 	expect(continuityErrors(bytes)).toEqual([]);
 }, 300_000);
+
+// The PMT is written here, so the only thing that settles whether a receiver *reads* a cue stream as one
+// is a receiver. ffprobe reports a PID it cannot place as `unknown`, which is the symptom this answers.
+test('ffprobe reads the SCTE-35 PID as a cue stream, not as unknown', async () => {
+	const probe = (() => {
+		try {
+			execFileSync('ffprobe', ['-version'], { stdio: 'ignore' });
+			return true;
+		} catch (error) {
+			return (error as { code?: string }).code !== 'ENOENT';
+		}
+	})();
+	if (!probe) {
+		return;
+	}
+
+	const bytes = await buildStream();
+	const directory = mkdtempSync(path.join(tmpdir(), 'scte35-'));
+	const file = path.join(directory, 'cue.ts');
+
+	try {
+		writeFileSync(file, bytes);
+		const streams = JSON.parse(execFileSync('ffprobe', [
+			'-v', 'quiet', '-print_format', 'json', '-show_streams', file,
+		], { encoding: 'utf8' })) as { streams: { codec_name?: string; id?: string }[] };
+
+		const names = streams.streams.map(s => s.codec_name ?? 'none');
+		// 0x1f00 is the PID buildStream declares; ffprobe prints stream ids in hex
+		const cue = streams.streams.find(s => s.id === '0x1f00');
+
+		expect(cue, `no stream at the SCTE-35 PID; ffprobe saw ${JSON.stringify(names)}`).toBeDefined();
+		expect(cue!.codec_name, `ffprobe saw ${JSON.stringify(names)}`).toBe('scte_35');
+	} finally {
+		rmSync(directory, { recursive: true, force: true });
+	}
+}, 60_000);

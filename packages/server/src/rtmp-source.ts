@@ -15,9 +15,6 @@ import { Writable } from 'node:stream';
 /** Microseconds. */
 const PER_SECOND = 1e6;
 
-// `rw_timeout` bounds one read rather than the session, so it is given the bound unscaled: below it a stall
-// in a healthy stream is cut mid-packet, above it an ended stream takes longer to notice. See FORK.md.
-
 // Without `delay_moov` the header is written before any packet is seen, so every track's first
 // fragment starts at zero and the A/V offset is lost.
 const MOVFLAGS = 'frag_keyframe+empty_moov+default_base_moof+delay_moov';
@@ -58,15 +55,12 @@ export type RtmpSourceOptions = {
 
 type Resolved = Required<Omit<RtmpSourceOptions, 'maxCacheSize'>>;
 
-// rtmp ignores URL query options, so bounds and listen mode travel as real AVOptions.
 const inputOptions = (options: Resolved): Record<string, string> => {
 	const result: Record<string, string> = {
 		rw_timeout: String(Math.max(1, Math.round(options.readTimeout * PER_SECOND))),
 	};
 	if (options.mode === 'listener') {
 		result['listen'] = '1';
-		// Seconds here, unlike every other bound in this file. Listener only: rtmp reads `timeout` as
-		// implying listen mode, so giving it to a caller makes the caller try to bind.
 		result['timeout'] = String(Math.max(1, Math.round(options.connectTimeout)));
 	}
 	return result;
@@ -101,7 +95,7 @@ class RtmpStreamReader {
 		try {
 			this.controller?.close();
 		} catch {
-			// Already closed or errored; nothing to end
+			// Already closed
 		}
 	}
 
@@ -126,8 +120,6 @@ class RtmpStreamReader {
 			}
 
 			this.silent = true;
-			// Closed here rather than at the next `pull`, or a consumer that is not asking would leave the
-			// stream open until the backstop fired
 			clearInterval(this.silenceTimer);
 			this.closeOnce();
 			this.wake();
@@ -138,8 +130,6 @@ class RtmpStreamReader {
 	private sink() {
 		return new Writable({
 			write: (chunk: Buffer, _encoding, callback) => {
-				// `closed` as well as `canceled`: the silence clock may have ended the stream mid-fragment,
-				// and enqueuing onto a closed controller throws back into the pump
 				if (!this.canceled && !this.closed) {
 					this.lastByteAt = Date.now();
 					this.controller?.enqueue(new Uint8Array(chunk));
@@ -163,8 +153,6 @@ class RtmpStreamReader {
 			this.pendingOpen = null;
 		}
 
-		// A callback-backed muxer context is freed rather than closed, so there is no socket here to race
-		// a cancel against; the demuxer's read is the only thing cancel has to wait for
 		const muxer = await Muxer.open(this.sink(), {
 			format: 'mp4',
 			options: {
@@ -193,16 +181,10 @@ class RtmpStreamReader {
 				}
 			}
 		} catch (error) {
-			// A publisher going away is how a live publish normally ends, and it ends by closing the socket -
-			// which libavformat reports as EIO, having no EOF for one. node-av 6.2 stopped translating a read
-			// failure into a clean end of stream, so that arrives here as an error and has to be read as the end.
 			if (!isPeerClosed(error)) {
 				throw error;
 			}
 		} finally {
-			// A fragmented muxer holds the fragment it is building until a flush point, so every packet
-			// after the last one is inside the muxer when the publisher goes away. Closing writes it out,
-			// and the sink still enqueues here because the stream is only ended once this returns.
 			await muxer.close().catch(() => {});
 		}
 	}
@@ -226,8 +208,6 @@ class RtmpStreamReader {
 				this.wake();
 			});
 
-		// Resolves on the next chunk rather than immediately: the pump enqueues on its own schedule, and
-		// returning now would have the stream call `pull` in a loop
 		return new Promise<void>((resolve) => {
 			this.notify = resolve;
 		});
@@ -237,13 +217,10 @@ class RtmpStreamReader {
 		this.canceled = true;
 		clearInterval(this.silenceTimer);
 
-		// A pending accept outlives a close
 		if (this.options.mode === 'listener' && this.pendingOpen) {
 			await wakePendingAccept(this.url);
 		}
 
-		// The pump is parked inside a native read that nothing can interrupt, and closing the demuxer
-		// under it aborts the process. Waiting is bounded by the read timeout; see FORK.md.
 		await this.pump?.catch(() => {});
 		await this.demuxer?.close().catch(() => {});
 	}
@@ -255,7 +232,6 @@ const openStream = (url: string, options: Resolved): ReadableStream<Uint8Array> 
 	return new ReadableStream<Uint8Array>({
 		pull: controller => reader.pull(controller),
 		cancel: () => reader.cancel(),
-	// Room to run ahead of the consumer, as a live publisher does not wait.
 	}, { highWaterMark: 64 });
 };
 

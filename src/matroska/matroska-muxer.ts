@@ -841,8 +841,6 @@ export class MatroskaMuxer extends Muxer {
 			} else if (trackData.type === 'audio') {
 				return trackData.info.decoderConfig.codec;
 			} else {
-				// Matroska defines no TTML codec ID, so the format declares no support and the track is
-				// refused long before it can reach here.
 				assert(trackData.track.source._codec === 'webvtt');
 				return 'wvtt';
 			}
@@ -1251,7 +1249,6 @@ export class MatroskaMuxer extends Muxer {
 
 		// We wanna only finalize this cluster (and begin a new one) if we know that each track will be able to
 		// start the new one with a key frame.
-		// Asked at most once, and only for a track that has nothing queued: this runs per chunk.
 		let quietSkippable: boolean | null = null;
 		const keyFrameQueuedEverywhere = this.trackDatas.every((otherTrackData) => {
 			if (trackData === otherTrackData) {
@@ -1263,8 +1260,6 @@ export class MatroskaMuxer extends Muxer {
 				return firstQueuedSample.type === 'key';
 			}
 
-			// A quiet track must not hold the cluster open either, or nothing reaches the target until the
-			// cluster hits its maximum length. Starting on a delta frame is already accepted below.
 			return this.closedTracks.has(otherTrackData.track) || (quietSkippable ??= this.quietTrackMayBeSkipped(
 				this.trackDatas,
 				x => x.chunkQueue,

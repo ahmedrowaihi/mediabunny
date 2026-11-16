@@ -72,7 +72,6 @@ export const concatMpdPeriods = (inputs: MpdConcatInput[]): MpdConcatResult => {
 		return root;
 	});
 
-	// Taken before the output root is cleared below: input 0's root is that same element.
 	const imported = roots.map((root, idx) => {
 		const period = root.children.find(child => child.localName === 'Period');
 		if (period === undefined) {
@@ -88,7 +87,6 @@ export const concatMpdPeriods = (inputs: MpdConcatInput[]): MpdConcatResult => {
 	});
 
 	const outRoot = roots[0]!;
-	// Non-Period children (e.g. <UTCTiming>, <ProgramInformation>) stay untouched.
 	const kept = outRoot.children.filter(child => child.localName !== 'Period');
 	outRoot.children.length = 0;
 	outRoot.children.push(...kept);

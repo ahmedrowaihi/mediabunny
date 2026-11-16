@@ -152,8 +152,6 @@ export const readHeaderMetadataSets = (slice: FileSlice) => {
 
 		const type = setTypeOf(header.key);
 		if (type === null) {
-			// Past the metadata: the essence, an index table segment, or the next partition pack. The
-			// slice is left at this item's key so a caller can carry on reading from it.
 			slice.skip(header.start - slice.filePos);
 			break;
 		}

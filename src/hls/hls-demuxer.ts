@@ -290,7 +290,6 @@ export class HlsDemuxer extends Demuxer {
 				const averageBandwidth = variant.averageBandwidth;
 				const name = variant.name;
 
-				// Several strings for one codec differ only in profile or level, so none describes this track
 				const resolveCodec = async (typeStrings: string[], type: 'video' | 'audio') => {
 					if (typeStrings.length === 0) {
 						return null;
@@ -378,7 +377,6 @@ export class HlsDemuxer extends Demuxer {
 								demuxer: this,
 								backingTrack: null,
 								default: mediaTag.media.default === true,
-								// Autoselect is inferred to be true if the default is true
 								autoselect: mediaTag.media.default === true || mediaTag.media.autoselect === true,
 								languageCode: preprocessLanguageCode(mediaTag.media.language),
 								lineNumber: mediaTag.lineNumber,
@@ -441,7 +439,6 @@ export class HlsDemuxer extends Demuxer {
 								demuxer: this,
 								backingTrack: null,
 								default: mediaTag.media.default === true,
-								// Autoselect is inferred to be true if the default is true
 								autoselect: mediaTag.media.default === true || mediaTag.media.autoselect === true,
 								languageCode: preprocessLanguageCode(mediaTag.media.language),
 								lineNumber: mediaTag.lineNumber,
@@ -462,8 +459,6 @@ export class HlsDemuxer extends Demuxer {
 					}
 				}
 
-				// In the order CODECS lists them: track ids follow the order declarations are added, and a
-				// playlist that names its audio first used to get the lower id.
 				const firstVideo = inferredPerString.findIndex(x =>
 					x.inferred !== null && VIDEO_CODECS.includes(x.inferred as VideoCodec));
 				const firstAudio = inferredPerString.findIndex(x =>
@@ -592,7 +587,6 @@ export class HlsDemuxer extends Demuxer {
 
 		assert(this.internalTracks);
 
-		// Key-only renditions are a poor reference but may be all there is: this fork reads
 		// #EXT-X-I-FRAMES-ONLY playlists, and a master listing only those left nothing to choose
 		const fullTracks = this.internalTracks.filter(x => !x.hasOnlyKeyPackets);
 		const candidates = fullTracks.length > 0 ? fullTracks : this.internalTracks;
@@ -690,7 +684,6 @@ abstract class HlsInputTrackBacking extends SegmentedTrackBacking<InternalTrack>
 	}
 
 	protected isPrimary(): boolean {
-		// Meanings are swapped in HLS: "default" means the track is the primary one.
 		return this.internalTrack.default;
 	}
 }

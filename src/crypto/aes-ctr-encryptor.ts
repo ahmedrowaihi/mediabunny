@@ -20,8 +20,6 @@ const node = typeof nodeAlias !== 'undefined'
 	? nodeAlias // Aliasing it prevents some bundler warnings
 	: undefined!;
 
-// crypt() also runs in browsers, where this module is stubbed or shimmed inconsistently — Vite serves
-// a `crypto` object without the ciphers — so only the function itself is worth testing for
 const nativeCrypto: typeof nodeAlias.crypto | undefined
 	= typeof node?.crypto?.createCipheriv === 'function' ? node.crypto : undefined;
 

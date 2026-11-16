@@ -584,7 +584,6 @@ export const edts = (trackData: IsobmffTrackData) => {
 	const emptyDuration = Math.max(0, intoTimescale(offset, GLOBAL_TIMESCALE));
 	const mediaTime = intoTimescale(Math.max(0, offset) - trackData.firstDecodeTimestamp, trackData.timescale);
 
-	// For fragmented files this is zero, which simply means "unknown duration" in this case. Spec:
 	// "the segment_duration of this edit may be zero"
 	const mediaDuration = Math.max(
 		0,
@@ -740,8 +739,6 @@ export const stbl = (trackData: IsobmffTrackData) => {
 	const needsCtts = trackData.compositionTimeOffsetTable.length > 1
 		|| trackData.compositionTimeOffsetTable.some(x => x.sampleCompositionTimeOffset !== 0);
 
-	// A fragmented file has no sample table to take the decode-to-composition shift from, so a reader has
-	// to bound it by the codec's reorder depth. Stating the decode timeline makes it exactly zero.
 	const statesZeroShift = trackData.muxer.isFragmented && trackData.statesDecodeTimeline === true;
 
 	return box('stbl', undefined, [
@@ -1749,7 +1746,6 @@ const baseMediaDecodeTime = (chunk: { samples: { decodeTimestamp: number }[] }) 
 		lowest = Math.min(lowest, sample.decodeTimestamp);
 	}
 
-	// tfdt is unsigned, so a timeline reaching below zero would wrap rather than fail
 	assert(lowest >= 0);
 
 	return lowest;
@@ -2233,7 +2229,6 @@ const videoCodecToBoxName = (
 	isQuickTime: boolean,
 	doviConfig?: DoviConfig,
 ) => {
-	// QuickTime's own AVC-Intra entries, which ffmpeg selects itself and which override any other naming
 	if (avcIntraEntry !== null) {
 		return avcIntraEntry;
 	}
@@ -2259,7 +2254,6 @@ const videoCodecToBoxName = (
 		case 'vp9': return 'vp09';
 		case 'av1': return 'av01';
 		case 'prores': return fullCodecString;
-		// QuickTime's own entry, which ffmpeg writes for `-f mov`, against the generic MPEG-4 visual one
 		case 'mpeg2': return isQuickTime ? 'm2v1' : 'mp4v';
 		case 'qtrle': return 'rle ';
 		case 'png': return 'png ';
@@ -2293,7 +2287,6 @@ export const declaredVideoCodec = (
 		return codecString;
 	}
 
-	// A manifest never carries an AVC-Intra entry: those are QuickTime's, and QuickTime is not segmented
 	const fourcc = videoCodecToBoxName(
 		codec, codecString, parameterSets, null, segmentFormat instanceof MovOutputFormat,
 	);
@@ -2308,8 +2301,6 @@ const VIDEO_CODEC_TO_CONFIGURATION_BOX: Record<
 	VideoCodec,
 	((trackData: IsobmffVideoTrackData) => Box | null) | null
 > = {
-	// An AVC-Intra entry carries no `avcC` at all - the parameter sets travel in the samples, which is what
-	// makes the entry self-describing and the reason ffmpeg writes none either.
 	avc: trackData => trackData.info.avcIntraEntry === null ? avcC(trackData) : null,
 	hevc: hvcC,
 	mpeg2: trackData => trackData.muxer.isQuickTime ? null : esds(trackData),
@@ -2317,7 +2308,6 @@ const VIDEO_CODEC_TO_CONFIGURATION_BOX: Record<
 	vp9: vpcC,
 	av1: av1C,
 	prores: null,
-	// Both entries are self-describing: the dimensions and the depth field are the whole configuration
 	qtrle: null,
 	png: null,
 };
@@ -2326,8 +2316,6 @@ const audioCodecToBoxName = (codec: AudioCodec, fullCodecString: string, isQuick
 	switch (codec) {
 		case 'aac': return 'mp4a';
 		case 'mp3': return isQuickTime ? '.mp3' : 'mp4a';
-		// QuickTime has its own entry for MPEG audio and carries no esds with it, which is what ffmpeg
-		// writes for `-f mov -c:a mp2` and what makes ffprobe read it back as mp2 rather than mp3
 		case 'mp2': return isQuickTime ? '.mp2' : 'mp4a';
 		case 'opus': return 'Opus';
 		case 'vorbis': return 'mp4a';

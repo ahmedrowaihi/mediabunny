@@ -14,3 +14,10 @@ packages/aac-encoder/dist
 packages/flac-encoder/dist
 packages/server/dist
 packages/prores/dist
+packages/rist/dist
+packages/srt/dist
+# Captured HLS test media: 84 MB of third-party streams, rebuilt with `npm run capture-hls-fixtures`
+test/fixtures/hls/
+
+# libsrt prebuilds: produced by CI before publish, never committed
+packages/server/prebuilt/

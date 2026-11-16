@@ -169,7 +169,6 @@ class Ac4TocParser {
 			}
 		}
 
-		// ETSI TS 103 190-1 substream_size table.
 		let nSubstreams = this.readBits(2);
 		if (nSubstreams === 0) {
 			nSubstreams = this.readVariableBits(2) + 4;
@@ -242,8 +241,6 @@ class Ac4TocParser {
 	}
 
 	private parsePresentationConfig(presentationConfig: number): void {
-		// Each config reads a fixed set of ac4_sgi_specifier()s (their count varies), then bookkeeps
-		// the highest group index. Config 5 reads an explicit count; the default reads an ext block.
 		const specifierCounts: Record<number, number> = { 0: 2, 1: 2, 2: 2, 3: 3, 4: 3 };
 		const count = specifierCounts[presentationConfig];
 		if (count !== undefined) {
@@ -393,7 +390,6 @@ class Ac4TocParser {
 			}
 		}
 		const bChannelCoded = this.readBits(1);
-		// frame_rate_factor is invariably 1: shaka never assigns dsi_frame_rate_multiply_info.
 		const frameRateFactor = 1;
 		if (bChannelCoded) {
 			for (let sus = 0; sus < nLfSubstreams; sus++) {

@@ -30,7 +30,9 @@ registerMediabunnyServer();
 const SOURCE = new URL('../public/demo.mp4', import.meta.url).pathname;
 const ID3_PID = 0x1e2;
 /** The default mediaTimestampBase for HLS: splice and metadata times are on the output's timeline. */
-const HLS_BASE = 10;
+// A time handed to addId3Metadata or addScte35Section is on the same timeline as the media added
+// beside it - what Conversion reads out of the source - not on the output's shifted one
+const HLS_BASE = 0;
 
 /** A minimal but real ID3v2.4 tag carrying one TXXX frame, so the bytes mean something. */
 const id3Tag = (text: string) => {
@@ -97,7 +99,9 @@ describe('ID3 through a segmented output', () => {
 
 		const payload = found[1]![0]!;
 		expect(bytesToHexString(payload.data)).toBe(bytesToHexString(tag));
-		expect(payload.time).toBeCloseTo(HLS_BASE + 1.5, 3);
+		// The PES states the time on the transport stream's own clock, which is the media timeline
+		// shifted by mediaTimestampBase - 10 s by default, the same shift every packet gets
+		expect(payload.time).toBeCloseTo(HLS_BASE + 1.5 + 10, 3);
 	}, 300_000);
 
 	test('the PMT names it with stream type 0x15 and the ID3 metadata descriptor', async () => {

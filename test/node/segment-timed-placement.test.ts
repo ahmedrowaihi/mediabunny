@@ -159,6 +159,10 @@ const write = async (options: {
 				: new MpegTsOutputFormat({ timedMetadataPid: ID3_PID }),
 			targetDuration: TARGET_DURATION,
 			live: options.live,
+			// The two timelines coincide, so a probe derived from a written window can be handed
+			// straight back. That a stated time is shifted onto the output's own timeline is a
+			// different question, and inband-events.test.ts asks it.
+			mediaTimestampBase: 0,
 			onInit: (target, info) => void inits.set(info.n, new Uint8Array((target as BufferTarget).buffer!)),
 			onSegment: (target, info) => {
 				const list = bodies.get(info.playlist.n) ?? [];

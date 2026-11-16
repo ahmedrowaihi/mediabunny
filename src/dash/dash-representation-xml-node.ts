@@ -257,10 +257,14 @@ export class RepresentationXmlNode extends RepresentationBaseXmlNode {
 			this.setStringAttribute('frameRate', `${videoInfo.timeScale}/${videoInfo.frameDuration}`);
 		}
 
+		// Only stated when it is interlaced: `progressive` is what a reader assumes of a manifest that
+		// says nothing, so writing it would add a line to every MPD to no effect
+		if (videoInfo.scanType !== undefined && videoInfo.scanType !== 'progressive') {
+			this.setStringAttribute('scanType', videoInfo.scanType);
+		}
+
 		if (videoInfo.playbackRate !== undefined) {
 			this.setStringAttribute('maxPlayoutRate', String(videoInfo.playbackRate));
-			// Trick-play streams contain only key frames so coding dependency
-			// on the main stream is broken. Per shaka, simply set false.
 			this.setStringAttribute('codingDependency', 'false');
 		}
 		return true;
@@ -312,8 +316,6 @@ export class RepresentationXmlNode extends RepresentationBaseXmlNode {
 
 		const child = new XmlNode(useSegmentList ? 'SegmentList' : 'SegmentBase');
 
-		// Forcing SegmentList for longer audio causes sidx atom to not be
-		// generated, therefore indexRange is not added to MPD if flag is set.
 		if (mediaInfo.indexRange !== undefined && !useSegmentList) {
 			child.setStringAttribute('indexRange', rangeToString(mediaInfo.indexRange));
 		}
@@ -336,8 +338,6 @@ export class RepresentationXmlNode extends RepresentationBaseXmlNode {
 			child.addChild(initialization);
 		}
 
-		// Since the SegmentURLs here do not have a @media element, BaseURL
-		// element is mapped to the @media attribute.
 		if (useSegmentList && mediaInfo.subsegmentRanges !== undefined) {
 			for (const subsegmentRange of mediaInfo.subsegmentRanges) {
 				const subsegment = new XmlNode('SegmentURL');
@@ -404,8 +404,6 @@ export class RepresentationXmlNode extends RepresentationBaseXmlNode {
 		}
 
 		if (segmentInfos.length > 0) {
-			// Don't use SegmentTimeline if all segments except the last one
-			// are of the same duration.
 			if (isTimelineConstantDuration(segmentInfos, startNumber, flagSegmentTemplateConstantDuration)) {
 				segmentTemplate.setIntegerAttribute('duration', segmentInfos[0]!.duration);
 				if (flagDashAddLastSegmentNumberWhenNeeded) {
@@ -438,19 +436,13 @@ export class RepresentationXmlNode extends RepresentationBaseXmlNode {
 		const codecData = audioInfo.codecSpecificData;
 
 		if (codec === EC3_CODEC) {
-			// MPEG scheme where the value is valid, else EC-3 channel mapping:
-			// https://github.com/Dash-Industry-Forum/DASH-IF-IOP/issues/268
 			const ec3ChannelMpegValue = codecData?.channelMpegValue;
 			const NO_MAPPING = 0xFFFFFFFF;
 			if (ec3ChannelMpegValue === undefined || ec3ChannelMpegValue === NO_MAPPING) {
-				// EC-3 channel map as 4 hex digits, padded.
-				// Spec: DASH-IF Interoperability Points v3.0 9.2.1.2.
 				const mask = codecData?.channelMask ?? 0;
 				audioChannelConfigValue = mask.toString(16).toUpperCase().padStart(4, '0');
 				audioChannelConfigScheme = 'tag:dolby.com,2014:dash:audio_channel_configuration:2011';
 			} else {
-				// Spec: ETSI TS 102 366 V1.4.1 Digital Audio Compression
-				// (AC-3, Enhanced AC-3) I.1.2.
 				audioChannelConfigValue = String(ec3ChannelMpegValue);
 				audioChannelConfigScheme = 'urn:mpeg:mpegB:cicp:ChannelConfiguration';
 			}
@@ -459,8 +451,6 @@ export class RepresentationXmlNode extends RepresentationBaseXmlNode {
 				audioChannelConfigScheme,
 				audioChannelConfigValue,
 			);
-			// Dolby Digital Plus JOC descriptor. Spec: ETSI TS 103 420 v1.2.1
-			// D.2.2.
 			if (codecData?.ec3JocComplexity !== undefined && codecData.ec3JocComplexity !== 0) {
 				const ec3JocComplexity = String(codecData.ec3JocComplexity);
 				this.addDescriptor(
@@ -486,11 +476,8 @@ export class RepresentationXmlNode extends RepresentationBaseXmlNode {
 				// bits are meaningful per ETSI TS 103 190-2 V1.2.1 G.3.1.
 				const mask = codecData?.channelMask ?? 0;
 				audioChannelConfigValue = mask.toString(16).toUpperCase().padStart(6, '0');
-				// Note: the channel-config scheme for EC-3 and AC-4 differ.
-				// See https://github.com/Dash-Industry-Forum/DASH-IF-IOP/issues/268
 				audioChannelConfigScheme = 'tag:dolby.com,2015:dash:audio_channel_configuration:2015';
 			} else {
-				// Spec: ETSI TS 103 190-2 V1.2.1 G.3.2.
 				audioChannelConfigValue = String(ac4ChannelMpegValue);
 				audioChannelConfigScheme = 'urn:mpeg:mpegB:cicp:ChannelConfiguration';
 			}
@@ -514,7 +501,6 @@ export class RepresentationXmlNode extends RepresentationBaseXmlNode {
 			audioChannelConfigScheme = 'tag:dts.com,2014:dash:audio_channel_configuration:2012';
 		} else if (codec === DTSX_CODEC) {
 			const mask = codecData?.channelMask ?? 0;
-			// 8-digit hex padded.
 			audioChannelConfigValue = mask.toString(16).toUpperCase().padStart(8, '0');
 			audioChannelConfigScheme = 'tag:dts.com,2018:uhd:audio_channel_configuration';
 		} else {

@@ -23,6 +23,7 @@
 
 import { createSocket, type Socket } from 'node:dgram';
 import { RTP_HEADER_SIZE, RTP_VERSION } from './rtp';
+import { St2110Clock, type St2110ClockOptions } from './st2110-clock';
 
 /**
  * Bits per sample. ST 2110-30 inherits AES67's L16 and L24; 24-bit is what broadcast uses.
@@ -426,6 +427,15 @@ export type St2110AudioSdpOptions = {
 	channelOrder?: St2110ChannelGroup[];
 	/** The PTP grandmaster this stream's clock is locked to, written as `ts-refclk`. */
 	ptpGrandmaster?: string;
+	/**
+	 * The sender's MAC address, written as `ts-refclk:localmac=`, for a stream whose clock is its own
+	 * rather than locked to PTP.
+	 *
+	 * ST 2110-10 §8.2 requires a reference clock to be stated either way, so a stream with neither of
+	 * these says nothing about what its timestamps are against - which leaves a receiver no basis for
+	 * aligning it with anything else.
+	 */
+	localMac?: string;
 };
 
 const isMulticastIpv4 = (address: string) => {
@@ -485,6 +495,8 @@ export const buildAudioSdp = (options: St2110AudioSdpOptions): string => {
 	lines.push('a=mediaclk:direct=0');
 	if (options.ptpGrandmaster) {
 		lines.push(`a=ts-refclk:ptp=IEEE1588-2008:${options.ptpGrandmaster}`);
+	} else if (options.localMac) {
+		lines.push(`a=ts-refclk:localmac=${options.localMac}`);
 	}
 
 	return lines.join('\n') + '\n';
@@ -502,7 +514,7 @@ export type St2110AudioSenderOptions = St2110AudioPacketizerOptions & {
 	port: number;
 	/** Multicast hop limit. Defaults to 64. */
 	ttl?: number;
-};
+} & St2110ClockOptions;
 
 /**
  * Sends uncompressed audio as ST 2110-30 over UDP, paced to the packet time.
@@ -544,7 +556,13 @@ export class St2110AudioSender {
 			throw new TypeError('options.port must be an integer in [0, 65535].');
 		}
 
-		this.packetizer = new St2110AudioPacketizer(options);
+		// A locked clock states where the stream's timestamps begin; the packetizer counts on from there
+		// in media units, so the spacing stays exact
+		const clock = new St2110Clock(options);
+		this.packetizer = new St2110AudioPacketizer({
+			...options,
+			initialTimestamp: options.initialTimestamp ?? clock.now(options.format.sampleRate) ?? 0,
+		});
 		this.address = options.address;
 		this.port = options.port;
 		this.ttl = options.ttl ?? 64;

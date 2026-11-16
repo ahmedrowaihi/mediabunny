@@ -1,4 +1,4 @@
-import { expect, test } from 'vitest';
+import { beforeAll, expect, test } from 'vitest';
 import { Input } from '../../src/input.js';
 import { UrlSource } from '../../src/source.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
@@ -10,6 +10,15 @@ import { canEncodeVideo, Quality, QualityLevel } from '../../src/encode.js';
 import { VideoCodec } from '../../src/codec.js';
 
 const QUALITY_LEVELS: QualityLevel[] = ['very-low', 'low', 'medium', 'high', 'very-high'];
+
+// The FIRST conversion in this file pays for the source fetch and for Chrome bringing up its video
+// encoder, and nothing after it does: measured, 11.9 s for the first and ~0.8 s for each of the
+// sixteen that follow. Against a per-test timeout that cost lands on whichever test happens to run
+// first - which is why `'very-low'` had a reputation for being flaky when nothing about 'very-low' is
+// slow. Paying it here leaves each test's timeout measuring that test.
+beforeAll(async () => {
+	await convertVideo(new Quality('medium'), 'avc');
+}, 120_000);
 
 for (const level of QUALITY_LEVELS) {
 	test(`AVC, qualitative quality '${level}'`, { timeout: 10_000 }, async () => {

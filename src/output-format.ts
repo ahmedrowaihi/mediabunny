@@ -20,6 +20,7 @@ import {
 	VideoCodec,
 } from './codec';
 import { FlacMuxer } from './flac/flac-muxer';
+import { HlsImageStreamSource } from './hls/hls-image-stream';
 import { IsobmffMuxer } from './isobmff/isobmff-muxer';
 import { MatroskaMuxer } from './matroska/matroska-muxer';
 import { MediaSource } from './media-source';
@@ -29,6 +30,8 @@ import { OggMuxer } from './ogg/ogg-muxer';
 import { Output, OutputTrack, TrackType } from './output';
 import { MpegTsMuxer } from './mpeg-ts/mpeg-ts-muxer';
 import { WaveMuxer } from './wave/wave-muxer';
+import { AiffMuxer } from './aiff/aiff-muxer';
+import { Y4mMuxer } from './y4m/y4m-muxer';
 import { DashManifestEmitter } from './dash/dash-manifest-emitter';
 import type { DashProfile, MpdParams, MpdType } from './dash/dash-types';
 import { HlsManifestEmitter } from './hls/hls-manifest-emitter';
@@ -667,7 +670,6 @@ export class MkvOutputFormat extends OutputFormat {
 			...NON_PCM_AUDIO_CODECS,
 			...PCM_AUDIO_CODECS.filter(codec => !['pcm-s8', 'pcm-f32be', 'pcm-f64be', 'ulaw', 'alaw'].includes(codec)),
 
-			// Matroska defines no TTML codec ID
 			'webvtt',
 		];
 	}
@@ -713,7 +715,6 @@ export class WebMOutputFormat extends MkvOutputFormat {
 			...VIDEO_CODECS.filter(codec => ['vp8', 'vp9', 'av1'].includes(codec)),
 			...AUDIO_CODECS.filter(codec => ['opus', 'vorbis'].includes(codec)),
 
-			// Matroska defines no TTML codec ID
 			'webvtt',
 		];
 	}
@@ -940,6 +941,177 @@ export class WavOutputFormat extends OutputFormat {
 				['pcm-s16', 'pcm-s24', 'pcm-s32', 'pcm-f32', 'pcm-f64', 'pcm-u8', 'ulaw', 'alaw'].includes(codec),
 			),
 		];
+	}
+
+	get supportsVideoTransformationMetadata() {
+		return false;
+	}
+
+	get supportsTimestampedMediaData() {
+		return false;
+	}
+
+	get negativeTimestampSupport() {
+		return null;
+	}
+}
+
+/**
+ * AIFF-specific output options.
+ * @group Output formats
+ * @public
+ */
+export type AiffOutputFormatOptions = {
+	/**
+	 * Will be called once the file header is written. The header consists of the FORM header, the COMM
+	 * chunk, and the start of the SSND chunk (with placeholder sizes).
+	 */
+	onHeader?: (data: Uint8Array, position: number) => unknown;
+};
+
+/**
+ * AIFF file format, the big-endian elder of WAVE.
+ *
+ * Big-endian signed PCM is written as plain AIFF; everything else - little-endian PCM, floats, µ-law and
+ * A-law - is written as AIFF-C, which is the same file with a compression type in its `COMM` chunk.
+ *
+ * @group Output formats
+ * @public
+ */
+export class AiffOutputFormat extends OutputFormat {
+	/** @internal */
+	_options: AiffOutputFormatOptions;
+
+	/** Creates a new {@link AiffOutputFormat} configured with the specified `options`. */
+	constructor(options: AiffOutputFormatOptions = {}) {
+		if (!options || typeof options !== 'object') {
+			throw new TypeError('options must be an object.');
+		}
+		if (options.onHeader !== undefined && typeof options.onHeader !== 'function') {
+			throw new TypeError('options.onHeader, when provided, must be a function.');
+		}
+
+		super();
+
+		this._options = options;
+	}
+
+	/** @internal */
+	_createMuxer(output: Output) {
+		return new AiffMuxer(output, this);
+	}
+
+	/** @internal */
+	get _name() {
+		return 'AIFF';
+	}
+
+	getSupportedTrackCounts(): TrackCountLimits {
+		return {
+			video: { min: 0, max: 0 },
+			audio: { min: 1, max: 1 },
+			subtitle: { min: 0, max: 0 },
+			total: { min: 1, max: 1 },
+		};
+	}
+
+	get fileExtension() {
+		return '.aiff';
+	}
+
+	get mimeType() {
+		return 'audio/aiff';
+	}
+
+	getSupportedCodecs(): MediaCodec[] {
+		return [
+			...PCM_AUDIO_CODECS.filter(codec => [
+				'pcm-s8', 'pcm-u8', 'pcm-s16', 'pcm-s16be', 'pcm-s24', 'pcm-s24be', 'pcm-s32', 'pcm-s32be',
+				'pcm-f32be', 'pcm-f64be', 'ulaw', 'alaw',
+			].includes(codec)),
+		];
+	}
+
+	get supportsVideoTransformationMetadata() {
+		return false;
+	}
+
+	get supportsTimestampedMediaData() {
+		return false;
+	}
+
+	get negativeTimestampSupport() {
+		return null;
+	}
+}
+
+/**
+ * Y4M-specific output options.
+ * @group Output formats
+ * @public
+ */
+export type Y4mOutputFormatOptions = {
+	/** Will be called once the `YUV4MPEG2` header line is written. */
+	onHeader?: (data: Uint8Array, position: number) => unknown;
+};
+
+/**
+ * YUV4MPEG2 (Y4M): a text header, then every frame uncompressed, one after another.
+ *
+ * There is no index and no compression, so the file is as large as its pictures and as simple as a
+ * pipe. It is what ffmpeg, x264 and the quality metrics read when they want frames rather than a
+ * stream, which is what it is for here.
+ *
+ * @group Output formats
+ * @public
+ */
+export class Y4mOutputFormat extends OutputFormat {
+	/** @internal */
+	_options: Y4mOutputFormatOptions;
+
+	/** Creates a new {@link Y4mOutputFormat} configured with the specified `options`. */
+	constructor(options: Y4mOutputFormatOptions = {}) {
+		if (!options || typeof options !== 'object') {
+			throw new TypeError('options must be an object.');
+		}
+		if (options.onHeader !== undefined && typeof options.onHeader !== 'function') {
+			throw new TypeError('options.onHeader, when provided, must be a function.');
+		}
+
+		super();
+
+		this._options = options;
+	}
+
+	/** @internal */
+	_createMuxer(output: Output) {
+		return new Y4mMuxer(output, this);
+	}
+
+	/** @internal */
+	get _name() {
+		return 'Y4M';
+	}
+
+	getSupportedTrackCounts(): TrackCountLimits {
+		return {
+			video: { min: 1, max: 1 },
+			audio: { min: 0, max: 0 },
+			subtitle: { min: 0, max: 0 },
+			total: { min: 1, max: 1 },
+		};
+	}
+
+	get fileExtension() {
+		return '.y4m';
+	}
+
+	get mimeType() {
+		return 'video/x-yuv4mpeg';
+	}
+
+	getSupportedCodecs(): MediaCodec[] {
+		return ['rawvideo'];
 	}
 
 	get supportsVideoTransformationMetadata() {
@@ -1279,6 +1451,32 @@ export type MpegTsOutputFormatOptions = {
 	timestampOffset?: number;
 
 	/**
+	 * How AAC audio is framed in the transport stream.
+	 *
+	 * - `'adts'` (default): stream type 0x0F, one ADTS header per access unit. What North American
+	 *   practice and HLS expect, and what this muxer has always written.
+	 * - `'latm'`: stream type 0x11, LOAS/LATM framing. What DVB broadcast feeds carry. The
+	 *   configuration travels **inside** the stream, in a `StreamMuxConfig`, so a receiver that joins
+	 *   mid-stream learns the sample rate and channel layout without a PMT descriptor.
+	 *
+	 * Only AAC is affected; every other codec is framed as it was. An AAC stream whose
+	 * `channelConfiguration` is 0, or whose object type this library cannot measure the configuration
+	 * length of, is refused rather than written wrong - see {@link MpegTsOutputFormatOptions.aacFraming}
+	 * for why that length has to be exact.
+	 */
+	aacFraming?: 'adts' | 'latm';
+
+	/**
+	 * How often the LOAS/LATM `StreamMuxConfig` is repeated, in frames; defaults to 1, meaning every
+	 * frame carries it.
+	 *
+	 * A receiver can only start decoding at a frame that states the configuration, so repeating it is
+	 * what makes a stream joinable. Ignored unless {@link MpegTsOutputFormatOptions.aacFraming} is
+	 * `'latm'`.
+	 */
+	latmConfigInterval?: number;
+
+	/**
 	 * Declares an SCTE-35 cue stream on this PID, so the PMT lists it with stream type 0x86 and the
 	 * `CUEI` registration descriptor. Write sections into it with `addScte35Section`.
 	 *
@@ -1412,6 +1610,72 @@ export type MpegTsOutputFormatOptions = {
 	sdtInterval?: number;
 
 	/**
+	 * Writes the DVB time tables on PID 0x0014: a Time and Date Table always, and a Time Offset Table
+	 * where `regions` names any. Omitted, neither is written and the output is unchanged.
+	 *
+	 * A DVB receiver takes the wall-clock time it displays from here, which is why a stream meant for
+	 * one carries it — the PCR says nothing about what time it is.
+	 *
+	 * The time is encoded as EN 300 468 Annex C states it: a 16-bit Modified Julian Date counting from
+	 * 17 November 1858, then hours, minutes and seconds in BCD. The TDT is a short section with **no**
+	 * CRC and the TOT is a short section **with** one, which is a quirk of EN 300 468 rather than a
+	 * mistake.
+	 */
+	dvbTime?: {
+		/**
+		 * What the stream says the time is, called once per table. Defaults to the system clock.
+		 *
+		 * Stated as a function so a stream can carry a time that is not this machine's — a replay of
+		 * recorded material, or a feed whose time comes from elsewhere.
+		 */
+		now?: () => Date;
+		/** Seconds between repeats, defaulting to 25, the maximum EN 300 468 allows for either table. */
+		interval?: number;
+		/**
+		 * The local time offsets to state in a Time Offset Table. Each is a country and region whose
+		 * civil time differs from UTC by `offsetMinutes`, with the next change it will make.
+		 *
+		 * Left empty, only the TDT is written: a TOT with no offsets in it tells a receiver nothing the
+		 * TDT has not already said.
+		 */
+		regions?: {
+			/** The ISO 3166 three-letter country code, such as `'GBR'`. */
+			country: string;
+			/** `country_region_id`, 0 where the country has one time zone. */
+			regionId?: number;
+			/** Minutes the country's civil time is ahead of UTC; negative for behind. */
+			offsetMinutes: number;
+			/** When this offset next changes, which is the next daylight-saving transition. */
+			nextChange: Date;
+			/** The offset in minutes that takes effect then. */
+			nextOffsetMinutes: number;
+		}[];
+	};
+
+	/**
+	 * Writes a Network Information Table on PID 0x0010, naming the network this stream belongs to.
+	 * Omitted, none is written.
+	 *
+	 * **The delivery system descriptors are the caller's**, because only they know them: the modulation,
+	 * frequency and FEC of a terrestrial, satellite or cable path are properties of the transmission,
+	 * not of the file. Without any, the table still names the network and lists this transport stream,
+	 * which is what a receiver needs to associate the two.
+	 */
+	network?: {
+		/** `network_id`, which ETSI allocates. */
+		id: number;
+		/** The network name, carried in a `network_name_descriptor` (tag 0x40). */
+		name: string;
+		/** Seconds between repeats, defaulting to 10, the maximum EN 300 468 allows. */
+		interval?: number;
+		/**
+		 * Descriptors to list against this transport stream, each a complete descriptor including its
+		 * tag and length octets. A terrestrial delivery system descriptor (tag 0x5A) goes here.
+		 */
+		transportDescriptors?: Uint8Array[];
+	};
+
+	/**
 	 * Bits per second to write the transport stream at, making it constant bit rate. Null packets on PID
 	 * 0x1fff fill whatever the media does not, and every PCR is then stamped from the byte position it
 	 * sits at rather than from a packet's decode time — which is what makes the stream's own clock and
@@ -1515,7 +1779,6 @@ export class MpegTsOutputFormat extends OutputFormat {
 		}
 		for (const name of ['programNumber', 'transportStreamId'] as const) {
 			const value = options[name];
-			// 0 is reserved for the network information table's program in the PAT
 			if (value !== undefined && (!Number.isInteger(value) || value < 1 || value > 0xffff)) {
 				throw new TypeError(`options.${name}, when provided, must be an integer between 1 and 65535.`);
 			}
@@ -1553,6 +1816,64 @@ export class MpegTsOutputFormat extends OutputFormat {
 			&& (!Number.isFinite(options.muxRate) || options.muxRate <= 0)
 		) {
 			throw new TypeError('options.muxRate, when provided, must be a positive, finite number.');
+		}
+		if (options.dvbTime !== undefined) {
+			if (!options.dvbTime || typeof options.dvbTime !== 'object') {
+				throw new TypeError('options.dvbTime, when provided, must be an object.');
+			}
+			if (options.dvbTime.interval !== undefined && !(options.dvbTime.interval > 0)) {
+				throw new TypeError('options.dvbTime.interval, when provided, must be a positive number.');
+			}
+			for (const region of options.dvbTime.regions ?? []) {
+				if (typeof region.country !== 'string' || region.country.length !== 3) {
+					throw new TypeError(
+						'Each options.dvbTime.regions entry needs a three-letter ISO 3166 country code.',
+					);
+				}
+				if (
+					region.regionId !== undefined
+					&& (!Number.isInteger(region.regionId) || region.regionId < 0 || region.regionId > 63)
+				) {
+					throw new TypeError('A country_region_id must be an integer from 0 to 63.');
+				}
+				// The offset is stated as BCD hours and minutes, so it cannot exceed what that holds
+				for (const minutes of [region.offsetMinutes, region.nextOffsetMinutes]) {
+					if (!Number.isInteger(minutes) || Math.abs(minutes) > 99 * 60 + 59) {
+						throw new TypeError(
+							'A local time offset must be a whole number of minutes that fits BCD hhmm.',
+						);
+					}
+				}
+				if (!(region.nextChange instanceof Date) || Number.isNaN(region.nextChange.getTime())) {
+					throw new TypeError('Each options.dvbTime.regions entry needs a valid nextChange Date.');
+				}
+			}
+		}
+		if (options.network !== undefined) {
+			if (!options.network || typeof options.network !== 'object') {
+				throw new TypeError('options.network, when provided, must be an object.');
+			}
+			if (
+				!Number.isInteger(options.network.id)
+				|| options.network.id < 0 || options.network.id > 0xffff
+			) {
+				throw new TypeError('options.network.id must be an integer from 0 to 65535.');
+			}
+			if (typeof options.network.name !== 'string') {
+				throw new TypeError('options.network.name must be a string.');
+			}
+			if (options.network.interval !== undefined && !(options.network.interval > 0)) {
+				throw new TypeError('options.network.interval, when provided, must be a positive number.');
+			}
+		}
+		if (options.aacFraming !== undefined && !['adts', 'latm'].includes(options.aacFraming)) {
+			throw new TypeError('options.aacFraming, when provided, must be \'adts\' or \'latm\'.');
+		}
+		if (
+			options.latmConfigInterval !== undefined
+			&& (!Number.isInteger(options.latmConfigInterval) || options.latmConfigInterval < 1)
+		) {
+			throw new TypeError('options.latmConfigInterval, when provided, must be a positive integer.');
 		}
 		if (options.sdtInterval !== undefined && !(options.sdtInterval > 0)) {
 			throw new TypeError('options.sdtInterval, when provided, must be a positive number.');
@@ -1998,6 +2319,13 @@ export type HlsOutputFormatOptions = SegmentedOutputFormatOptions & {
 	 */
 	adMarkers?: 'none' | 'daterange' | 'elemental-scte35' | 'elemental';
 
+	/**
+	 * A trick-play rendition of thumbnail sheets, written alongside the media playlists and announced
+	 * in the multivariant playlist with `#EXT-X-IMAGE-STREAM-INF`. Push each sheet as it is captured;
+	 * see {@link HlsImageStreamSource}.
+	 */
+	imageStream?: HlsImageStreamSource;
+
 	/** Called whenever the master playlist is written. */
 	onMaster?: (content: string) => unknown;
 	/** Called whenever a media playlist is written. */
@@ -2121,6 +2449,9 @@ export class HlsOutputFormat extends OutputFormat {
 		) {
 			throw new TypeError('options.programDateTime, when provided, must be a valid Date or null.');
 		}
+		if (options.imageStream !== undefined && !(options.imageStream instanceof HlsImageStreamSource)) {
+			throw new TypeError('options.imageStream, when provided, must be an HlsImageStreamSource.');
+		}
 		if (options.onMaster !== undefined && typeof options.onMaster !== 'function') {
 			throw new TypeError('options.onMaster, when provided, must be a function.');
 		}
@@ -2170,7 +2501,6 @@ export class HlsOutputFormat extends OutputFormat {
 		if (this._options.singleFilePerPlaylist) {
 			uniqueCodecs.delete('webvtt');
 		} else {
-			// WebVTT rides in its own .vtt segments, independent of the configured segment formats.
 			uniqueCodecs.add('webvtt');
 		}
 

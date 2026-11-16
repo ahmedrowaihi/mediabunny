@@ -20,8 +20,6 @@ if ((globalThis as Record<symbol, unknown>)[MEDIABUNNY_LOADED_SYMBOL]) {
 		+ ' or if something is being bundled incorrectly.',
 	);
 }
-// A count rather than a flag: a second copy is what silently strands an extension's registered codecs on
-// the instance the caller is not holding, and the conversion that then discards every track can say so.
 (globalThis as Record<symbol, unknown>)[MEDIABUNNY_LOADED_SYMBOL]
 	= ((globalThis as Record<symbol, number>)[MEDIABUNNY_LOADED_SYMBOL] ?? 0) + 1;
 
@@ -78,6 +76,10 @@ export {
 	type MpegTsPrivateStreamDeclaration,
 	OggOutputFormat,
 	type OggOutputFormatOptions,
+	AiffOutputFormat,
+	type AiffOutputFormatOptions,
+	Y4mOutputFormat,
+	type Y4mOutputFormatOptions,
 	WavOutputFormat,
 	type WavOutputFormatOptions,
 	WebMOutputFormat,
@@ -101,13 +103,18 @@ export {
 	MediaStreamVideoTrackSource,
 	type MediaStreamVideoTrackSourceOptions,
 	SubtitleCueSource,
+	type SubtitleCueSourceOptions,
 	TextSubtitleSource,
 	VideoSampleSource,
 } from './media-source';
 export {
 	type SubtitleConfig,
 	type SubtitleCue,
+	type SubtitlePlacement,
+	type SubtitleTextRun,
+	type TtmlProfile,
 	type SubtitleMetadata,
+	ttmlDocumentOf,
 } from './subtitles';
 export {
 	type MediaCodec,
@@ -117,6 +124,7 @@ export {
 	extractVideoProfileAndLevel,
 	type AudioCodec,
 	type SubtitleCodec,
+	DNXHD_FOURCC,
 	VIDEO_BIT_DEPTHS,
 	VIDEO_CODECS,
 	AUDIO_CODECS,
@@ -194,6 +202,7 @@ export {
 	type EventListenerOptions,
 	type FilePath,
 	type MaybePromise,
+	type WideVideoColorSpaceInit,
 } from './misc';
 export {
 	Logging,
@@ -294,6 +303,10 @@ export {
 	MxfInputFormat,
 	OggInputFormat,
 	QuickTimeInputFormat,
+	AiffInputFormat,
+	AIFF,
+	Y4mInputFormat,
+	Y4M,
 	WaveInputFormat,
 	WebMInputFormat,
 	ALL_FORMATS,
@@ -317,6 +330,7 @@ export {
 export {
 	Input,
 	type InputOptions,
+	type InbandEvent,
 	type InputEvents,
 	InputDisposedError,
 	UnsupportedInputFormatError,
@@ -338,6 +352,21 @@ export {
 	desc,
 	prefer,
 } from './input-track';
+export {
+	formatTimecode,
+	parseTimecode,
+} from './timecode';
+export {
+	type Afd,
+	AFD_CODES,
+	parsePacketAfd,
+} from './afd';
+export {
+	type AncillaryFrame,
+	type AncillaryPacket,
+	ancillaryCaptionsOf,
+	ancillaryPacketsOf,
+} from './ancillary';
 export {
 	EncodedPacket,
 	type EncodedPacketSideData,
@@ -494,6 +523,8 @@ export {
 	hlsStart,
 	hlsVariant,
 } from './hls/hls-playlist-builder';
+export { HlsImageStreamSource } from './hls/hls-image-stream';
+export type { HlsImageSheetInfo, HlsImageStreamSourceOptions, HlsTileLayout } from './hls/hls-image-stream';
 export {
 	type HlsReloadDirective,
 	type HlsReloadState,
@@ -813,6 +844,9 @@ export {
 	patchMpdContentProtection,
 	buildCbcsHlsKey,
 	buildHlsKeys,
+	CENC_HLS_METHOD,
+	hlsKeysOf,
+	hlsMethodForScheme,
 	patchMediaPlaylistKeys,
 } from './manifest-protection';
 export {
@@ -845,6 +879,7 @@ export {
 export {
 	readScte35Sections,
 	parseSpliceInfoSection,
+	SCTE35_BINARY_SCHEME,
 	type Scte35Section,
 } from './mpeg-ts/scte35';
 export {
@@ -883,11 +918,27 @@ export type {
 	ImfVirtualTrack,
 } from './imf/imf-package';
 export {
+	buildLhvcConfigRecord,
+	buildVexuBox,
 	extractLayerIdForHevc,
 	extractTemporalIdForHevc,
 	inspectHevcLayers,
+	lhvcConfigFromBitstream,
+	parseHevcVpsExtension,
+	parseHvccConfigRecord,
+	parseLhvcConfigRecord,
+	parseVexuBox,
+	vexuInfoFromVpsExtension,
 } from './mvhevc';
-export type { HevcLayerInfo } from './mvhevc';
+export type {
+	HevcLayerInfo,
+	HevcVpsLayerInfo,
+	LhvcConfig,
+	VexuEye,
+	VexuInfo,
+	VexuPacking,
+	VexuProjection,
+} from './mvhevc';
 export { StatMux } from './statmux';
 export type { StatMuxOptions, StatMuxProgram } from './statmux';
 export { MptsMultiplexer } from './mpeg-ts/mpts-multiplexer';
@@ -908,9 +959,17 @@ export {
 	doviCompatibleBrand,
 } from './dovi';
 export {
+	buildDolbyVisionProfile81Rpu,
+	type DolbyVisionLevel1,
+	type DolbyVisionLevel5,
+	type DolbyVisionLevel6,
+	type DolbyVisionRpuOptions,
+} from './dovi-rpu';
+export {
 	type MasteringDisplayMetadata,
 	type ContentLightLevel,
 	type HdrStaticMetadata,
+	type MultiviewConfiguration,
 	type VideoDecoderConfigWithHdr,
 	parseMasteringDisplayMetadata,
 	parseContentLightLevel,

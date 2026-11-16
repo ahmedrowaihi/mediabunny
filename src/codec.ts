@@ -30,7 +30,6 @@ import {
 	MATRIX_COEFFICIENTS_MAP_INVERSE,
 	TRANSFER_CHARACTERISTICS_MAP,
 	TRANSFER_CHARACTERISTICS_MAP_INVERSE,
-	videoRangeFromTransferCharacteristics,
 	assert,
 	assertNever,
 	base64ToBytes,
@@ -41,6 +40,8 @@ import {
 	reverseBitsU32,
 	toDataView,
 	toUint8Array,
+	type WideVideoColorSpaceInit,
+	videoRangeFromTransferCharacteristics,
 } from './misc';
 import { SubtitleMetadata } from './subtitles';
 import { PCM_ENCODER_PACKET_SIZE } from './media-source';
@@ -58,9 +59,30 @@ export const VIDEO_CODECS = [
 	'vp8',
 	'prores',
 	'mpeg2',
+	'dnxhd',
 	'qtrle',
 	'png',
+	'rawvideo',
 ] as const;
+
+/**
+ * VC-3's four-character code, as MOV, MP4 and MXF all state it. VC-3 has no RFC 6381 registration, so
+ * this is the whole of a DNxHD or DNxHR codec string.
+ *
+ * @group Codecs
+ * @public
+ */
+export const DNXHD_FOURCC = 'AVdn';
+
+/**
+ * The codec string for uncompressed video. There is no RFC 6381 registration for it, and nothing in
+ * the string could say what the samples are anyway - that is the pixel format, which the decoder
+ * config's `description` carries as the Y4M colour-space tag it was read from.
+ *
+ * @group Codecs
+ * @public
+ */
+export const RAWVIDEO_CODEC_STRING = 'rawvideo';
 /**
  * List of known PCM (uncompressed) audio codecs, ordered by encoding preference.
  * @group Codecs
@@ -316,11 +338,15 @@ const CODEC_BIT_DEPTHS: Record<VideoCodec, VideoBitDepth[]> = {
 	av1: [8, 10],
 	// Main and 4:2:2 Profile are both 8-bit; the deeper profiles are out of scope here
 	mpeg2: [8],
+	// VC-3 classes are 8-bit (145, 220) or 10-bit (220x); DNxHR adds 10-bit HQX and 444
+	dnxhd: [8, 10],
 	// ProRes stores 10 bits (422) or 12 bits (4444); the four-character code fixes it, so it can't be requested.
 	prores: [],
 	// Read-only here: neither has an encoder, so no bit depth can be requested of one
 	qtrle: [],
 	png: [],
+	// Uncompressed: the depth is a property of the pixel format, which the container states
+	rawvideo: [8, 10, 12],
 };
 
 export const buildVideoCodecString = (
@@ -433,9 +459,15 @@ export const buildVideoCodecString = (
 
 		return bestFourCc;
 	} else if (codec === 'mpeg2') {
-		// The profile and level are in the bitstream's own sequence extension, not derivable from a target
-		// bitrate the way VP9's and AV1's levels are, so the object type indication is the whole string.
 		return mpeg2CodecString(MPEG2_OBJECT_TYPE_MAIN);
+	} else if (codec === 'dnxhd') {
+		// VC-3 has no RFC 6381 registration; the four-character code is what a container states and
+		// what every tool matches on, which is how ProRes is handled here too
+		return DNXHD_FOURCC;
+	} else if (codec === 'rawvideo') {
+		// Uncompressed frames have nothing to state but that they are uncompressed; what they actually
+		// are is the pixel format, which the container says and the decoder config carries
+		return RAWVIDEO_CODEC_STRING;
 	} else if (codec === 'qtrle' || codec === 'png') {
 		throw new TypeError(
 			`'${codec}' can be read and decoded but not encoded, so no codec string can be built for it.`,
@@ -583,7 +615,6 @@ export const extractVideoCodecString = (trackInfo: {
 			}
 		}
 
-		// The sample entry decides where the parameter sets live, so the string has to follow it.
 		let codecString = `${trackInfo.hevcType}.`;
 
 		codecString += ['', 'A', 'B', 'C'][generalProfileSpace]! + generalProfileIdc;
@@ -707,8 +738,11 @@ export const extractVideoCodecString = (trackInfo: {
 		return proresFormat ?? 'apch';
 	} else if (codec === 'mpeg2') {
 		return mpeg2CodecString(mpeg2ObjectTypeFromProfile(mpeg2CodecInfo?.profileAndLevelIndication ?? null));
+	} else if (codec === 'dnxhd') {
+		return DNXHD_FOURCC;
+	} else if (codec === 'rawvideo') {
+		return RAWVIDEO_CODEC_STRING;
 	} else if (codec === 'qtrle' || codec === 'png') {
-		// Neither is registered with WebCodecs and neither carries a profile, so the name is the whole string
 		return codec;
 	} else if (codec !== null) {
 		assertNever(codec);
@@ -1069,7 +1103,6 @@ export const getMinimumAudioPacketSize = (codec: AudioCodec, sampleRate: number)
 		case 'aac': return 1024;
 		case 'opus': return 0.02 * sampleRate; // Fixed 20 ms frames, regardless of sample rate
 		case 'mp3': return 576;
-		// Layer II is 1152 samples a frame in every MPEG version, unlike Layer III
 		case 'mp2': return 1152;
 		case 'vorbis': return 256;
 		case 'flac': return 1152;
@@ -1199,6 +1232,8 @@ export const inferCodecFromCodecString = (codecString: string): MediaCodec | nul
 		return 'av1';
 	} else if ((PRORES_FOURCCS as readonly string[]).includes(codecString)) {
 		return 'prores';
+	} else if (codecString === DNXHD_FOURCC) {
+		return 'dnxhd';
 	} else if (mpeg2ObjectTypeOf(codecString) !== null) {
 		return 'mpeg2';
 	}
@@ -1211,8 +1246,6 @@ export const inferCodecFromCodecString = (codecString: string): MediaCodec | nul
 		|| codecString === 'mp4a.6b'
 		|| codecString === 'mp4a.40.34'
 	) {
-		// An object type indication names the MPEG version, not the layer, so these stay mp3: a Layer II
-		// stream in an MP4 is told apart by its frame headers, which a codec string does not carry.
 		return 'mp3';
 	} else if (codecString === 'mp2') {
 		return 'mp2';
@@ -1257,7 +1290,6 @@ const extractVideoProfileIdc = (codecString: string): number | null => {
 	}
 
 	if (codecString.startsWith('hev1') || codecString.startsWith('hvc1')) {
-		// The profile IDC may be preceded by a profile space letter.
 		return Number(codecString.split('.')[1]?.replace(/^[ABC]/, ''));
 	}
 
@@ -1308,7 +1340,6 @@ export const extractVideoProfileAndLevel = (
 	}
 
 	if (codecString.startsWith('hev1') || codecString.startsWith('hvc1')) {
-		// The general level, which the string states in thirtieths of a level as `L153`
 		const generalLevelIdc = Number(codecString.split('.')[3]?.replace(/^[LH]/, ''));
 
 		return {
@@ -1333,8 +1364,6 @@ const bitDepthFromDescription = (codecString: string, description: AllowSharedBu
 	const bytes = toUint8Array(description);
 
 	if (codecString.startsWith('avc1') || codecString.startsWith('avc3')) {
-		// The SPS, not the record's own bitDepthLumaMinus8: that field is present only for some profiles, and
-		// the profiles it is optional for are exactly the ambiguous ones this is here to resolve.
 		const sps = deserializeAvcDecoderConfigurationRecord(bytes)?.sequenceParameterSets[0];
 		const parsed = sps && parseAvcSps(sps);
 
@@ -1384,7 +1413,6 @@ export const extractVideoBitDepth = (source: string | VideoDecoderConfig): Video
 			}
 		}
 
-		// Main 10 is profile 2; the RExt profiles carry their depth in the config alone, not in the string
 		return extractVideoProfileIdc(codecString) === 2 ? 10 : 8;
 	} else if (codecString.startsWith('vp09') || codecString.startsWith('av01')) {
 		// Both state the bit depth in the string itself, so there is nothing a config would add
@@ -1396,7 +1424,7 @@ export const extractVideoBitDepth = (source: string | VideoDecoderConfig): Video
 };
 
 /** @internal */
-export const transferNeedsTenBits = (transfer: VideoTransferCharacteristics | null | undefined) => {
+export const transferNeedsTenBits = (transfer: WideVideoColorSpaceInit['transfer']) => {
 	if (!transfer) {
 		return false;
 	}
@@ -1405,11 +1433,9 @@ export const transferNeedsTenBits = (transfer: VideoTransferCharacteristics | nu
 	return range === 'PQ' || range === 'HLG';
 };
 
-// The one place that decides whether HDR10 static metadata may be written: it describes how a PQ or HLG grade was
-// mastered, so it may only sit on an output that still states such a transfer function at a depth able to carry it.
 /** @internal */
 export const outputCarriesHdrSignal = (
-	transfer: VideoTransferCharacteristics | null | undefined,
+	transfer: WideVideoColorSpaceInit['transfer'],
 	outputBitDepth: VideoBitDepth | null,
 ) => transferNeedsTenBits(transfer) && (outputBitDepth === null || outputBitDepth >= 10);
 
@@ -1418,7 +1444,7 @@ export const outputCarriesHdrSignal = (
 /** @internal */
 export const validateBitDepthCarriesTransfer = (
 	bitDepth: VideoBitDepth | undefined,
-	colorSpace: VideoColorSpaceInit | undefined,
+	colorSpace: WideVideoColorSpaceInit | undefined,
 	prefix: string,
 ) => {
 	const transfer = colorSpace?.transfer;
@@ -1432,7 +1458,7 @@ export const validateBitDepthCarriesTransfer = (
 	);
 };
 
-export const validateVideoColorSpaceInit = (colorSpace: VideoColorSpaceInit, prefix: string) => {
+export const validateVideoColorSpaceInit = (colorSpace: WideVideoColorSpaceInit, prefix: string) => {
 	if (!colorSpace || typeof colorSpace !== 'object') {
 		throw new TypeError(`${prefix}, when provided, must be an object.`);
 	}
@@ -1458,8 +1484,6 @@ export const validateVideoColorSpaceInit = (colorSpace: VideoColorSpaceInit, pre
 };
 
 const validateUint = (value: unknown, bits: number, name: string) => {
-	// The fields are serialized with setUint16/setUint32, which wrap silently, so an out-of-range value would be
-	// written as a different number than the one that was stated.
 	if (!Number.isInteger(value) || (value as number) < 0 || (value as number) >= 2 ** bits) {
 		throw new TypeError(`${name} must be an integer in [0, ${2 ** bits - 1}].`);
 	}
@@ -1516,12 +1540,10 @@ export const validateHdrStaticMetadata = (hdrStaticMetadata: HdrStaticMetadata, 
 	}
 };
 
-// MDCV and CLLI describe how a PQ or HLG grade was mastered, so a file that states them while stating no such
-// transfer describes a grade that isn't there.
 /** @internal */
 export const validateTransferCarriesHdrStaticMetadata = (
 	hdrStaticMetadata: HdrStaticMetadata | undefined,
-	colorSpace: VideoColorSpaceInit | undefined,
+	colorSpace: WideVideoColorSpaceInit | undefined,
 	prefix: string,
 ) => {
 	if (hdrStaticMetadata === undefined || transferNeedsTenBits(colorSpace?.transfer)) {
@@ -1572,7 +1594,7 @@ export const getAudioEncoderConfigExtension = (codec: AudioCodec) => {
 };
 
 const VALID_VIDEO_CODEC_STRING_PREFIXES = [
-	'avc1', 'avc3', 'hev1', 'hvc1', 'vp8', 'vp09', 'av01', 'mp4v', ...PRORES_FOURCCS,
+	'avc1', 'avc3', 'hev1', 'hvc1', 'vp8', 'vp09', 'av01', 'mp4v', DNXHD_FOURCC, ...PRORES_FOURCCS,
 ];
 const AVC_CODEC_STRING_REGEX = /^(avc1|avc3)\.[0-9a-fA-F]{6}$/;
 /** RFC 6381 §3.3: `mp4v` plus the object type indication, and the profile byte if one is stated. */
@@ -1689,8 +1711,6 @@ export const validateVideoChunkMetadata = (
 		// validation for it.
 		// https://www.w3.org/TR/webcodecs-hevc-codec-registration
 	} else if (metadata.decoderConfig.codec.startsWith('mp4v')) {
-		// MPEG-2-specific validation
-
 		if (!MPEG4_VISUAL_CODEC_STRING_REGEX.test(metadata.decoderConfig.codec)) {
 			throw new TypeError(
 				'Video chunk metadata decoder configuration codec string for MPEG-2 video must be a valid MPEG-4'
@@ -1815,9 +1835,6 @@ export const validateAudioChunkMetadata = (
 		|| metadata.decoderConfig.codec.startsWith('mp2')
 		|| metadata.decoderConfig.codec.startsWith('mp4a')
 	) {
-		// MPEG audio validation. The same object type indications serve Layer II and Layer III, so the
-		// accepted strings are the same for both and `mp2` is accepted alongside `mp3`.
-
 		if (
 			metadata.decoderConfig.codec !== 'mp3'
 			&& metadata.decoderConfig.codec !== 'mp2'

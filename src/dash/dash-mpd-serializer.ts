@@ -40,6 +40,7 @@ const NAMESPACE_URI_BY_PREFIX: Record<string, string> = {
 	scte35: DASH_NS.scte35,
 	scte214: DASH_NS.scte214,
 	dashif: DASH_NS.dashif,
+	dvb: DASH_NS.dvb,
 	mas: DASH_NS.mas,
 	xlink: DASH_NS.xlink,
 };
@@ -84,7 +85,6 @@ const setBool = (node: XmlNode, name: string, value: boolean | null | undefined)
 	}
 };
 
-// Shared by AdaptationSet and Representation, which both extend RepresentationBaseType.
 const setRepresentationBase = (node: XmlNode, base: {
 	profiles: string | null;
 	segmentProfiles: string | null;
@@ -107,7 +107,6 @@ const setRepresentationBase = (node: XmlNode, base: {
 	setFloat(node, 'maximumSAPPeriod', base.maximumSAPPeriod);
 	setInteger(node, 'selectionPriority', base.selectionPriority);
 	setString(node, 'tag', base.tag);
-	// On RepresentationBaseType in SCTE 214, so an AdaptationSet states them too
 	setString(node, 'scte214:supplementalCodecs', base.supplementalCodecs);
 	setString(node, 'scte214:supplementalProfiles', base.supplementalProfiles);
 };
@@ -124,6 +123,9 @@ const descriptorNodes = (parent: XmlNode, name: string, items: readonly DashDesc
 		node.setStringAttribute('schemeIdUri', item.schemeIdUri);
 		setString(node, 'value', item.value);
 		setString(node, 'id', item.id);
+		for (const [attribute, value] of Object.entries(item.foreignAttributes ?? {})) {
+			node.setStringAttribute(attribute, value);
+		}
 		parent.addChild(node);
 	}
 };
@@ -230,8 +232,6 @@ const representationBaseChildNodes = (parent: XmlNode, base: MpdRepresentationBa
 
 const baseUrlNode = (entry: MpdBaseURL): XmlNode => {
 	const node = new XmlNode('BaseURL');
-	// The parser stores the raw URI reference; emit it verbatim (XML-escaped only).
-	// setPathContent would percent-encode it and corrupt query strings / already-encoded paths.
 	node.setContent(entry.value);
 	setString(node, 'serviceLocation', entry.serviceLocation);
 	if (entry.availabilityTimeOffset) {
@@ -240,6 +240,8 @@ const baseUrlNode = (entry: MpdBaseURL): XmlNode => {
 	if (entry.availabilityTimeComplete === false) {
 		node.setStringAttribute('availabilityTimeComplete', 'false');
 	}
+	setInteger(node, 'dvb:priority', entry.dvbPriority);
+	setInteger(node, 'dvb:weight', entry.dvbWeight);
 	return node;
 };
 
@@ -288,6 +290,8 @@ const contentProtectionNode = (cp: ContentProtection): XmlNode => {
 	if (cp.keyId !== null) {
 		node.setStringAttribute('cenc:default_KID', keyIdToUuid(cp.keyId));
 	}
+	setString(node, 'refId', cp.refId);
+	setString(node, 'ref', cp.ref);
 	node.addElements(cp.psshBoxes.map(generateCencPsshElement));
 	for (const raw of cp.foreignXml) {
 		node.addRawXml(raw);
@@ -433,12 +437,14 @@ const appendCommonChildren = (
 	for (const config of source.audioChannelConfigurations) {
 		node.addChild(descriptorNode('AudioChannelConfiguration', config.schemeIdUri, config.value));
 	}
-	for (const property of source.supplementalProperties) {
-		node.addChild(descriptorNode('SupplementalProperty', property.schemeIdUri, property.value));
-	}
-	for (const property of source.essentialProperties) {
-		node.addChild(descriptorNode('EssentialProperty', property.schemeIdUri, property.value));
-	}
+	// `descriptorNodes`, not `descriptorNode`: the singular form writes only schemeIdUri and value, so
+	// these two lost `id` and every foreign attribute. DVB font download states the whole thing in
+	// foreign attributes - `<SupplementalProperty schemeIdUri="urn:dvb:dash:fontdownload:2014" value="1"
+	// dvb:url dvb:fontFamily dvb:mimeType>` on a text AdaptationSet (ETSI TS 103 285 7.2.1) - so what
+	// came out was a property that signalled a font and named none. Period level already did this right,
+	// which is what made the difference findable.
+	descriptorNodes(node, 'SupplementalProperty', source.supplementalProperties);
+	descriptorNodes(node, 'EssentialProperty', source.essentialProperties);
 	for (const entry of source.baseURLs) {
 		node.addChild(baseUrlNode(entry));
 	}
@@ -659,6 +665,8 @@ const periodNode = (period: MpdPeriod): XmlNode => {
 		node.addChild(sub);
 	}
 	labelNodes(node, 'GroupLabel', period.groupLabels);
+	descriptorNodes(node, 'SupplementalProperty', period.supplementalProperties);
+	descriptorNodes(node, 'EssentialProperty', period.essentialProperties);
 	for (const preselection of period.preselections ?? []) {
 		const ps = new XmlNode('Preselection');
 		setString(ps, 'id', preselection.id);
@@ -680,6 +688,11 @@ const periodNode = (period: MpdPeriod): XmlNode => {
 	}
 	for (const description of period.serviceDescriptions) {
 		node.addChild(serviceDescriptionNode(description));
+	}
+	// After ServiceDescription and before AdaptationSet, which is where PeriodType puts it in the
+	// 5th edition schema - and where it has to be, since the sets below point back at it with @ref
+	for (const cp of period.contentProtections) {
+		node.addChild(contentProtectionNode(cp));
 	}
 	for (const set of period.adaptationSets) {
 		node.addChild(adaptationSetNode(set));
@@ -771,6 +784,10 @@ const buildMpd = (mpd: Mpd): XmlNode => {
 		setFloat(pl, 'ttl', patch.ttl);
 		pl.setContent(patch.value);
 		node.addChild(pl);
+	}
+	// Before the first Period, which is where MPDtype puts it in the 5th edition schema
+	for (const cp of mpd.contentProtections) {
+		node.addChild(contentProtectionNode(cp));
 	}
 	for (const period of mpd.periods) {
 		node.addChild(periodNode(period));

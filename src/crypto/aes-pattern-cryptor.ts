@@ -44,7 +44,6 @@ export class AesPatternCryptor {
 		useConstantIv: boolean,
 		cryptor: BlockCryptor,
 	) {
-		// Treat pattern 0:0 as 1:0.
 		if (cryptByteBlock === 0 && skipByteBlock === 0) {
 			cryptByteBlock = 1;
 		}
@@ -78,11 +77,9 @@ export class AesPatternCryptor {
 
 	/** Apply pattern encryption to `text` in place; skipped ranges are never written. */
 	crypt(text: Uint8Array): void {
-		// With a constant IV, each call restarts from the stored sample IV.
 		if (this.useConstantIv) {
 			this.cryptor.setIv(this.iv);
 		}
-		// Only the crypt ranges are written; skipped ranges are never touched, so they stay verbatim.
 		const cryptText = text;
 		let offset = 0;
 		let remaining = cryptText.length;
@@ -94,7 +91,6 @@ export class AesPatternCryptor {
 				const needEncrypt = this.encryptionMode !== 'skipIfCryptByteBlockRemaining'
 					&& remaining >= AES_128_BLOCK_SIZE;
 				if (needEncrypt) {
-					// The partial pattern's full blocks are encrypted; a trailing partial block stays clear.
 					const alignedCryptByteSize = Math.floor(remaining / AES_128_BLOCK_SIZE) * AES_128_BLOCK_SIZE;
 					this.cryptor.crypt(cryptText.subarray(offset, offset + alignedCryptByteSize));
 					offset += alignedCryptByteSize;
@@ -107,7 +103,6 @@ export class AesPatternCryptor {
 			offset += cryptByteSize;
 			remaining -= cryptByteSize;
 
-			// The skipped blocks are left unencrypted.
 			const skipByteSize = Math.min(this.skipByteBlock * AES_128_BLOCK_SIZE, remaining);
 			offset += skipByteSize;
 			remaining -= skipByteSize;

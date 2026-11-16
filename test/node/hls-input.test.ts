@@ -1836,3 +1836,43 @@ hevc.ts
 	const videoTracks = await input.getVideoTracks();
 	expect(await Promise.all(videoTracks.map(x => x.getCodec()))).toEqual(['hevc']);
 });
+
+// A channel that has gone on air but not yet published a segment lists none. Answering null there is
+// indistinguishable from "this playlist has no video", and the two call for opposite things from a
+// consumer: one is a reason to give up, the other is a reason to wait.
+fixtureTest('a live playlist with no segments yet waits rather than reporting no video',
+	{ timeout: 60_000, concurrent: false }, async () => {
+		using input = new Input({
+			source: new UrlSource(server!.liveEmptyUrl, { requestInit: { cache: 'no-store' } }),
+			formats: ALL_FORMATS,
+		});
+
+		const videoTrack = await input.getPrimaryVideoTrack();
+		assert(videoTrack);
+		expect(await videoTrack.isLive()).toBe(true);
+
+		// It had to fetch more than once, which is the waiting - a single reload still found nothing
+		expect(server!.liveEmptyFetchCount()).toBeGreaterThan(1);
+
+		// And what it waited for is really there
+		const sink = new EncodedPacketSink(videoTrack);
+		const first = await sink.getPacket(0, { skipLiveWait: true });
+		assert(first);
+		expect(first.data.byteLength).toBeGreaterThan(0);
+	});
+
+fixtureTest('a finished playlist listing nothing answers at once rather than waiting forever',
+	{ timeout: 20_000, concurrent: false }, async () => {
+		// The other half of the rule above. An #EXT-X-ENDLIST says the edge will never move again, so
+		// waiting for a first segment that is not coming would hang - which is a worse answer than null.
+		using input = new Input({
+			source: new UrlSource(server!.endedEmptyUrl, { requestInit: { cache: 'no-store' } }),
+			formats: ALL_FORMATS,
+		});
+
+		const resolved = await Promise.race([
+			input.getPrimaryVideoTrack().then(() => 'answered').catch(() => 'answered'),
+			new Promise(resolve => setTimeout(() => resolve('hung'), 8000)),
+		]);
+		expect(resolved).toBe('answered');
+	});

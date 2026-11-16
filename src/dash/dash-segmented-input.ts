@@ -9,9 +9,10 @@
 import { Input } from '../input';
 import { type InputFormatOptions } from '../input-format';
 import { psshBoxesAreEqual } from '../isobmff/isobmff-misc';
-import { arrayArgmin, assert, binarySearchLessOrEqual, last, wait } from '../misc';
+import { arrayArgmin, assert, base64ToBytes, binarySearchLessOrEqual, last, textEncoder, wait } from '../misc';
 import { Segment, SegmentedInput, SegmentedInputTrackDeclaration, SegmentRetrievalOptions } from '../segmented-input';
 import { CustomPathedSource, SourceRequest } from '../source';
+import { SCTE35_BINARY_SCHEME } from '../mpeg-ts/scte35';
 import { type DashDemuxer } from './dash-demuxer';
 import {
 	psshBoxesFromContentProtections,
@@ -198,8 +199,6 @@ export class DashSegmentedInput extends SegmentedInput {
 		return result <= 50 ? 0 : result;
 	}
 
-	// A static MPD may carry availabilityStartTime for archival reasons but its segments are still
-	// presentation-time-relative; only dynamic MPDs anchor to the wall clock.
 	isWallClockTimeline(): boolean {
 		return this.context.isDynamic && this.context.availabilityStartTime !== null;
 	}
@@ -302,8 +301,6 @@ export class DashSegmentedInput extends SegmentedInput {
 			}
 
 			if (availabilityWindow !== null) {
-				// The window is stated against availabilityStartTime, so the period's own start has to be
-				// added back: a later period's segments are period-relative and would all fall before it.
 				const presentationStart = this.context.periodStart + (timeTicks - periodStartTicks) / timescale;
 				const presentationEnd = presentationStart + durationTicks / timescale;
 				if (presentationEnd < availabilityWindow.earliestPresentationTime) {
@@ -558,6 +555,8 @@ export class DashSegmentedInput extends SegmentedInput {
 			formatOptions,
 		});
 
+		this.forwardInbandEvents(dashSegment, input);
+
 		this.inputCache.push({
 			segment: dashSegment,
 			input,
@@ -591,6 +590,59 @@ export class DashSegmentedInput extends SegmentedInput {
 
 	getFirstSegmentTimestampOffset(): Promise<number> {
 		return Promise.resolve(0);
+	}
+
+	/**
+	 * Announces this period's `<EventStream>` events. A manifest is the only place a DASH splice has to
+	 * be, exactly as `#EXT-X-DATERANGE` is for HLS, so a reader that only looked in band carried none
+	 * of them. One `DashSegmentedInput` exists per Representation and each announces the period's
+	 * events, which the dedupe collapses back to one.
+	 *
+	 * An event with no payload is not announced: it signals through its scheme and attributes, and this
+	 * hands over bytes.
+	 */
+	announcePeriodEvents() {
+		for (const stream of this.context.period.eventStreams) {
+			const timescale = stream.timescale ?? 1;
+			const offset = stream.presentationTimeOffset ?? 0;
+
+			for (const event of stream.events) {
+				let scheme = stream.schemeIdUri;
+				let data: Uint8Array | null = null;
+
+				if (event.scte35Binary !== null) {
+					// SCTE 214-1 states the section as base64 inside the event's own <Signal>, whatever
+					// the stream's scheme says, so it names itself
+					scheme = SCTE35_BINARY_SCHEME;
+					data = base64ToBytes(event.scte35Binary);
+				} else {
+					const payload = event.messageData ?? event.value;
+					if (payload !== null) {
+						data = event.contentEncoding === 'base64'
+							? base64ToBytes(payload)
+							: textEncoder.encode(payload);
+					}
+				}
+
+				if (data === null) {
+					continue;
+				}
+
+				// ISO/IEC 23009-1 5.10.2.2: the period's start plus the event's own time, less whatever
+				// the stream shifts its timeline by
+				this.announceInbandEvent({
+					timestamp: this.context.periodStart + ((event.presentationTime ?? 0) - offset) / timescale,
+					scheme,
+					data,
+				});
+			}
+		}
+	}
+
+	override getTrackBackings() {
+		// Before any track is read, so a caller that listens and then reads sees them in order
+		this.announcePeriodEvents();
+		return super.getTrackBackings();
 	}
 
 	async getRawTimestampOffset(input: Input): Promise<number | null> {
@@ -657,8 +709,6 @@ const liveSegmentWindow = (
 		elapsedSec,
 		context.timeShiftBufferDepth ?? LIVE_WINDOW_WITHOUT_BUFFER_DEPTH,
 	);
-	// The window ends at the live edge, so a stream whose availabilityStartTime is far in the past begins
-	// at the depth's worth before now rather than at the number the first segment ever had.
 	return {
 		firstIndex: Math.max(0, Math.floor(((elapsedSec - windowSec) * timescale) / segDuration)),
 		count: Math.max(0, Math.floor((windowSec * timescale) / segDuration)),

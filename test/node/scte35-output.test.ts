@@ -74,7 +74,11 @@ const spliceSection = (
 	body.push((ptsAdjustment >>> 8) & 0xff);
 	body.push(ptsAdjustment & 0xff);
 	body.push(0x00); // cw_index
-	body.push(0x0f, 0xf0 | ((command.length >> 8) & 0x0f)); // tier 0xFFF, splice_command_length high
+	// tier is 12 bits, then splice_command_length is 12 more: 0x0f here puts tier's top 8 bits at 0x0f,
+	// so this states tier 0x0FF, not the 0xFFF ("no tier") a real encoder writes. TSDuck decodes it as
+	// 0x0FF. Left as is because the library neither writes nor reads tier - the section is the caller's
+	// bytes, passed through - so the value is fixture detail, not behaviour under test.
+	body.push(0x0f, 0xf0 | ((command.length >> 8) & 0x0f)); // tier, splice_command_length high
 	body.push(command.length & 0xff);
 	body.push(0x06); // splice_command_type: time_signal
 	body.push(...command);
@@ -311,16 +315,42 @@ test('a cue PID does not warn, but the same type without CUEI still does', async
 	const bytes = await buildStream(output => addScte35Section(output, spliceSection(0, 450_000)));
 
 	// The clean stream goes first: the demuxer warns once per stream type process-wide, so warning here
-	// would also mask the control below
+	// would also mask the control below. That one budget is why all three cases live in one test.
 	const clean = await warningsWhileDemuxing(bytes);
 	expect(clean.filter(line => line.includes('0x86'))).toEqual([]);
 
-	// Strip the registration that makes it a cue stream. The demuxer never checks the section CRC, so
-	// the identifier can be overwritten in place.
+	const hex = bytesToHexString(bytes);
+	const offsets: number[] = [];
+	for (let from = hex.indexOf('050443554549'); from !== -1; from = hex.indexOf('050443554549', from + 1)) {
+		offsets.push(from / 2);
+	}
+	// The PMT repeats and each copy carries CUEI twice - the program's own descriptor loop first, then
+	// the cue elementary stream - so the occurrences alternate program, ES, program, ES.
+	expect(offsets.length).toBeGreaterThanOrEqual(2);
+	expect(offsets.length % 2).toBe(0);
+
+	// 'ZZZZ' means nothing, deliberately not 'HDMV': at the program level that one declares a Blu-ray
+	// program, which remaps type 0x86 to DTS and makes the demuxer read the cue sections as PES.
+	const NOTHING = [0x5a, 0x5a, 0x5a, 0x5a];
+
+	// SCTE 35 §8.1 registers the cue stream at the program, and libavformat reads it only from there, so
+	// a stream carrying it there alone is conformant and must not warn either. Without this case the
+	// demuxer could read only the elementary-stream copy and nothing would notice.
+	const programOnly = bytes.slice();
+	for (const [index, at] of offsets.entries()) {
+		if (index % 2 === 1) {
+			programOnly.set(NOTHING, at + 2);
+		}
+	}
+	const programRegistered = await warningsWhileDemuxing(programOnly);
+	expect(programRegistered.filter(line => line.includes('0x86'))).toEqual([]);
+
+	// Now every occurrence, so the type is registered nowhere. The demuxer never checks the section CRC,
+	// so the identifiers can be overwritten in place.
 	const stripped = bytes.slice();
-	const at = bytesToHexString(stripped).indexOf('050443554549') / 2;
-	expect(at).toBeGreaterThan(0);
-	stripped.set([0x48, 0x44, 0x4d, 0x56], at + 2); // 'HDMV'
+	for (const at of offsets) {
+		stripped.set(NOTHING, at + 2);
+	}
 
 	const warnings = await warningsWhileDemuxing(stripped);
 	expect(warnings.filter(line => line.includes('0x86'))).toHaveLength(1);
@@ -396,13 +426,14 @@ describe('a cue stream through a segmented output', () => {
 		expect(warnings).toEqual([]);
 	}, 300_000);
 
-	test('a splice on the input\'s timeline is placed and named rather than silently misplaced', async () => {
-		// 2.5 rather than 12.5: a caller who forgot that mediaTimestampBase shifts the output's timeline
+	test('a splice before the stream begins is dropped and named, not written at the wrong time', async () => {
+		// 2.5 rather than 12.5: a caller who forgot that a section's splice_time is on the transport
+		// stream's own clock, which mediaTimestampBase shifts. Writing it into the first segment anyway
+		// would put a break 10 s from where the section says it is, and a receiver acts on that.
 		const { found, warnings } = await publish(2.5);
 
-		expect(found.map(entry => entry.cues.length)).toEqual([1, 0, 0]);
-		expect(warnings.join('\n')).toMatch(/more than one segment behind/);
-		expect(warnings.join('\n')).toMatch(/mediaTimestampBase/);
+		expect(found.every(entry => entry.cues.length === 0)).toBe(true);
+		expect(warnings.join('\n')).toMatch(/before this output's first packet/);
 	}, 300_000);
 
 	test('a splice past the end of the media is named rather than dropped in silence', async () => {
@@ -541,17 +572,20 @@ describe('ad markers in the media playlist', () => {
 		expect(line).toMatch(/SCTE35-OUT=0x[0-9A-F]+/);
 		expect(line).toMatch(/PLANNED-DURATION=4/);
 
-		// START-DATE is the date of the segment the cue landed in, on the stated clock
+		// START-DATE is the splice's own date on the stated clock, not the segment's opening: a segment
+		// is a second long here and the break does not begin at its edge
 		const startDate = /START-DATE="([^"]+)"/.exec(line!)![1]!;
 		const offset = (Date.parse(startDate) - ANCHOR.getTime()) / 1000;
-		expect(offset).toBeGreaterThanOrEqual(1);
-		expect(offset).toBeLessThanOrEqual(2);
+		expect(offset).toBeCloseTo(1.5, 3);
 
-		// And it sits on the same date the segment's own PROGRAM-DATE-TIME states
+		// And it falls inside the segment that carries it, which opens before it
 		const lines = playlist.split('\n');
 		const at = lines.indexOf(line!);
 		const pdt = lines.slice(at).find(l => l.startsWith('#EXT-X-PROGRAM-DATE-TIME'));
-		expect(pdt).toBe(`#EXT-X-PROGRAM-DATE-TIME:${startDate}`);
+		expect(pdt).toBeDefined();
+		const segmentDate = Date.parse(pdt!.slice('#EXT-X-PROGRAM-DATE-TIME:'.length));
+		expect(segmentDate).toBeLessThanOrEqual(Date.parse(startDate));
+		expect(Date.parse(startDate) - segmentDate).toBeLessThan(1000); // Within the segment
 	}, 300_000);
 
 	test('daterange without a clock says so rather than writing an invalid tag', async () => {

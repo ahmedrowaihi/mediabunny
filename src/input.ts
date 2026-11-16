@@ -98,6 +98,39 @@ export type InputEvents = {
 		/** Whether the source is the root file of the media. */
 		isRoot: boolean;
 	};
+	/**
+	 * Emitted for an event carried **inside** the media rather than alongside it: an SCTE-35 splice on
+	 * an MPEG-TS cue stream, and in time whatever else a container carries this way.
+	 *
+	 * It is an event rather than a track because these are not media: they have no samples, no codec
+	 * and no duration of their own, and a reader that had to pull a track to see a splice would have
+	 * to keep pulling it in step with the media to see one in time.
+	 *
+	 * Listen before reading. They are emitted as the bytes carrying them are parsed, so a listener
+	 * added after a read has already passed a splice will not be told about it.
+	 */
+	inbandEvent: InbandEvent;
+};
+
+/**
+ * An event carried inside the media, as the container carried it.
+ *
+ * @group Input files & tracks
+ * @public
+ */
+export type InbandEvent = {
+	/**
+	 * Where it sits on the input's timeline, in seconds, or null where the carriage states no time of
+	 * its own - an SCTE-35 section states its splice time inside the payload rather than outside it.
+	 */
+	timestamp: number | null;
+	/**
+	 * What kind of event this is. `urn:scte:scte35:2013:bin` for a binary SCTE-35 section, which is
+	 * the identifier the same payload carries in DASH and HLS.
+	 */
+	scheme: string;
+	/** The payload exactly as it was carried, unparsed. */
+	data: Uint8Array;
 };
 
 /**
@@ -578,6 +611,20 @@ export class Input<S extends Source = Source> extends EventEmitter<InputEvents> 
 	async getPsshBoxes() {
 		const demuxer = await this._getDemuxer();
 		return demuxer.getPsshBoxes();
+	}
+
+	/**
+	 * Returns the frames of the file's ancillary data tracks (SMPTE ST 436M), which is how an MXF broadcast
+	 * master carries VANC - closed captions, AFD, timecode - beside its picture and sound. Use
+	 * {@link ancillaryCaptionsOf} or {@link ancillaryPacketsOf} to read one.
+	 *
+	 * There is no track type for ancillary essence, so these frames do not appear in
+	 * {@link Input.getTracks} and are read whole rather than through a sink. Returns an empty array for
+	 * files that carry none.
+	 */
+	async getAncillaryFrames() {
+		const demuxer = await this._getDemuxer();
+		return demuxer.getAncillaryFrames();
 	}
 
 	/**

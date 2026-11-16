@@ -408,6 +408,15 @@ export type St2110AncSdpOptions = {
 	vpidCode?: number;
 	/** The PTP grandmaster this stream's clock is locked to, written as `ts-refclk`. */
 	ptpGrandmaster?: string;
+	/**
+	 * The sender's MAC address, written as `ts-refclk:localmac=`, for a stream whose clock is its own
+	 * rather than locked to PTP.
+	 *
+	 * ST 2110-10 §8.2 requires a reference clock to be stated either way, so a stream with neither of
+	 * these says nothing about what its timestamps are against - which leaves a receiver no basis for
+	 * aligning it with anything else.
+	 */
+	localMac?: string;
 };
 
 const isMulticastIpv4 = (address: string) => {
@@ -472,6 +481,8 @@ export const buildAncSdp = (options: St2110AncSdpOptions): string => {
 	lines.push('a=mediaclk:direct=0');
 	if (options.ptpGrandmaster) {
 		lines.push(`a=ts-refclk:ptp=IEEE1588-2008:${options.ptpGrandmaster}`);
+	} else if (options.localMac) {
+		lines.push(`a=ts-refclk:localmac=${options.localMac}`);
 	}
 
 	return lines.join('\n') + '\n';

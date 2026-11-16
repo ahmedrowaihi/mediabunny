@@ -37,6 +37,7 @@ import { AudioCodec, VideoCodec } from '../../src/codec.js';
 import { EncodedPacket, PacketType } from '../../src/packet.js';
 import { assert, promiseWithResolvers } from '../../src/misc.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
+import { HlsImageStreamSource, type HlsImageSheetInfo } from '../../src/hls/hls-image-stream.js';
 import { Input } from '../../src/input.js';
 import { BufferSource, CustomPathedSource, FilePathSource } from '../../src/source.js';
 import { Conversion } from '../../src/conversion.js';
@@ -5662,4 +5663,210 @@ describe('closing two packet sources that share a playlist', () => {
 			}, 60_000);
 		}
 	}
+});
+
+// CHARACTERISTICS is what a player's accessibility setting selects on (RFC 8216 §4.3.4.1). Without it a
+// described-audio or SDH rendition is indistinguishable from another language entry, so the disposition
+// has to reach the master playlist rather than only the segments.
+test('an accessibility disposition reaches EXT-X-MEDIA CHARACTERISTICS', async () => {
+	const files = new Map<string, string>();
+	const output = new Output({
+		format: new HlsOutputFormat({ segmentFormat: new MpegTsOutputFormat(), targetDuration: 2 }),
+		target: new PathedTarget('master.m3u8', (request) => {
+			const target = new BufferTarget();
+			target.on('finalized', () => files.set(request.path, new TextDecoder().decode(target.buffer!)));
+			return target;
+		}),
+	});
+
+	const video = videoSource();
+	output.addVideoTrack(video);
+
+	const described = audioSource();
+	output.addAudioTrack(described, {
+		languageCode: 'eng',
+		name: 'Described',
+		disposition: { visuallyImpaired: true },
+	});
+	// No identifier exists for a hearing-impaired audio mix, so this one must state nothing
+	const plainAudio = audioSource();
+	output.addAudioTrack(plainAudio, {
+		languageCode: 'deu',
+		name: 'German',
+		disposition: { hearingImpaired: true },
+	});
+
+	const sdh = new TextSubtitleSource('webvtt');
+	output.addSubtitleTrack(sdh, { languageCode: 'eng', name: 'SDH', disposition: { hearingImpaired: true } });
+
+	await output.start();
+	for (const timestamp of [0, 0.5, 1, 1.5, 2, 2.5, 3, 3.5]) {
+		await video.add(
+			new EncodedPacket(avcPacketData, timestamp % 2 === 0 ? 'key' : 'delta', timestamp, 0.5),
+			avcMetadata,
+		);
+		await described.add(new EncodedPacket(aacPacketData, 'key', timestamp, 0.5), aacMetadata);
+		await plainAudio.add(new EncodedPacket(aacPacketData, 'key', timestamp, 0.5), aacMetadata);
+	}
+	await sdh.add('WEBVTT\n\n00:00.100 --> 00:00.900\nHildy!\n');
+	await output.finalize();
+
+	const master = files.get('master.m3u8')!;
+	const lineFor = (name: string) =>
+		master.split('\n').find(line => line.startsWith('#EXT-X-MEDIA') && line.includes(`NAME="${name}"`))!;
+
+	expect(lineFor('Described')).toContain('CHARACTERISTICS="public.accessibility.describes-video"');
+	expect(lineFor('SDH')).toContain(
+		'CHARACTERISTICS="public.accessibility.transcribes-spoken-dialog'
+		+ ',public.accessibility.describes-music-and-sound"',
+	);
+	// An invented identifier would be worse than none
+	expect(lineFor('German')).not.toContain('CHARACTERISTICS');
+}, 60_000);
+
+// Trick play: a rendition of thumbnail sheets a player scrubs instead of seeking the video. The
+// sheets come from the caller - the library does not capture them - so what is under test is that a
+// pushed sheet lands as a file, that its playlist describes the grid, and that the master announces
+// it beside the variants.
+
+describe('HLS image stream', () => {
+	const writeWithSheets = async (
+		sheets: { bytes: Uint8Array; info: HlsImageSheetInfo }[],
+		options: { maxLiveSegmentCount?: number } = {},
+	) => {
+		using input = new Input({
+			source: new FilePathSource(path.join(__dirname, '../public/video.mp4')),
+			formats: ALL_FORMATS,
+		});
+
+		const targets = new Map<string, BufferTarget>();
+		let master = '';
+		const imageStream = new HlsImageStreamSource({ path: 'thumbs.m3u8' });
+
+		const output = new Output({
+			format: new HlsOutputFormat({
+				segmentFormat: new CmafOutputFormat(),
+				targetDuration: 2,
+				imageStream,
+				onMaster: content => void (master = content),
+				...(options.maxLiveSegmentCount === undefined
+					? {}
+					: { live: true, maxLiveSegmentCount: options.maxLiveSegmentCount }),
+			}),
+			// Kept and read after finalize: a BufferTarget's buffer is only whole once it is closed, so
+			// reading it from a write event gives whatever had landed by then
+			target: new PathedTarget('index.m3u8', (request) => {
+				const target = new BufferTarget();
+				targets.set(request.path, target);
+				return target;
+			}),
+		});
+
+		const track = (await input.getPrimaryVideoTrack())!;
+		const source = new EncodedVideoPacketSource('avc');
+		output.addVideoTrack(source);
+		await output.start();
+
+		for (const sheet of sheets) {
+			await imageStream.add(sheet.bytes, sheet.info);
+		}
+
+		const config = (await track.getDecoderConfig())!;
+		let first = true;
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			await source.add(packet, first ? { decoderConfig: config } : undefined);
+			first = false;
+		}
+		await output.finalize();
+
+		const files = new Map<string, Uint8Array>();
+		for (const [filePath, target] of targets) {
+			if (target.buffer) {
+				files.set(filePath, new Uint8Array(target.buffer));
+			}
+		}
+
+		return { files, master, imageStream };
+	};
+
+	const sheet = (seed: number, info: Partial<HlsImageSheetInfo> = {}) => ({
+		bytes: Uint8Array.from({ length: 64 }, (unused, index) => (index * seed) & 0xff),
+		info: {
+			layout: { columns: 5, rows: 4 },
+			tileResolution: { width: 160, height: 90 },
+			tileDuration: 1,
+			...info,
+		} as HlsImageSheetInfo,
+	});
+
+	test('a pushed sheet is written, listed with its grid, and announced in the master', async () => {
+		const { files, master } = await writeWithSheets([sheet(7), sheet(11)]);
+
+		// The sheets themselves, as given
+		expect(files.get('image0.jpg')).toEqual(sheet(7).bytes);
+		expect(files.get('image1.jpg')).toEqual(sheet(11).bytes);
+
+		const playlist = new TextDecoder().decode(files.get('thumbs.m3u8'));
+		// Every URI here is an image, which is what lets a player skip the usual segment handling
+		expect(playlist).toContain('#EXT-X-IMAGES-ONLY');
+		expect(playlist).toContain('#EXT-X-TILES:RESOLUTION=160x90,LAYOUT=5x4,DURATION=1');
+		expect(playlist).toContain('image0.jpg');
+		expect(playlist).toContain('image1.jpg');
+		// 5x4 tiles of one second each: the sheet covers twenty seconds, not one
+		expect(playlist).toContain('#EXTINF:20');
+		expect(playlist).toContain('#EXT-X-ENDLIST');
+
+		// And the master points at it, beside the variants rather than inside one
+		expect(master).toContain('#EXT-X-IMAGE-STREAM-INF:');
+		expect(master).toContain('URI="thumbs.m3u8"');
+		expect(master).toContain('CODECS="jpeg"');
+		expect(master).toContain('RESOLUTION=160x90');
+		expect(master).toMatch(/BANDWIDTH=\d+/);
+	});
+
+	test('the image playlist states its media sequence from the first write', async () => {
+		// Zero is what an absent tag already means (RFC 8216bis 4.4.3.2), so this is not correcting a
+		// wrong number - it is so the number never appears to arrive from nowhere when the first sheet
+		// rolls off a playlist that exists in order to evict.
+		const { files } = await writeWithSheets([sheet(7)]);
+		const playlist = new TextDecoder().decode(files.get('thumbs.m3u8'));
+		expect(playlist).toContain('#EXT-X-MEDIA-SEQUENCE:0');
+	});
+
+	test('an output with no sheets pushed announces nothing', async () => {
+		// A declared image stream that never received a sheet must not leave a tag pointing at a
+		// playlist that was never written
+		const { files, master } = await writeWithSheets([]);
+		expect(master).not.toContain('EXT-X-IMAGE-STREAM-INF');
+		expect(files.has('thumbs.m3u8')).toBe(false);
+	});
+
+	test('sheets roll out of a live window instead of growing without bound', async () => {
+		// Two segments of a two-second target is a four-second window; each sheet here covers two
+		const { files, imageStream } = await writeWithSheets(
+			[1, 2, 3, 4, 5].map(seed => sheet(seed, { layout: { columns: 2, rows: 1 }, tileDuration: 1 })),
+			{ maxLiveSegmentCount: 2 },
+		);
+
+		expect(imageStream.sheetCount).toBeLessThan(5);
+		const playlist = new TextDecoder().decode(files.get('thumbs.m3u8'));
+		// The oldest is gone from the listing, and the sequence number says how many went
+		expect(playlist).not.toContain('image0.jpg');
+		expect(playlist).toMatch(/#EXT-X-MEDIA-SEQUENCE:[1-9]/);
+	});
+
+	test('a sheet that describes no tiles is refused rather than written', async () => {
+		const stream = new HlsImageStreamSource();
+		// Not attached: pushing before the output starts has nowhere to write
+		await expect(stream.add(new Uint8Array(4), sheet(1).info)).rejects.toThrow(/not attached/);
+
+		for (const bad of [
+			{ layout: { columns: 0, rows: 4 } },
+			{ layout: { columns: 5, rows: 0 } },
+			{ tileResolution: { width: 0, height: 90 } },
+			{ tileDuration: 0 },
+		]) {
+			await expect(writeWithSheets([sheet(3, bad as Partial<HlsImageSheetInfo>)])).rejects.toThrow(TypeError);
+		}
+	});
 });

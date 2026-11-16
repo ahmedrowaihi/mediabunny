@@ -7,7 +7,7 @@
  */
 
 import { TAG_WMPACEINFO } from './hls/hls-misc';
-import { CBCS_HLS_METHOD, dashContentProtectionSpecs, hlsKeySpecs } from './manifest-protection';
+import { dashContentProtectionSpecs, hlsKeysOf } from './manifest-protection';
 import type { DrmSystem } from './manifest-protection';
 import type { ProtectionScheme } from './crypto/subsample-generator';
 import { resolveURL } from './dash/dash-misc';
@@ -37,9 +37,6 @@ import type {
 import { bytesToHexString, popcount } from './misc';
 import { variantFromSchemeIdUri, WM_PACE_INFO_SCHEME_ID_URI } from './watermarking/wm-signalling';
 import type { Manifest, ManifestTransform } from './manifest';
-
-// Selective transforms keep untouched nodes by reference through these helpers, so a derived variant
-// differs from its base only along the edited spine; whole-manifest ones have nothing to share
 
 /** Map that returns the original array reference when no element changed. */
 const mapShared = <T>(items: T[], fn: (item: T) => T): T[] => {
@@ -140,7 +137,6 @@ const channelCountFromConfig = (config: { schemeIdUri: string; value: string }):
 		const mask = Number.parseInt(config.value, 16);
 		return Number.isNaN(mask) ? null : popcount(mask);
 	}
-	// urn:mpeg:dash:23003:3:audio_channel_configuration:2011, DTS-2014, and peers: plain decimal count.
 	const count = Number.parseInt(config.value, 10);
 	return Number.isNaN(count) ? null : count;
 };
@@ -284,7 +280,6 @@ const filterMaster = (playlist: HlsMasterPlaylist, keep: RenditionPredicate): Hl
 	const iFrameStreams = filterShared(playlist.iFrameStreams, stream => keep(iFrameRendition(stream)));
 	let variants = filterShared(playlist.variants, variant => keep(variantRendition(variant)));
 	if (media !== playlist.media) {
-		// A dropped media group must not leave dangling variant references behind.
 		const groups = new Set(media.map(rendition => rendition.groupId));
 		variants = mapShared(variants, variant => pruneGroupRefs(variant, groups));
 	}
@@ -395,8 +390,6 @@ export type ResolutionCap = {
 	minHeight?: number;
 };
 
-// A rendition the bound does not speak about is kept, whether because its kind is out of scope or
-// because it states no value to weigh.
 const outOfScope = (rendition: Rendition, kind: Rendition['kind'] | undefined) =>
 	kind !== undefined && rendition.kind !== kind;
 
@@ -549,7 +542,6 @@ const withoutWatermarkingTags = (tags: string[]): string[] =>
 export const neutralizeWatermarking = (): ManifestTransform => (manifest) => {
 	if (manifest.format === 'dash') {
 		const periods = mapShared(manifest.mpd.periods, (period) => {
-			// One Adaptation Set per variant on ingest, so the duplicates collapse here.
 			const seen = new Set<string>();
 			const kept = filterShared(period.adaptationSets, (set) => {
 				if (!set.essentialProperties.some(isWatermarkingDescriptor)) {
@@ -643,8 +635,6 @@ const rebaseLevel = (urls: MpdBaseURL[], parent: string): MpdBaseURL[] =>
 const anchorOf = (resolved: MpdBaseURL[], parent: string): string => resolved[0]?.value ?? parent;
 
 const rebaseMpd = (mpd: Mpd, base: string): Mpd => {
-	// Each level resolves against the parent anchor, never `base`, so the chain and an absolute ancestor
-	// survive; sibling BaseURLs are failover alternatives and the first anchors
 	let sawBaseUrl = mpd.baseURLs.length > 0;
 	const mpdBaseURLs = rebaseLevel(mpd.baseURLs, base);
 	const mpdAnchor = anchorOf(mpdBaseURLs, base);
@@ -666,8 +656,6 @@ const rebaseMpd = (mpd: Mpd, base: string): Mpd => {
 		return { ...period, baseURLs: periodBaseURLs, adaptationSets };
 	});
 
-	// With no BaseURL anywhere, segment templates resolve against the document URL; inject one so the
-	// manifest still points at the original assets once served from elsewhere.
 	return { ...mpd, baseURLs: sawBaseUrl ? mpdBaseURLs : [{ value: base, serviceLocation: null }], periods };
 };
 
@@ -743,6 +731,8 @@ const dashContentProtections = (options: DrmOptions): ContentProtection[] =>
 	dashContentProtectionSpecs({ scheme: options.scheme, defaultKid: options.defaultKid, systems: options.systems })
 		.map((spec): ContentProtection => ({
 			schemeIdUri: spec.schemeIdUri,
+			refId: null,
+			ref: null,
 			value: spec.value,
 			keyId: spec.defaultKid === null ? null : bytesToHexString(spec.defaultKid),
 			psshBoxes: spec.pssh === null ? [] : [spec.pssh],
@@ -750,15 +740,14 @@ const dashContentProtections = (options: DrmOptions): ContentProtection[] =>
 		}));
 
 const hlsKeys = (options: DrmOptions): HlsKey[] =>
-	hlsKeySpecs({ systems: options.systems, fairplayKeyUri: options.fairplayKeyUri })
-		.map((spec): HlsKey => ({
-			method: CBCS_HLS_METHOD,
-			uri: spec.uri,
-			iv: null,
-			keyId: null,
-			keyFormat: spec.keyFormat,
-			keyFormatVersions: [1],
-		}));
+	hlsKeysOf({
+		systems: options.systems,
+		fairplayKeyUri: options.fairplayKeyUri,
+		// The same scheme the DASH descriptor states. Dropping it here is what let one `drm()` call
+		// describe the same content as `cenc` in the MPD and SAMPLE-AES - which is cbcs - in the
+		// playlist.
+		scheme: options.scheme,
+	});
 
 /**
  * Signal DRM on the manifest. For a DASH MPD, prepends `<ContentProtection>` descriptors (the
@@ -851,8 +840,6 @@ const mapHlsUrls = (
 			media: mapShared(playlist.media, m => (m.uri === null ? m : { ...m, uri: map(m.uri, 'rendition') })),
 		};
 	}
-	// A media playlist's `#EXT-X-MAP` is sticky (shared across segments), so rewrite each distinct map
-	// object once and reuse it — one `'init'` call per init, `'segment'` calls in playback order.
 	const rewrittenMaps = new Map<HlsMap, HlsMap>();
 	const segments = playlist.segments.map((segment) => {
 		let nextMap = segment.map;

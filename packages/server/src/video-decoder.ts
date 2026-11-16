@@ -14,6 +14,7 @@ import {
 	mapColorPrimaries,
 	mapMatrixCoefficients,
 	mapTransferCharacteristics,
+	Y4M_TAG_TO_PIXEL_FORMAT,
 } from './misc';
 import { assert, binarySearchLessOrEqual, simplifyRational, toUint8Array } from '../../../src/misc';
 import { AvFrameVideoSampleResource } from './video-sample';
@@ -41,8 +42,9 @@ export class NodeAvVideoDecoder extends CustomVideoDecoder {
 	// eslint-disable-next-line @typescript-eslint/no-unused-vars
 	static override supports(codec: VideoCodec, config: VideoDecoderConfig): boolean {
 		return codec === 'avc' || codec === 'hevc' || codec === 'vp8' || codec === 'vp9' || codec === 'av1'
-			// The overlay codecs, whose alpha is in the bitstream rather than in a second stream
-			|| codec === 'qtrle' || codec === 'png';
+			|| codec === 'mpeg2'
+			|| codec === 'qtrle' || codec === 'png'
+			|| codec === 'rawvideo';
 	}
 
 	async init() {
@@ -91,14 +93,26 @@ export class NodeAvVideoDecoder extends CustomVideoDecoder {
 		codecContext.height = this.config.codedHeight ?? 0;
 		codecContext.codecType = NodeAv.AVMEDIA_TYPE_VIDEO;
 		codecContext.codecId = codecId;
-		codecContext.extraData = this.config.description
-			? Buffer.from(toUint8Array(this.config.description))
-			: null;
+		if (this.codec === 'rawvideo') {
+			// Uncompressed frames have no extradata; what the `description` carries is the Y4M colour
+			// space, which is the pixel format and the only thing the decoder needs to be told
+			const tag = this.config.description
+				? new TextDecoder('latin1').decode(toUint8Array(this.config.description))
+				: '420jpeg';
+			const pixelFormat = Y4M_TAG_TO_PIXEL_FORMAT[tag];
+			if (pixelFormat === undefined) {
+				throw new Error(`Uncompressed video stating an unknown colour space '${tag}' cannot be decoded.`);
+			}
+
+			codecContext.pixelFormat = pixelFormat;
+		} else {
+			codecContext.extraData = this.config.description
+				? Buffer.from(toUint8Array(this.config.description))
+				: null;
+		}
 		codecContext.sampleAspectRatio = new NodeAv.Rational(this.pixelAspectRatio.num, this.pixelAspectRatio.den);
 		codecContext.threadCount = 0; // libavcodec defaults this to 1, unlike the ffmpeg CLI
 
-		// QuickTime RLE and PNG take their pixel format from this rather than from the bitstream, and
-		// `open2` returns EINVAL without it: 32 is the one that keeps the alpha channel
 		if (this.config.bitsPerCodedSample !== undefined) {
 			codecContext.bitsPerCodedSample = this.config.bitsPerCodedSample;
 		}

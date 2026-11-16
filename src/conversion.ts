@@ -57,18 +57,19 @@ import {
 	DeclaredColorSpaceMismatchError,
 } from './media-source';
 import {
+	MaybePromise,
+	Rotation,
 	assert,
 	assertNever,
 	ceilToMultipleOfTwo,
 	clamp,
 	colorSpaceIsEmpty,
+	composeRotationAndFlip,
+	duplicateMediabunnyLoaded,
 	isIso639Dash2LanguageCode,
 	isNumber,
-	MaybePromise,
-	composeRotationAndFlip,
 	promiseWithResolvers,
-	Rotation,
-	duplicateMediabunnyLoaded,
+	type WideVideoColorSpaceInit,
 } from './misc';
 import { Output, OutputTrackGroup } from './output';
 import { NullOutputFormat } from './output-format';
@@ -317,7 +318,7 @@ export type ConversionVideoOptions = {
 	 *
 	 * Setting this field forces a transcode.
 	 */
-	colorSpace?: VideoColorSpaceInit;
+	colorSpace?: WideVideoColorSpaceInit;
 	/**
 	 * The HDR10 static metadata (mastering display colour volume and content light level) to signal on the output
 	 * track. Defaults to the input track's, which describes how the content was graded and therefore still holds
@@ -989,8 +990,6 @@ export class Conversion {
 	_lastProgress = 0;
 	/** @internal */
 	_lastProcessedTime = 0;
-	// Captured where the track is discarded, because the explanation is built synchronously and
-	// getCodec() is async.
 	/** @internal */
 	_undecodableSourceCodecs: MediaCodec[] = [];
 
@@ -1137,8 +1136,6 @@ export class Conversion {
 			} else {
 				validateSubtitleOptions(options.subtitle);
 			}
-		} else {
-			// We'll validate the return value later
 		}
 
 		if (options.trim !== undefined && (!options.trim || typeof options.trim !== 'object')) {
@@ -1204,8 +1201,6 @@ export class Conversion {
 
 			tracks = [primaryVideoTrack, primaryAudioTrack].filter(x => x !== null);
 
-			// The input has no primary subtitle track to select, so 'primary' holds none. Record them instead of
-			// letting them go missing without a word.
 			for (const subtitleTrack of await this.input.getSubtitleTracks()) {
 				this.discardedTracks.push({
 					track: subtitleTrack,
@@ -1220,7 +1215,6 @@ export class Conversion {
 
 		const outputTrackCounts = this.output.format.getSupportedTrackCounts();
 
-		// Only subtitles are counted: the video and audio callbacks are handed the track's own number.
 		let nSubtitle = 1;
 
 		// All tracks that aren't discarded by the user
@@ -1297,7 +1291,6 @@ export class Conversion {
 
 						nSubtitle++;
 					} else {
-						// Already validated
 						trackOptions = Array.isArray(this._options.subtitle)
 							? this._options.subtitle
 							: [this._options.subtitle];
@@ -1604,8 +1597,6 @@ export class Conversion {
 					);
 				}
 			} else if (decodabilityIsTheProblem) {
-				// Without this branch a missing *decoder* fell through to the generic message below,
-				// which names the output configuration while the cause is the input's codec.
 				const sourceCodecs = [...new Set(this._undecodableSourceCodecs)];
 
 				if (sourceCodecs.length === 1) {
@@ -1823,7 +1814,6 @@ export class Conversion {
 
 		this._finishRequested = true;
 
-		// Wake any pump parked at a checkpoint so it can run out its loop and flush.
 		for (const pump of this._trackPumps) {
 			pump.wake?.();
 		}
@@ -1939,10 +1929,6 @@ export class Conversion {
 		let videoCodecs = this.output.format.getSupportedVideoCodecs();
 		const alpha = trackOptions.alpha ?? 'discard';
 
-		// Where the parameter sets sit is a property of the bitstream, so moving them means rewriting every
-		// sample's NAL units. The muxer already does that for an Annex B source, since it has to convert
-		// those samples to length-prefixed anyway - so a copy can honour the option there and nowhere else.
-		// An Annex B source is one whose decoder config states no description.
 		const sourceIsAnnexB = (sourceCodec === 'avc' || sourceCodec === 'hevc')
 			&& !(await track.getDecoderConfig())?.description;
 
@@ -1954,15 +1940,11 @@ export class Conversion {
 			// Same for the bit depth, which is fixed by the codec profile the samples were encoded with.
 			|| trackOptions.bitDepth !== undefined
 			|| trackOptions.colorSpace !== undefined
-			// Unreachable while a demanded `hdrStaticMetadata` requires a demanded `colorSpace`, which already forces
-			// the transcode. Stated anyway, so that relaxing that pairing cannot turn into a copy silently ignoring it.
 			|| trackOptions.hdrStaticMetadata !== undefined
 			|| trackOptions.process !== undefined
 			|| trackOptions.preProcess !== undefined
-			// A hook with frames still held adds samples the copied packets do not have
 			|| trackOptions.preProcessFlush !== undefined
 			|| trackOptions.processFlush !== undefined
-			// Copied packets were encoded by something else, so none of these could have applied to them
 			|| trackOptions.encoderControls !== undefined
 			|| trackOptions.quality !== undefined
 			// eslint-disable-next-line @typescript-eslint/no-deprecated
@@ -2221,7 +2203,6 @@ export class Conversion {
 				?? (colorSpaceIsEmpty(sourceColorSpace) ? undefined : sourceColorSpace);
 			const hdrStaticMetadata = trackOptions.hdrStaticMetadata ?? sourceDecoderConfig?.hdrStaticMetadata;
 
-			// Either hook can hand back a different size, so the hints apply to both
 			const sampleHookIsSet = trackOptions.process !== undefined || trackOptions.preProcess !== undefined
 				|| trackOptions.processFlush !== undefined || trackOptions.preProcessFlush !== undefined;
 			const encodableCodecOptions = {
@@ -2271,7 +2252,6 @@ export class Conversion {
 			};
 			assert(encodingConfig.transform);
 
-			// A hook hands back samples of its own, so the rotation cannot be left to the track metadata
 			let needsRerender = width !== originalWidth
 				|| height !== originalHeight
 				|| (totalRotation !== 0 && (!canUseRotationMetadata || sampleHookIsSet))
@@ -2281,16 +2261,12 @@ export class Conversion {
 				|| squarePixelWidth !== await track.getCodedWidth()
 				|| squarePixelHeight !== await track.getCodedHeight();
 
-			// Only the re-rendered samples say whether depth and color survived, so what they do not back is
-			// dropped at the encoder; this handles the encoder refusing them outright
 			const dropInheritedColor = () => {
 				encodingConfig.bitDepth = trackOptions.bitDepth;
 				encodingConfig.colorSpace = trackOptions.colorSpace;
 				encodingConfig.hdrStaticMetadata = trackOptions.hdrStaticMetadata;
 			};
 
-			// A `preProcess` hook owns the frames' format, so probing the decoded sample tests one the encoder
-			// never sees
 			if (!needsRerender && trackOptions.preProcess === undefined) {
 				// If we're directly passing decoded samples back to the encoder, sometimes the encoder may error due
 				// to lack of support of certain video frame formats, like when HDR is at play. To check for this, we
@@ -2321,8 +2297,6 @@ export class Conversion {
 						await tempOutput.finalize();
 					} catch (error) {
 						if (error instanceof DeclaredColorSpaceMismatchError && trackOptions.colorSpace !== undefined) {
-							// The caller demanded this color space and the source doesn't carry it; re-rendering
-							// would only hide the conflict behind a canvas.
 							void tempOutput.cancel();
 							throw error;
 						}
@@ -2482,8 +2456,6 @@ export class Conversion {
 			averageBitrate: averageBitrate ?? undefined,
 			maximumPacketCount,
 			dolbyVision: trackOptions.dolbyVision,
-			// On a copy this is the only thing that moves the parameter sets. On a transcode it restates
-			// what the encoder was already configured to emit, so it changes nothing there.
 			parameterSets: trackOptions.parameterSets,
 		});
 
@@ -3013,8 +2985,6 @@ export class Conversion {
 
 		const supportedCodecs = this.output.format.getSupportedSubtitleCodecs();
 
-		// Every subtitle codec is driven from the same cue representation, so any supported codec is reachable from
-		// any source codec; only a codec the format cannot hold is out of reach.
 		let targetCodec: SubtitleCodec | null;
 		if (trackOptions.codec) {
 			targetCodec = supportedCodecs.includes(trackOptions.codec) ? trackOptions.codec : null;
@@ -3031,14 +3001,12 @@ export class Conversion {
 			return;
 		}
 
-		// The config is the source codec's own header block, so it only means anything to that same codec.
 		const config = targetCodec === sourceCodec ? await track.getConfig() : null;
 		const source = new SubtitleCueSource(targetCodec);
 
 		this._registerTrackPump(async (pump) => {
 			const sink = new SubtitleCueSink(track);
 
-			// Only the first cue carries the track's config.
 			let meta: SubtitleMetadata | undefined = { config: config ?? { description: '' } };
 
 			for await (const cue of sink.cues(this._startTimestamp, this._endTimestamp)) {
@@ -3072,8 +3040,6 @@ export class Conversion {
 
 		let ownGroup: OutputTrackGroup | null = null;
 		if (!trackOptions.group && !this._composable) {
-			// Create per-track groups to replicate the input's pairability graph. Don't do this for composable
-			// conversions.
 			ownGroup = new OutputTrackGroup();
 		}
 

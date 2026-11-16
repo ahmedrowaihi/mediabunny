@@ -32,6 +32,10 @@ const TAG_INSTANCE_UID = 0x3c0a;
 const TAG_CONTENT_STORAGE = 0x3b03;
 const TAG_PACKAGES = 0x1901;
 const TAG_PACKAGE_UID = 0x4401;
+const TAG_ESSENCE_CONTAINERS = 0x1902;
+const TAG_LINKED_PACKAGE_UID = 0x2701;
+const TAG_INDEX_SID = 0x3f06;
+const TAG_BODY_SID = 0x3f07;
 const TAG_PACKAGE_NAME = 0x4402;
 const TAG_PACKAGE_TRACKS = 0x4403;
 const TAG_DESCRIPTOR = 0x4701;
@@ -45,6 +49,8 @@ const TAG_ORIGIN = 0x4b02;
 
 const TAG_DURATION = 0x0202;
 const TAG_STRUCTURAL_COMPONENTS = 0x1001;
+/** An EssenceGroup's choices sit under a tag of their own rather than under 0x1001. */
+const TAG_ESSENCE_GROUP_CHOICES = 0x0501;
 const TAG_DATA_DEFINITION = 0x0201;
 
 const TAG_SOURCE_PACKAGE_ID = 0x1101;
@@ -65,12 +71,37 @@ const TAG_SUB_DESCRIPTORS = 0x3f01;
  */
 export type MxfTrackKind = 'picture' | 'sound' | 'timecode' | 'data' | 'unknown';
 
+/**
+ * Avid Media Composer writes data definitions under keys of its own that are not universal labels at
+ * all - they begin 0x80 - so byte 12 says nothing about them. FFmpeg carries the same two
+ * (`ff_mxf_data_definition_uls`, "LegacyPicture"/"LegacySound"), which is where these come from.
+ */
+const AVID_LEGACY_DATA_DEFINITIONS: readonly { ul: readonly number[]; kind: MxfTrackKind }[] = [
+	{
+		ul: [0x80, 0x7d, 0x00, 0x60, 0x08, 0x14, 0x3e, 0x6f, 0x6f, 0x3c, 0x8c, 0xe1, 0x6c, 0xef, 0x11, 0xd2],
+		kind: 'picture',
+	},
+	{
+		ul: [0x80, 0x7d, 0x00, 0x60, 0x08, 0x14, 0x3e, 0x6f, 0x78, 0xe1, 0xeb, 0xe1, 0x6c, 0xef, 0x11, 0xd2],
+		kind: 'sound',
+	},
+];
+
 const dataDefinitionKind = (ul: Uint8Array | undefined): MxfTrackKind => {
 	if (!ul || ul.byteLength < 14) {
 		return 'unknown';
 	}
 
-	// 06.0e.2b.34.04.01.01.xx.01.03.02.02.yy.zz: yy picks the kind
+	if (ul[0] !== 0x06) {
+		for (const legacy of AVID_LEGACY_DATA_DEFINITIONS) {
+			if (legacy.ul.every((byte, index) => ul[index] === byte)) {
+				return legacy.kind;
+			}
+		}
+
+		return 'unknown';
+	}
+
 	switch (ul[12]) {
 		case 0x01: return 'picture';
 		case 0x02: return 'sound';
@@ -133,6 +164,11 @@ export type MxfHeaderMetadata = {
 	materialPackage: MxfPackage | null;
 	/** What the file holds, by PackageUID. A SourceClip in the material package names one of these. */
 	sourcePackages: Map<string, MxfPackage>;
+	/**
+	 * Which essence container each file package's essence lives in, by PackageUID. An essence element
+	 * key is only unique within a container, so this is what tells two containers' tracks apart.
+	 */
+	essenceContainers: Map<string, { bodySid: number; indexSid: number }>;
 };
 
 /** MXF writes strings as UTF-16BE, with a trailing null that is not part of the text. */
@@ -185,7 +221,6 @@ const asPosition = (bytes: Uint8Array | undefined): number | null => {
 
 	const data = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
 	const value = data.getBigInt64(0);
-	// -1 is MXF's "not known yet", written by anything that could not seek back to fill it in
 	return value < 0n ? null : Number(value);
 };
 
@@ -258,9 +293,6 @@ export const readHeaderMetadata = (
 		track.kind = dataDefinitionKind(sequence.get(TAG_DATA_DEFINITION));
 		track.duration = asPosition(sequence.get(TAG_DURATION));
 
-		// A sequence holds the components in order. Only the first is read: a track built from several
-		// clips is an edit list this demuxer does not present, and reading the first still gives the
-		// package the essence lives in, which is the same for every component of a well-formed file.
 		for (const componentUid of asKeyBatch(sequence.get(TAG_STRUCTURAL_COMPONENTS))) {
 			const component = sets.get(componentUid);
 			if (!component) {
@@ -272,16 +304,53 @@ export const readHeaderMetadata = (
 				track.startTimecode ??= readTimecode(component);
 				track.duration ??= asPosition(component.get(TAG_DURATION));
 			} else if (type === MxfSetType.SourceClip && track.sourcePackageId === null) {
-				const packageId = component.get(TAG_SOURCE_PACKAGE_ID);
-				const trackId = component.get(TAG_SOURCE_TRACK_ID);
-				track.sourcePackageId = packageId ? asKey(packageId) : null;
-				track.sourceTrackId = trackId ? asUint(trackId) : null;
-				track.startPosition = asPosition(component.get(TAG_START_POSITION)) ?? 0;
+				applySourceClip(track, component);
+			} else if (type === MxfSetType.EssenceGroup && track.sourcePackageId === null) {
+				// The group's choices are the same essence in different representations, and in an
+				// OP-Atom file most of them live in sibling files: the first choice of
+				// `opatom_essencegroup_alpha_raw.mxf` names a package this file does not contain. So
+				// the choice to take is the first whose package is actually here, which is what
+				// FFmpeg's `mxf_resolve_sourceclip` means by the first one with a valid descriptor.
+				for (const choiceUid of asKeyBatch(component.get(TAG_ESSENCE_GROUP_CHOICES))) {
+					const choice = sets.get(choiceUid);
+					if (!choice || setTypes.get(choiceUid) !== MxfSetType.SourceClip) {
+						continue;
+					}
+
+					const packageId = choice.get(TAG_SOURCE_PACKAGE_ID);
+					if (packageId && packagesPresent.has(asKey(packageId))) {
+						applySourceClip(track, choice);
+						break;
+					}
+				}
+
 				track.duration ??= asPosition(component.get(TAG_DURATION));
 			}
 		}
 
 		return track;
+	};
+
+	// Every package this file actually carries, by PackageUID, so an EssenceGroup's choices can be
+	// told apart from the ones that live in another file of the same set
+	const packagesPresent = new Set<string>();
+	for (const [uid, set] of sets) {
+		const type = setTypes.get(uid);
+		if (type === MxfSetType.SourcePackage || type === MxfSetType.MaterialPackage) {
+			const packageUid = set.get(TAG_PACKAGE_UID);
+			if (packageUid) {
+				packagesPresent.add(asKey(packageUid));
+			}
+		}
+	}
+
+	const applySourceClip = (track: MxfTrack, component: LocalSet) => {
+		const packageId = component.get(TAG_SOURCE_PACKAGE_ID);
+		const trackId = component.get(TAG_SOURCE_TRACK_ID);
+		track.sourcePackageId = packageId ? asKey(packageId) : null;
+		track.sourceTrackId = trackId ? asUint(trackId) : null;
+		track.startPosition = asPosition(component.get(TAG_START_POSITION)) ?? 0;
+		track.duration ??= asPosition(component.get(TAG_DURATION));
 	};
 
 	const readPackage = (uid: string): MxfPackage | null => {
@@ -320,8 +389,6 @@ export const readHeaderMetadata = (
 		};
 	};
 
-	// The Preface names the ContentStorage, which lists the packages. A file whose Preface is missing is
-	// not readable as MXF, but one whose storage merely lists nothing is - it just has no tracks.
 	const preface = bySetType(MxfSetType.Preface)[0];
 	if (!preface) {
 		throw new MalformedInputError('MXF header metadata states no Preface.');
@@ -346,7 +413,21 @@ export const readHeaderMetadata = (
 		}
 	}
 
-	return { sets, materialPackage, sourcePackages };
+	const essenceContainers = new Map<string, { bodySid: number; indexSid: number }>();
+	for (const uid of storage ? asKeyBatch(storage.get(TAG_ESSENCE_CONTAINERS)) : []) {
+		const set = sets.get(uid);
+		const linked = set?.get(TAG_LINKED_PACKAGE_UID);
+		if (!set || !linked) {
+			continue;
+		}
+
+		essenceContainers.set(asKey(linked), {
+			bodySid: asUint(set.get(TAG_BODY_SID) ?? new Uint8Array()),
+			indexSid: asUint(set.get(TAG_INDEX_SID) ?? new Uint8Array()),
+		});
+	}
+
+	return { sets, materialPackage, sourcePackages, essenceContainers };
 };
 
 /**
@@ -363,7 +444,6 @@ export const descriptorForTrack = (pkg: MxfPackage, trackId: number): LocalSet |
 		}
 	}
 
-	// A file with one essence track states its descriptor directly, and may well omit LinkedTrackID
 	if (pkg.subDescriptors.length === 0) {
 		return pkg.descriptor;
 	}
@@ -387,7 +467,11 @@ export const resolveTracks = (metadata: MxfHeaderMetadata) => {
 	}
 
 	for (const track of material.tracks) {
-		if (track.kind !== 'picture' && track.kind !== 'sound') {
+		// `data` covers everything that is neither picture nor sound, so it is admitted here and the
+		// descriptor decides what it actually is - a timed text track file is a data track whose
+		// descriptor is ST 2067-5's, and a data track whose descriptor says nothing recognisable
+		// yields no samples and is dropped further along
+		if (track.kind !== 'picture' && track.kind !== 'sound' && track.kind !== 'data') {
 			continue;
 		}
 

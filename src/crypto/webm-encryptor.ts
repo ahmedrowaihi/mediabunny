@@ -40,7 +40,6 @@ const ID_CONTENT_ENC_KEY_ID = 0x47e2;
 const ID_CONTENT_ENC_AES_SETTINGS = 0x47e7;
 const ID_AES_SETTINGS_CIPHER_MODE = 0x47e8;
 
-// Elements whose children we walk/mutate; everything else stays an opaque leaf and is re-emitted verbatim.
 const RECURSED_MASTERS = new Set([ID_SEGMENT, ID_TRACKS, ID_TRACK_ENTRY, ID_CLUSTER, ID_BLOCK_GROUP]);
 
 const TRACK_TYPE_VIDEO = 1;
@@ -203,7 +202,6 @@ const forEachTrackEntry = (segment: EbmlNode, cb: (entry: EbmlNode) => void): vo
 	}
 };
 
-// Clusters live under the Segment in a whole file, but a bare media segment carries them at top level.
 const collectClusters = (nodes: EbmlNode[]): EbmlNode[] => {
 	const segment = nodes.find(n => n.id === ID_SEGMENT);
 	return (segment?.children ?? nodes).filter(n => n.id === ID_CLUSTER);
@@ -227,7 +225,6 @@ const codecOf = (codecId: string): EncryptionCodec | null => {
 
 type TrackMeta = { trackNumber: number; trackType: number; codecId: string };
 
-// Read a track's number/type/codec, or null if it is not an encryptable video/audio track.
 const trackMeta = (entry: EbmlNode): TrackMeta | null => {
 	let trackNumber = 0;
 	let trackType = 0;
@@ -431,8 +428,6 @@ const LACE_XIPH = 1;
 const LACE_FIXED = 2;
 const LACE_EBML = 3;
 
-// A (Simple)Block is | track number (vint) | timecode (int16) | flags | frame(s) |; only the frames
-// are transformed. Laced blocks are re-laced as EBML, since per-frame headers make sizes uneven.
 const encryptBlock = (block: Uint8Array, encryptors: Map<number, TrackEncryptor>): Uint8Array => {
 	const { value: trackNumber, length: trackLen } = readVint(block, 0);
 	const encryptor = encryptors.get(trackNumber);
@@ -470,7 +465,6 @@ const deLace = (payload: Uint8Array, laceType: number): Uint8Array[] => {
 		const each = (payload.length - 1) / numFrames;
 		return Array.from({ length: numFrames }, (_, i) => payload.subarray(1 + i * each, 1 + (i + 1) * each));
 	}
-	// Xiph/EBML: read the first numFrames-1 sizes; the last frame's size is the remainder.
 	const sizes: number[] = [];
 	let pos = 1;
 	if (laceType === LACE_XIPH) {
@@ -503,7 +497,6 @@ const deLace = (payload: Uint8Array, laceType: number): Uint8Array[] => {
 	return frames;
 };
 
-// Re-lace frames as EBML lacing: | num_frames-1 | size0 (vint) | Δsize (signed vint) … | frames |.
 const reLaceEbml = (frames: Uint8Array[]): Uint8Array => {
 	const parts: Uint8Array[] = [Uint8Array.from([frames.length - 1]), writeVint(frames[0]!.length)];
 	for (let i = 1; i < frames.length - 1; i++) {
@@ -522,8 +515,6 @@ const concat = (parts: Uint8Array[]): Uint8Array => {
 	}
 	return out;
 };
-
-// --- EBML primitives ---
 
 const readUint = (data: Uint8Array): number => {
 	let value = 0;
@@ -570,8 +561,6 @@ const parseEbml = (bytes: Uint8Array, start: number, end: number): EbmlNode[] =>
 		}
 		const sizeInfo = readVint(bytes, pos + idInfo.length);
 		const dataStart = pos + idInfo.length + sizeInfo.length;
-		// An all-ones size vint means "unknown length" — the element runs to the end of its parent
-		// (used for the streamed `Segment` of a DASH init segment).
 		const unknownSize = sizeInfo.value === 2 ** (7 * sizeInfo.length) - 1;
 		const dataEnd = unknownSize ? end : dataStart + sizeInfo.value;
 		if (RECURSED_MASTERS.has(id)) {
@@ -599,7 +588,6 @@ const writeVint = (value: number): Uint8Array => {
 	return out;
 };
 
-// EBML lacing sizes after the first are signed deltas: a vint biased by 2^(7·len-1)-1 so it centres on 0.
 const signedVintBias = (length: number): number => 2 ** (7 * length - 1) - 1;
 
 const readSignedVint = (bytes: Uint8Array, pos: number): { value: number; length: number } => {

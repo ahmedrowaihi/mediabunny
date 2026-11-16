@@ -17,12 +17,14 @@
 
 import type { FileSlice } from '../reader';
 import {
+	essenceTrackNumber,
 	INDEX_TABLE_SEGMENT,
 	KLV_FILL,
 	keyMatches,
 	type LocalSet,
 	partitionKind,
 	PRIMER_PACK,
+	RANDOM_INDEX_PACK,
 	readKlvHeader,
 	readLocalSet,
 	readPrimerPack,
@@ -89,7 +91,9 @@ export const readPartitions = (slice: FileSlice): MxfPartition[] => {
 	const partitions: MxfPartition[] = [];
 
 	for (;;) {
-		const header = readKlvHeader(slice);
+		// Everything that is not a partition pack is stepped over by its length, so a private key is
+		// as skippable here as a standard one: this walk only cares where the partitions are.
+		const header = readKlvHeader(slice, true);
 		if (!header) {
 			break;
 		}
@@ -120,6 +124,36 @@ export const readPartitions = (slice: FileSlice): MxfPartition[] => {
 };
 
 /**
+ * The partition offsets a Random Index Pack states, in the order it states them.
+ *
+ * A file whose header partition pack does not say where the footer is - because it was written
+ * without seeking back - still ends with this, and it is the only thing that says where the footer's
+ * index went. `slice` must hold the last `length` octets of the file, where `length` is the 32-bit
+ * count the file's final four octets state.
+ *
+ * @internal
+ */
+export const readRandomIndexPack = (slice: FileSlice): { bodySid: number; offset: number }[] => {
+	const header = readKlvHeader(slice);
+	if (!header || !keyMatches(header.key, RANDOM_INDEX_PACK)) {
+		return [];
+	}
+
+	// The trailing 32-bit overall length is part of the value and is not an entry
+	const entryCount = Math.floor((header.length - 4) / 12);
+	const entries: { bodySid: number; offset: number }[] = [];
+	for (let i = 0; i < entryCount; i++) {
+		if (slice.remainingLength < 12) {
+			break;
+		}
+
+		entries.push({ bodySid: readU32Be(slice), offset: readU64Be(slice) });
+	}
+
+	return entries;
+};
+
+/**
  * Reads the header metadata that follows a partition pack: a primer, then local sets, until something
  * that is neither - the essence, an index table, or the next partition.
  *
@@ -135,7 +169,7 @@ export const readHeaderMetadataSets = (slice: FileSlice) => {
 	let primer: Map<number, Uint8Array> | null = null;
 
 	for (;;) {
-		const header = readKlvHeader(slice);
+		const header = readKlvHeader(slice, true);
 		if (!header) {
 			break;
 		}
@@ -152,10 +186,21 @@ export const readHeaderMetadataSets = (slice: FileSlice) => {
 
 		const type = setTypeOf(header.key);
 		if (type === null) {
-			// Past the metadata: the essence, an index table segment, or the next partition pack. The
-			// slice is left at this item's key so a caller can carry on reading from it.
-			slice.skip(header.start - slice.filePos);
-			break;
+			// Metadata ends at the next partition, at an index segment, or at the essence - not at the
+			// first set this reader has no name for. Avid writes private sets under its own keys and
+			// every writer is free to add sets from a later edition of 377M; skipping them is what
+			// keeps the sets that follow readable.
+			if (
+				partitionKind(header.key) !== null
+				|| keyMatches(header.key, INDEX_TABLE_SEGMENT)
+				|| essenceTrackNumber(header.key) !== null
+			) {
+				slice.skip(header.start - slice.filePos);
+				break;
+			}
+
+			slice.skip(header.length);
+			continue;
 		}
 
 		const set = readLocalSet(slice, header.length);

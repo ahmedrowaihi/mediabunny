@@ -33,10 +33,12 @@ import {
 	UNDETERMINED_LANGUAGE,
 	assertNever,
 	keyValueIterator,
+	simplifyRational,
 	toDataView,
 } from '../misc';
 import {
 	AudioCodec,
+	DNXHD_FOURCC,
 	generateAv1CodecConfigurationFromCodecString,
 	mpeg2ObjectTypeOf,
 	parsePcmCodec,
@@ -45,7 +47,13 @@ import {
 	SubtitleCodec,
 	VideoCodec,
 } from '../codec';
-import { formatSubtitleTimestamp, TTML_NAMESPACE } from '../subtitles';
+import {
+	EBUTTM_NAMESPACE,
+	EBUTTS_NAMESPACE,
+	formatSubtitleTimestamp,
+	SMPTE_TT_NAMESPACE,
+	TTML_NAMESPACE,
+} from '../subtitles';
 import { Writer } from '../writer';
 import {
 	getTrackMetadata,
@@ -54,6 +62,7 @@ import {
 	IsobmffAudioTrackData,
 	IsobmffMuxer,
 	IsobmffSubtitleTrackData,
+	IsobmffTimecodeTrackData,
 	IsobmffTrackData,
 	IsobmffVideoTrackData,
 	presentationSpan,
@@ -302,6 +311,8 @@ export const ftyp = (details: {
 	holdsAvc: boolean;
 	fragmented: boolean;
 	cmaf: boolean;
+	/** Whether an IMSC1 text track is present, which CMAF brands `im1t` (ISO/IEC 23000-19 Annex A.4). */
+	holdsImsc1Text: boolean;
 }) => {
 	// You can find the full logic for this at
 	// https://github.com/FFmpeg/FFmpeg/blob/de2fb43e785773738c660cdafb9309b1ef1bc80d/libavformat/movenc.c#L5518
@@ -328,6 +339,7 @@ export const ftyp = (details: {
 				ascii('iso6'),
 				ascii('mp41'),
 				ascii('cmfc'),
+				details.holdsImsc1Text ? ascii('im1t') : [],
 				ascii('dash'),
 			]);
 		} else {
@@ -353,7 +365,7 @@ export const ftyp = (details: {
 };
 
 /** Segment Type Box */
-export const styp = () => box('styp', [
+export const styp = (holdsImsc1Text = false) => box('styp', [
 	ascii('iso5'), // Major brand
 	u32(0), // Minor version
 	// Compatible brands
@@ -361,6 +373,8 @@ export const styp = () => box('styp', [
 	ascii('iso6'),
 	ascii('mp41'),
 	ascii('cmfc'),
+	// On the segments as well as the init: a receiver handed one segment has only this to read
+	holdsImsc1Text ? ascii('im1t') : [],
 	ascii('dash'),
 ]);
 
@@ -493,8 +507,16 @@ export const trak = (trackData: IsobmffTrackData, creationTime: number) => {
 	const needsEditList = trackData.startTimestampOffset !== null
 		&& (trackData.startTimestampOffset !== 0 || trackData.firstDecodeTimestamp !== 0);
 
+	// The reference goes on the VIDEO track and names the timecode track, not the other way round
+	const timecodeTrackData = trackData.type === 'video'
+		? trackData.muxer.trackDatas.find(
+				x => x.type === 'timecode' && x.info.videoTrackId === trackData.track.id,
+			)
+		: undefined;
+
 	return box('trak', undefined, [
 		tkhd(trackData, creationTime),
+		timecodeTrackData ? tref('tmcd', [timecodeTrackData.track.id]) : null,
 		needsEditList ? edts(trackData) : null,
 		mdia(trackData, creationTime),
 		trackMetadata.name !== undefined
@@ -540,7 +562,9 @@ export const tkhd = (
 	}
 
 	let flags = 0x2; // Track in movie
-	if (trackData.track.metadata.disposition?.default !== false) {
+	// A timecode track is read, never presented: ffmpeg leaves it disabled, and a player that honoured
+	// the enabled flag on one would try to show it alongside the video
+	if (trackData.type !== 'timecode' && trackData.track.metadata.disposition?.default !== false) {
 		flags |= 0x1; // Track enabled
 	}
 
@@ -553,7 +577,11 @@ export const tkhd = (
 			? 1
 			: trackData.type === 'subtitle'
 				? 2
-				: assertNever(trackData);
+				// A timecode track is an alternative to nothing - it labels the video track it is
+				// referenced by - so it stays out of the groups, which is also what ffmpeg writes
+				: trackData.type === 'timecode'
+					? 0
+					: assertNever(trackData);
 
 	return fullBox('tkhd', +needsU64, flags, [
 		u32OrU64(creationTime), // Creation time
@@ -584,7 +612,6 @@ export const edts = (trackData: IsobmffTrackData) => {
 	const emptyDuration = Math.max(0, intoTimescale(offset, GLOBAL_TIMESCALE));
 	const mediaTime = intoTimescale(Math.max(0, offset) - trackData.firstDecodeTimestamp, trackData.timescale);
 
-	// For fragmented files this is zero, which simply means "unknown duration" in this case. Spec:
 	// "the segment_duration of this edit may be zero"
 	const mediaDuration = Math.max(
 		0,
@@ -656,12 +683,14 @@ const TRACK_TYPE_TO_COMPONENT_SUBTYPE: Record<IsobmffTrackData['type'], string> 
 	video: 'vide',
 	audio: 'soun',
 	subtitle: 'text',
+	timecode: 'tmcd',
 };
 
 const TRACK_TYPE_TO_HANDLER_NAME: Record<IsobmffTrackData['type'], string> = {
 	video: 'MediabunnyVideoHandler',
 	audio: 'MediabunnySoundHandler',
 	subtitle: 'MediabunnyTextHandler',
+	timecode: 'MediabunnyTimecodeHandler',
 };
 
 /** Handler Reference Box. */
@@ -711,6 +740,9 @@ const TRACK_TYPE_TO_HEADER_BOX: Record<IsobmffTrackData['type'], () => Box> = {
 	video: vmhd,
 	audio: smhd,
 	subtitle: nmhd,
+	// `gmhd` is what QuickTime documents for a timecode track, but ffmpeg writes `nmhd` for both `mov`
+	// and `mp4` and every reader takes it, so this follows what the files actually hold
+	timecode: nmhd,
 };
 
 /**
@@ -740,8 +772,6 @@ export const stbl = (trackData: IsobmffTrackData) => {
 	const needsCtts = trackData.compositionTimeOffsetTable.length > 1
 		|| trackData.compositionTimeOffsetTable.some(x => x.sampleCompositionTimeOffset !== 0);
 
-	// A fragmented file has no sample table to take the decode-to-composition shift from, so a reader has
-	// to bound it by the codec's reorder depth. Stating the decode timeline makes it exactly zero.
 	const statesZeroShift = trackData.muxer.isFragmented && trackData.statesDecodeTimeline === true;
 
 	return box('stbl', undefined, [
@@ -793,6 +823,8 @@ export const stsd = (trackData: IsobmffTrackData) => {
 			SUBTITLE_CODEC_TO_BOX_NAME[trackData.track.source._codec],
 			trackData,
 		);
+	} else if (trackData.type === 'timecode') {
+		sampleDescription = timecodeSampleDescription(trackData);
 	}
 
 	assert(sampleDescription!);
@@ -830,15 +862,63 @@ export const videoSampleDescription = (
 	i16(0xffff), // Pre-defined
 ], [
 	VIDEO_CODEC_TO_CONFIGURATION_BOX[trackData.track.source._codec]?.(trackData) ?? null,
+	// Straight after the configuration box, which is where Apple's own spatial files put it
+	lhvC(trackData),
 	dovi(trackData),
 	pasp(trackData),
 	colorSpaceIsEmpty(trackData.info.decoderConfig.colorSpace)
 		? null
 		: colr(trackData),
+	vexu(trackData),
+	hfov(trackData),
 	btrt(trackData),
 	mdcv(trackData),
 	clli(trackData),
 ]);
+
+/**
+ * Layered HEVC Configuration Box: the parameter sets of every layer above the base.
+ *
+ * Written back byte for byte. `hvcC` describes the base layer alone, so without this a stereo track
+ * remuxes into a mono one - and because the base layer still decodes, nothing fails: the second view
+ * is simply gone.
+ */
+export const lhvC = (trackData: IsobmffVideoTrackData) => {
+	const multiview = trackData.info.decoderConfig.multiview;
+	if (!multiview || multiview.layerConfiguration.length === 0) {
+		return null;
+	}
+
+	return box('lhvC', [...multiview.layerConfiguration]);
+};
+
+/**
+ * Video Extended Usage Box: what makes a two-view track a spatial video rather than a wide one -
+ * which eyes are present, which leads, the camera baseline, and the projection.
+ */
+export const vexu = (trackData: IsobmffVideoTrackData) => {
+	const extension = trackData.info.decoderConfig.multiview?.viewExtension;
+	if (!extension || extension.length === 0) {
+		return null;
+	}
+
+	return box('vexu', [...extension]);
+};
+
+/**
+ * Horizontal Field of View Box: how wide the lens saw, in thousandths of a degree.
+ *
+ * A sibling of `vexu` rather than a child of it, and required - alongside `blin` and `dadj` - before
+ * visionOS treats the file as spatial media at all.
+ */
+export const hfov = (trackData: IsobmffVideoTrackData) => {
+	const millidegrees = trackData.info.decoderConfig.multiview?.fieldOfViewMillidegrees;
+	if (millidegrees === undefined) {
+		return null;
+	}
+
+	return box('hfov', [u32(millidegrees)]);
+};
 
 /** Bit Rate Box: Signals the average and peak bitrate of the track. */
 export const btrt = (trackData: IsobmffTrackData) => {
@@ -1415,15 +1495,29 @@ export const subtitleSampleDescription = (
 ) => box(compressionType, [
 	Array(6).fill(0), // Reserved
 	u16(1), // Data reference index
-	SUBTITLE_CODEC_TO_SAMPLE_ENTRY_FIELDS[trackData.track.source._codec](),
+	SUBTITLE_CODEC_TO_SAMPLE_ENTRY_FIELDS[trackData.track.source._codec](trackData),
 ], [
 	SUBTITLE_CODEC_TO_CONFIGURATION_BOX[trackData.track.source._codec](trackData),
 	btrt(trackData),
 ]);
 
 // XMLSubtitleSampleEntry (ISO/IEC 14496-12) states its three strings in the entry itself rather than in
-// a configuration box: namespace, schema location, auxiliary MIME types. The latter two are empty here.
-const stppSampleEntryFields = () => [...textEncoder.encode(TTML_NAMESPACE), 0, 0, 0];
+// a configuration box: namespace, schema location, auxiliary MIME types. The latter two stay empty.
+//
+// The namespace field is a **space-separated list of every namespace the documents use** (14496-30
+// section 7.2), not just the document element's. Writing only the TTML namespace made an EBU-TT-D
+// track byte-identical to an IMSC1 one, so nothing in the init said which profile it was - which is
+// what DASH-IF maps onto `stpp.ttml.etd1` versus `stpp.ttml.im1t`.
+const stppSampleEntryFields = (trackData: IsobmffSubtitleTrackData) => {
+	const profile = trackData.track.source._ttmlProfile;
+	const namespaces = profile === 'ebu-tt-d'
+		? [TTML_NAMESPACE, EBUTTS_NAMESPACE, EBUTTM_NAMESPACE].join(' ')
+		: profile === 'smpte-tt'
+			? [TTML_NAMESPACE, SMPTE_TT_NAMESPACE].join(' ')
+			: TTML_NAMESPACE;
+
+	return [...textEncoder.encode(namespaces), 0, 0, 0];
+};
 
 export const vttC = (trackData: IsobmffSubtitleTrackData) => box('vttC', [
 	...textEncoder.encode(trackData.info.config.description),
@@ -1431,6 +1525,41 @@ export const vttC = (trackData: IsobmffSubtitleTrackData) => box('vttC', [
 
 export const txtC = (textConfig: Uint8Array) => fullBox('txtC', 0, 0, [
 	...textConfig, 0, // Text config (null-terminated)
+]);
+
+/**
+ * Timecode Sample Description Box: states the count a timecode track's samples are frame numbers on.
+ *
+ * The layout is not in 14496-12 - it is QuickTime's, and these field widths are read out of ffmpeg's own
+ * files rather than taken from a table: a 36-octet entry whose trailing three octets (QuickTime's source
+ * identifier) ffmpeg writes as zero.
+ */
+export const timecodeSampleDescription = (trackData: IsobmffTimecodeTrackData) => {
+	const { timecode } = trackData.info;
+	// 30000/1001 rather than 29.97: the entry states the rate as a rational, and the frame duration has
+	// to divide the timescale exactly or a reader derives the wrong frames-per-second
+	const { num, den } = simplifyRational({ num: Math.round(timecode.frameRate * 1001), den: 1001 });
+
+	return box('tmcd', [
+		Array(6).fill(0), // Reserved
+		u16(1), // Data reference index
+		u32(0), // Reserved
+		u32(timecode.dropFrame ? 1 : 0), // Flags: bit 0 states a drop-frame count
+		u32(num), // Timescale
+		u32(den), // Frame duration
+		u8(Math.round(timecode.frameRate)), // Frames per second, rounded - 30 for a 29.97 count
+		Array(3).fill(0), // Source identifier
+	]);
+};
+
+/**
+ * Track Reference Box: names the tracks this one is bound to, by reference type.
+ *
+ * A video track points at its timecode track with a `tmcd` reference, which is what makes the timecode
+ * that track's rather than the file's.
+ */
+export const tref = (referenceType: string, trackIds: number[]) => box('tref', undefined, [
+	box(referenceType, trackIds.flatMap(id => u32(id))),
 ]);
 
 /**
@@ -1749,7 +1878,6 @@ const baseMediaDecodeTime = (chunk: { samples: { decodeTimestamp: number }[] }) 
 		lowest = Math.min(lowest, sample.decodeTimestamp);
 	}
 
-	// tfdt is unsigned, so a timeline reaching below zero would wrap rather than fail
 	assert(lowest >= 0);
 
 	return lowest;
@@ -2233,7 +2361,6 @@ const videoCodecToBoxName = (
 	isQuickTime: boolean,
 	doviConfig?: DoviConfig,
 ) => {
-	// QuickTime's own AVC-Intra entries, which ffmpeg selects itself and which override any other naming
 	if (avcIntraEntry !== null) {
 		return avcIntraEntry;
 	}
@@ -2259,10 +2386,15 @@ const videoCodecToBoxName = (
 		case 'vp9': return 'vp09';
 		case 'av1': return 'av01';
 		case 'prores': return fullCodecString;
-		// QuickTime's own entry, which ffmpeg writes for `-f mov`, against the generic MPEG-4 visual one
 		case 'mpeg2': return isQuickTime ? 'm2v1' : 'mp4v';
+		// VC-3 states its class in the bitstream, so one entry name covers every class and DNxHR too
+		case 'dnxhd': return DNXHD_FOURCC;
 		case 'qtrle': return 'rle ';
 		case 'png': return 'png ';
+		// Uncompressed video in ISOBMFF is a family of layouts - `2vuy`, `v210`, `raw ` - each with its
+		// own packing, and this library writes none of them. Y4M is where its raw frames go, and the
+		// output format refuses the codec before anything asks for an entry name.
+		case 'rawvideo': throw new Error('Uncompressed video has no sample entry in this library.');
 	}
 };
 
@@ -2293,7 +2425,6 @@ export const declaredVideoCodec = (
 		return codecString;
 	}
 
-	// A manifest never carries an AVC-Intra entry: those are QuickTime's, and QuickTime is not segmented
 	const fourcc = videoCodecToBoxName(
 		codec, codecString, parameterSets, null, segmentFormat instanceof MovOutputFormat,
 	);
@@ -2308,26 +2439,25 @@ const VIDEO_CODEC_TO_CONFIGURATION_BOX: Record<
 	VideoCodec,
 	((trackData: IsobmffVideoTrackData) => Box | null) | null
 > = {
-	// An AVC-Intra entry carries no `avcC` at all - the parameter sets travel in the samples, which is what
-	// makes the entry self-describing and the reason ffmpeg writes none either.
 	avc: trackData => trackData.info.avcIntraEntry === null ? avcC(trackData) : null,
 	hevc: hvcC,
+	// VC-3 carries its own parameters in every frame, so the sample entry needs no configuration box -
+	// ffmpeg's `mov` muxer writes none either
+	dnxhd: null,
 	mpeg2: trackData => trackData.muxer.isQuickTime ? null : esds(trackData),
 	vp8: vpcC,
 	vp9: vpcC,
 	av1: av1C,
 	prores: null,
-	// Both entries are self-describing: the dimensions and the depth field are the whole configuration
 	qtrle: null,
 	png: null,
+	rawvideo: null,
 };
 
 const audioCodecToBoxName = (codec: AudioCodec, fullCodecString: string, isQuickTime: boolean): string => {
 	switch (codec) {
 		case 'aac': return 'mp4a';
 		case 'mp3': return isQuickTime ? '.mp3' : 'mp4a';
-		// QuickTime has its own entry for MPEG audio and carries no esds with it, which is what ffmpeg
-		// writes for `-f mov -c:a mp2` and what makes ffprobe read it back as mp2 rather than mp3
 		case 'mp2': return isQuickTime ? '.mp2' : 'mp4a';
 		case 'opus': return 'Opus';
 		case 'vorbis': return 'mp4a';
@@ -2429,7 +2559,10 @@ const SUBTITLE_CODEC_TO_CONFIGURATION_BOX: Record<
 	ttml: () => null,
 };
 
-const SUBTITLE_CODEC_TO_SAMPLE_ENTRY_FIELDS: Record<SubtitleCodec, () => number[]> = {
+const SUBTITLE_CODEC_TO_SAMPLE_ENTRY_FIELDS: Record<
+	SubtitleCodec,
+	(trackData: IsobmffSubtitleTrackData) => number[]
+> = {
 	webvtt: () => [],
 	ttml: stppSampleEntryFields,
 };

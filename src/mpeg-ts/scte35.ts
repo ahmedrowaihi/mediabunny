@@ -15,6 +15,16 @@ import {
 	TS_PACKET_SIZE,
 } from './mpeg-ts-misc';
 
+/**
+ * The scheme a carriage of a `splice_info_section` states — an `emsg` box, an HLS in-band event, a DASH
+ * `EventStream` — as SCTE 35 registers it for binary sections. A reader matches on this to tell a
+ * splice from any other event the stream carries.
+ *
+ * @group Miscellaneous
+ * @public
+ */
+export const SCTE35_BINARY_SCHEME = 'urn:scte:scte35:2013:bin';
+
 const SYNC_BYTE = 0x47;
 const SPLICE_INFO_TABLE_ID = 0xfc;
 /** 'CUEI', the registration that tells SCTE-35 apart from the Blu-ray meaning of stream type 0x86. */
@@ -346,7 +356,6 @@ export const parseSpliceInfoSection = (section: Uint8Array): Scte35Section => {
 		segmentationTypeId: null,
 	};
 
-	// An encrypted section hides everything past pts_adjustment, so nothing can be read from it.
 	if (encrypted || commandLength === 0) {
 		return nothing;
 	}
@@ -356,7 +365,6 @@ export const parseSpliceInfoSection = (section: Uint8Array): Scte35Section => {
 	let commandPos = 14;
 
 	if (commandType === TIME_SIGNAL) {
-		// A time_signal carries no break of its own; its segmentation descriptor states one
 		const segmentation = descriptorsAt === null ? null : readSegmentation(section, descriptorsAt);
 		const withSegmentation: Scte35Section = {
 			...nothing,
@@ -398,7 +406,6 @@ export const parseSpliceInfoSection = (section: Uint8Array): Scte35Section => {
 	const spliceImmediate = (flags & SPLICE_IMMEDIATE_FLAG) !== 0;
 	commandPos += 1;
 
-	// The indicator stands whether or not a time comes with it: "now" is still out of network
 	const insert: Scte35Section = { ...nothing, outOfNetwork };
 
 	let time: number | null = null;
@@ -410,7 +417,6 @@ export const parseSpliceInfoSection = (section: Uint8Array): Scte35Section => {
 		time = wrap(ptsAdjustment + read33Bits(section, commandPos, 1));
 		commandPos += 5;
 	} else if (!programSplice) {
-		// A per-component splice states a time for each one rather than for the programme
 		const components = section[commandPos];
 		if (components === undefined) {
 			return insert;
@@ -423,7 +429,6 @@ export const parseSpliceInfoSection = (section: Uint8Array): Scte35Section => {
 		return { ...insert, time };
 	}
 
-	// break_duration(): auto_return 1b, reserved 6b, duration 33b
 	if (commandPos + 5 > section.length) {
 		return { ...insert, time };
 	}
@@ -463,7 +468,6 @@ const readSegmentation = (
 			continue;
 		}
 
-		// identifier(4) + segmentation_event_id(4), then the cancel indicator
 		let at = pos + 2 + 8;
 		if (at >= descriptorEnd || (section[at]! & 0x80) !== 0) {
 			return null; // cancelled, so nothing follows
@@ -500,7 +504,6 @@ const readSegmentation = (
 			at += 5;
 		}
 
-		// segmentation_upid_type, its length, and the upid itself
 		if (at + 2 > descriptorEnd) {
 			return null;
 		}

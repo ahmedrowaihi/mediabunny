@@ -1,5 +1,10 @@
 import path from 'node:path';
-import { describe, expect, test } from 'vitest';
+import { beforeAll, describe, expect, test } from 'vitest';
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { registerMediabunnyServer } from '@mediabunny/server';
+import { VideoSample } from '../../src/sample.js';
 
 import {
 	buildClosedCaptionSeiMessage,
@@ -18,7 +23,7 @@ import {
 } from '../../src/sei.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
 import { EncodedPacketSink } from '../../src/media-sink.js';
-import { EncodedAudioPacketSource, EncodedVideoPacketSource } from '../../src/media-source.js';
+import { EncodedAudioPacketSource, EncodedVideoPacketSource, VideoSampleSource } from '../../src/media-source.js';
 import { Input } from '../../src/input.js';
 import {
 	AdaptiveOutputFormat,
@@ -513,3 +518,59 @@ test('a captioned MPEG-TS remux still states decode times on the wire', async ()
 	expect(wire.length).toBeGreaterThan(0);
 	expect(wire.filter(x => x.dts! < x.pts).length).toBeGreaterThan(0);
 }, 60_000);
+
+describe('an encoded track carries them too, in whatever its codec uses', () => {
+	// The encoder path accepted captions only for AVC and HEVC: a track fed `VideoSample`s that stated
+	// captions logged "'mpeg2' cannot carry closed captions" and wrote none, while the very same captions
+	// went through when the caller added already-encoded packets. MPEG-2 has no SEI, so they go in the
+	// picture's `user_data` as SCTE-20 - which this library already writes on the packet path.
+	beforeAll(() => {
+		registerMediabunnyServer();
+	});
+
+	const written: ClosedCaptionBytePair[] = [{ type: 0, byte0: 0xc1, byte1: 0xc2 }];
+	const FRAMES = 25;
+
+	const encode = async (codec: 'avc' | 'mpeg2') => {
+		const output = new Output({ format: new MpegTsOutputFormat(), target: new BufferTarget() });
+		const source = new VideoSampleSource({ codec, bitrate: 2e6 });
+		output.addVideoTrack(source, {
+			frameRate: 25,
+			closedCaptions: { announceInManifest: false, channels: ['CC1'] },
+		});
+		await output.start();
+
+		const pixels = new Uint8Array(320 * 240 * 3 / 2).fill(0x80);
+		for (let i = 0; i < FRAMES; i++) {
+			using sample = new VideoSample(pixels, {
+				format: 'I420',
+				codedWidth: 320,
+				codedHeight: 240,
+				timestamp: i / 25,
+				duration: 1 / 25,
+				closedCaptions: written,
+			});
+			await source.add(sample);
+		}
+
+		await output.finalize();
+
+		const file = path.join(mkdtempSync(path.join(tmpdir(), 'mediabunny-cc-')), `${codec}.ts`);
+		writeFileSync(file, new Uint8Array(output.target.buffer!));
+		return file;
+	};
+
+	/**
+	 * How many decoded frames ffmpeg finds captions on. Its decoders read SCTE-20 and A/53 alike and
+	 * report both as the same side data, so one count covers both codecs and neither is read back by the
+	 * code that wrote it.
+	 */
+	const captionedFrameCount = (file: string) => execFileSync('ffprobe', [
+		'-v', 'error', '-select_streams', 'v', '-show_frames', '-show_entries', 'frame=side_data_type',
+		'-of', 'default=nw=1', file,
+	], { encoding: 'utf8' }).split('\n').filter(x => x.includes('A53')).length;
+
+	test.each(['avc', 'mpeg2'] as const)('%s states them on every frame', async (codec) => {
+		expect(captionedFrameCount(await encode(codec))).toBe(FRAMES);
+	}, 120_000);
+}, 180_000);

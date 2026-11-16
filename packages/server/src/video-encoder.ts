@@ -21,6 +21,7 @@ import { getSoftwareEncoderCodec, isHardwareCodec } from './encoder-choice';
 import {
 	CODEC_TO_CODEC_ID,
 	getHardwareEncoderCodec,
+	pixelFormatToY4mTag,
 	isRgbPixelFormat,
 	unmapColorPrimaries,
 	unmapMatrixCoefficients,
@@ -53,7 +54,7 @@ import {
 	VideoBitDepth,
 } from '../../../src/codec';
 import { assert, binarySearchLessOrEqual, simplifyRational, toUint8Array } from '../../../src/misc';
-import { type QualityCappedVideoEncoderConfig } from '../../../src/encode';
+import { type QualityCappedVideoEncoderConfig, type VideoEncoderControls } from '../../../src/encode';
 
 /** Encoders whose `profile` option takes the names an AVC or HEVC codec string states, rather than a number. */
 const NAMES_H26X_PROFILES = new Set(['libx264', 'libx265']);
@@ -164,14 +165,12 @@ const pixelFormatForBitDepth = (
 		: allCandidates.filter(format => CHROMA_FORMAT_OF[format] === chromaFormat);
 
 	if (!supportedPixelFormats) {
-		// No list advertised, so the ideal format is the best we can say
 		return candidates[0] ?? null;
 	}
 
 	return candidates.find(format => supportedPixelFormats.includes(format)) ?? null;
 };
 
-// Null for formats we don't track, which includes every RGB format
 const bitDepthOfPixelFormat = (pixelFormat: NodeAv.AVPixelFormat): VideoBitDepth | null => {
 	for (const bitDepth of VIDEO_BIT_DEPTHS) {
 		if (
@@ -245,15 +244,11 @@ export const choosePixelFormat = (options: {
 				+ `${wantsAlpha ? ' with alpha' : ''}, which the requested codec profile demands.`,
 			);
 		}
-
-		// Inherited, not demanded, so fall through to the encoder's default rather than failing the encode
 	}
 
 	let pixelFormat = NodeAv.AV_PIX_FMT_YUV420P;
 
 	if (supportedPixelFormats) {
-		// A fixed chroma format rules over both the 4:2:0 default and the encoder's own ordering: taking
-		// the first advertised format is what put 4:2:2 under a 4:4:4 ProRes profile
 		const fixed = chromaFormat !== null
 			? supportedPixelFormats.find(format => CHROMA_FORMAT_OF[format] === chromaFormat)
 			: undefined;
@@ -281,8 +276,6 @@ export const choosePixelFormat = (options: {
 	return pixelFormat;
 };
 
-// NTSC rates are x/1001 exactly; anything else is kept to the millisecond. Rounding to whole frames would state 24
-// fps for 24000/1001 video.
 const toFramerateRational = (framerate: number) => {
 	const ntscNum = Math.round(framerate * 1001);
 	if (ntscNum % 1000 === 0 && Math.abs(ntscNum / 1001 - framerate) < 1e-4 && !Number.isInteger(framerate)) {
@@ -292,10 +285,69 @@ const toFramerateRational = (framerate: number) => {
 	return simplifyRational({ num: Math.round(framerate * 1000), den: 1000 });
 };
 
-// A cap arrives in fields WebCodecs configs don't have
 const getQualityCap = (config: VideoEncoderConfig) => {
 	const { _maxBitrate, _bufferSize } = config as VideoEncoderConfig & { _maxBitrate?: number; _bufferSize?: number };
 	return _maxBitrate === undefined ? null : { maxBitrate: _maxBitrate, bufferSize: _bufferSize };
+};
+
+/**
+ * Thrown where a selected encoder has no option for a control the caller stated. Distinguished from an
+ * open failure so the hardware fallback does not report a refused control as a missing device.
+ */
+class UnsupportedEncoderControlError extends Error {}
+
+/**
+ * VC-3's sample entry fourcc, which is also its codec string.
+ *
+ * Stated here rather than imported from the core: this package resolves `mediabunny` to whatever the
+ * consumer installed, which is an upstream release that knows nothing of DNxHD. A fourcc is fixed by the
+ * registry, so there is nothing here to drift from `DNXHD_FOURCC`.
+ */
+const DNXHD_FOURCC = 'AVdn';
+
+/** As with {@link DNXHD_FOURCC}: stated here, because the installed core predates it. */
+const RAWVIDEO_CODEC_STRING = 'rawvideo';
+
+const textEncoder = new TextEncoder();
+
+/** The VBV D-10 states, in bits; it is filled at the start so the first frame is already exact. */
+const D10_VBV_BITS = 2_000_000;
+
+/**
+ * The VC-3 classes, by the frame size each one IS.
+ *
+ * A class is a fixed number of octets per frame at 1920x1080, so the bitrate follows from it and the
+ * frame rate rather than being chosen: 145 Mbit/s at 29.97 and 120 at 25 are the same 606,208 octets.
+ * ffmpeg's encoder matches a class by comparing the stated bitrate against its own table, so the exact
+ * value matters and the rates below are the ones that table holds - measured, not rounded.
+ */
+const VC3_CLASSES = {
+	'145': { frameSize: 606_208, bitDepth: 8 as const, megabits: { 25: 120, 29.97: 145 } },
+	'220': { frameSize: 917_504, bitDepth: 8 as const, megabits: { 25: 185, 29.97: 220 } },
+	'220x': { frameSize: 917_504, bitDepth: 10 as const, megabits: { 25: 185, 29.97: 220 } },
+} as const;
+
+/** DNxHR profiles, which take any resolution and are picked by name rather than by bitrate. */
+const DNXHR_PROFILES = {
+	lb: { name: 'dnxhr_lb', bitDepth: 8 as const, chroma: '422' as const },
+	sq: { name: 'dnxhr_sq', bitDepth: 8 as const, chroma: '422' as const },
+	hq: { name: 'dnxhr_hq', bitDepth: 8 as const, chroma: '422' as const },
+	hqx: { name: 'dnxhr_hqx', bitDepth: 10 as const, chroma: '422' as const },
+	444: { name: 'dnxhr_444', bitDepth: 10 as const, chroma: '444' as const },
+} as const;
+
+/** @internal */
+export const dnxProfileOf = (controls: VideoEncoderControls | undefined) => {
+	const profile = controls?.dnxProfile;
+	if (profile === undefined) {
+		return null;
+	}
+
+	if (profile === '145' || profile === '220' || profile === '220x') {
+		return { kind: 'vc3' as const, class: profile, ...VC3_CLASSES[profile] };
+	}
+
+	return { kind: 'dnxhr' as const, ...DNXHR_PROFILES[profile] };
 };
 
 export class NodeAvVideoEncoder extends CustomVideoEncoder {
@@ -314,9 +366,12 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 	packetEmitted = false;
 	quantizer: number | null = null;
 
-	// Bookkeeping to restore the original timing information
+	// Bookkeeping to restore the original timing information. Keyed by the TICK the frame was sent with
+	// rather than by its microseconds: a time base coarser than a microsecond - which MPEG-2 and AVC use,
+	// so the stream can state its frame rate - makes microseconds -> ticks -> microseconds lossy, and an
+	// entry looked up by a microsecond that came back a unit off is an entry that is never found.
 	preciseTimings: {
-		microsecondTimestamp: number;
+		tick: number;
 		timestamp: number;
 		duration: number;
 		timestampIsValid: boolean;
@@ -327,7 +382,7 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 		const codecSupported = config.bitrateMode === 'quantizer'
 			? codec === 'avc' || codec === 'hevc' || codec === 'vp9' || codec === 'av1'
 			: codec === 'avc' || codec === 'hevc' || codec === 'vp8' || codec === 'vp9' || codec === 'av1'
-				|| codec === 'prores' || codec === 'mpeg2';
+				|| codec === 'prores' || codec === 'mpeg2' || codec === 'dnxhd' || codec === 'rawvideo';
 
 		if (!codecSupported) {
 			return false;
@@ -340,7 +395,6 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 
 			const codecId = CODEC_TO_CODEC_ID[codec];
 			assert(codecId !== undefined);
-			// rav1e has no capped mode, only a constant quantizer or a bitrate
 			if (getSoftwareEncoderCodec(codec, codecId)?.name === 'librav1e') {
 				return false;
 			}
@@ -351,8 +405,6 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 			return true;
 		}
 
-		// A depth stated by the codec string has to be deliverable, or the output would be labelled with a profile
-		// its samples don't have. Hardware encoders that can't reach it are skipped, so software decides.
 		const codecId = CODEC_TO_CODEC_ID[codec];
 		assert(codecId !== undefined);
 		const avCodec = getSoftwareEncoderCodec(codec, codecId);
@@ -438,18 +490,21 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 				throw error;
 			}
 
+			// A refused control is not a missing device, and saying so sends the reader looking for a
+			// driver problem that is not there
 			Logging._warn(
-				`'${this.avCodec.name ?? 'unknown codec'}' would not open (${String(error)}), which means the`
-				+ ` device it drives is not available. Falling back to ${software.name ?? 'software'}.`,
+				error instanceof UnsupportedEncoderControlError
+					? `'${this.avCodec.name ?? 'unknown codec'}' cannot honour a stated encoder control`
+					+ ` (${error.message}). Falling back to ${software.name ?? 'software'}.`
+					: `'${this.avCodec.name ?? 'unknown codec'}' would not open (${String(error)}), which means`
+						+ ` the device it drives is not available. Falling back to`
+						+ ` ${software.name ?? 'software'}.`,
 			);
 			this.avCodec = software;
 
-			// Stated again, because the line logged at selection named an encoder that never ran — and that
-			// line is what a caller reads to find out what encoded its video
 			Logging._info(`Encoding '${this.codec}' with ${software.name ?? 'unknown codec'}.`);
 		}
 
-		// Outside the catch, so a failure here is the software encoder's own and not reported as a fallback
 		await this.createCodecContext();
 	}
 
@@ -479,14 +534,26 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 		const pixelFormat = choosePixelFormat({
 			codecName: this.avCodec.name,
 			supportedPixelFormats: this.avCodec.pixelFormats,
-			requestedBitDepth: prores444 ? 10 : extractVideoBitDepth(this.config.codec),
+			// `AVdn` carries no depth, so the profile is what states it for a VC-3 or DNxHR encode
+			requestedBitDepth: dnxProfileOf((this.config as QualityCappedVideoEncoderConfig)._encoderControls)
+				?.bitDepth
+				?? (prores444 ? 10 : extractVideoBitDepth(this.config.codec)),
 			incomingBitDepth,
 			wantsAlpha: this.config.alpha === 'keep',
-			chromaFormat: this.codec === 'prores'
-				? (prores444 ? '444' : '422')
-				: this.codec === 'mpeg2'
-					? (mpeg2ObjectTypeOf(this.config.codec) === MPEG2_OBJECT_TYPE_422 ? '422' : '420')
-					: null,
+			// D-10 IS 4:2:2 profile at main level - SMPTE 356M defines no 4:2:0 variant - so the control
+			// settles the chroma format whatever the codec string says. Measured: without this the
+			// output is MPEG-2 Main 4:2:0 with D-10's frame sizes, which is not an IMX deliverable even
+			// though every frame is the right length and the container accepts it.
+			chromaFormat: (() => {
+				const profile = dnxProfileOf((this.config as QualityCappedVideoEncoderConfig)._encoderControls);
+				return profile === null ? undefined : (profile.kind === 'dnxhr' ? profile.chroma : '422');
+			})() ?? ((this.config as QualityCappedVideoEncoderConfig)._encoderControls?.d10 !== undefined
+				? '422'
+				: this.codec === 'prores'
+					? (prores444 ? '444' : '422')
+					: this.codec === 'mpeg2'
+						? (mpeg2ObjectTypeOf(this.config.codec) === MPEG2_OBJECT_TYPE_422 ? '422' : '420')
+						: null),
 		});
 
 		const pixelAspectRatio = simplifyRational({
@@ -500,22 +567,25 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 		codecContext.threadCount = 0;
 		const framerate = toFramerateRational(this.config.framerate || 30);
 
-		if (this.codec === 'mpeg2') {
+		// x264 takes the SPS VUI timing straight from the encoder's time base - num_units_in_tick is its
+		// numerator and time_scale twice its denominator - so a microsecond time base makes the stream
+		// declare a million frames a second. The rate and the PTS resolution are one knob there, and the
+		// stated rate is the one worth having: a broadcast receiver reads the SPS and nothing else.
+		// (x265 takes its timing from the frame rate instead, and already states it correctly.)
+		const statesFramerate = !!this.config.framerate;
+		if (this.codec === 'mpeg2' || (this.codec === 'avc' && statesFramerate)) {
 			this.ptsTimeBase = { num: framerate.den, den: framerate.num };
+		}
 
+		if (this.codec === 'mpeg2') {
 			// MPEG-2 defaults to open GOPs, and `>>> 0` because bit 31 through a plain `|` is negative
 			codecContext.flags = (
 				(codecContext.flags | NodeAv.AV_CODEC_FLAG_CLOSED_GOP) >>> 0
 			) as NodeAv.AVCodecFlag;
-			// FFmpeg refuses a closed GOP while scene change detection is live, and the caller's forced
-			// key frames leave it nothing to decide
 			codecContext.setOption('sc_threshold', '1000000000');
 		}
 
 		codecContext.timeBase = new NodeAv.Rational(this.ptsTimeBase.num, this.ptsTimeBase.den);
-		// Key frames come from the caller, which forces one every keyFrameInterval; a GOP length of the encoder's
-		// own would add key frames between the forced ones
-		// 600 is as long a GOP as MPEG-2 allows, and FFmpeg reduces anything longer to it with a warning
 		codecContext.gopSize = this.codec === 'mpeg2' ? 600 : 2 ** 30;
 		codecContext.framerate = new NodeAv.Rational(framerate.num, framerate.den);
 		// In quantizer mode, the quantizer dictates the rate; a target bitrate would put encoders in the wrong rate
@@ -571,15 +641,21 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 		if (this.config.bitrateMode === 'constant') {
 			codecContext.rcMinRate = codecContext.bitRate;
 			codecContext.rcMaxRate = codecContext.bitRate;
+
+			// A rate pinned top and bottom is only really constant against a buffer; without one the
+			// encoder has no window to even out over. Set only when the caller stated a buffer size, so
+			// an encode that did not ask comes out exactly as it did before.
+			const { _bufferSize } = this.config as QualityCappedVideoEncoderConfig;
+			if (_bufferSize !== undefined) {
+				codecContext.rcBufferSize = _bufferSize;
+			}
 		}
 
 		const isRealtime = this.config.latencyMode === 'realtime';
 
-		// Collected, not set, so the caller's params can merge in
 		const ownParams = new Map<string, string>();
 
 		if (this.avCodec.name === 'libx264') {
-			// Scene-cut detection would also add key frames between the forced ones
 			ownParams.set('scenecut', '0');
 
 			if (isRealtime) {
@@ -587,8 +663,6 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 				codecContext.setOption('preset', 'ultrafast');
 			}
 		} else if (this.avCodec.name === 'libx265') {
-			// Besides no scene-cut key frames, a forced key frame must be a true IDR: with an open GOP, x265 writes it
-			// as a CRA whose leading RASL pictures can't be decoded when playback starts there
 			ownParams.set('log-level', 'error');
 			ownParams.set('scenecut', '0');
 			ownParams.set('open-gop', '0');
@@ -599,12 +673,13 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 				codecContext.setOption('preset', 'ultrafast');
 			}
 		} else if (this.avCodec.name === 'libvpx') {
-			if (isRealtime) {
-				codecContext.setOption('deadline', 'realtime');
-				codecContext.setOption('cpu-used', '8');
-			} else {
-				codecContext.setOption('cpu-used', '8');
-			}
+			// `deadline` outside realtime too, which is what the libvpx-vp9 branch below does
+			// unconditionally. Without it VP8 encodes at libvpx's `good` deadline and costs 42 s
+			// against VP9's 6.9 s for the same 125 frames of 1080p - six times its own successor,
+			// which is not a trade anyone asked for. `cpu-used=8` was already here, so the intent to
+			// go fast was stated; only the mode knob was missing.
+			codecContext.setOption('deadline', 'realtime');
+			codecContext.setOption('cpu-used', '8');
 
 			if (this.config.alpha === 'keep') {
 				// libvpx refuses to encode VP8 transparency when alternate reference frames are enabled
@@ -638,8 +713,12 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 
 			// Map the quantizer from the scale used by Mediabunny to the scale expected by the specific FFmpeg encoder
 			let mapped: number;
-			if (this.avCodec.name === 'libaom-av1' || this.avCodec.name === 'libsvtav1') {
-				// Mediabunny uses AV1's quantizer index (0-255), while these encoders expect the 0-63 quantizer scale
+			if (
+				this.avCodec.name === 'libaom-av1'
+				|| this.avCodec.name === 'libsvtav1'
+				// Mediabunny uses the quantizer index (0-255), while this encoder expects the 0-63 quantizer scale
+				|| this.avCodec.name === 'libvpx-vp9'
+			) {
 				mapped = Math.round(this.quantizer / 4);
 			} else if (this.avCodec.name === 'libx264') {
 				// x264 makes qp 0 lossless, which switches to the High 4:4:4 Predictive profile. That's not what a
@@ -651,10 +730,8 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 				mapped = this.quantizer;
 			}
 
-			// Capped CRF needs the encoder's quality mode, not a constant quantizer
 			const cap = getQualityCap(this.config);
 			if (cap) {
-				// Read back from the branches, so an encoder added below cannot fall out of the warning
 				const bufferSize = cap.bufferSize ?? 2 * cap.maxBitrate;
 				let honoursBufferSize = false;
 
@@ -664,18 +741,14 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 					codecContext.rcBufferSize = bufferSize;
 					honoursBufferSize = true;
 				} else if (this.avCodec.name === 'libsvtav1') {
-					// SVT-AV1 reads crf 0 as unset
 					codecContext.setOption('crf', String(Math.max(mapped, 1)));
 					codecContext.rcMaxRate = BigInt(cap.maxBitrate);
-					// Without this, FFmpeg leaves maximum_buffer_size_ms unset and the cap is not a buffer model
 					codecContext.rcBufferSize = bufferSize;
 					honoursBufferSize = true;
 				} else if (this.avCodec.name === 'libvpx-vp9' || this.avCodec.name === 'libaom-av1') {
-					// Constrained quality: the bitrate is a ceiling over the stream, not a buffer model
 					codecContext.setOption('crf', String(mapped));
 					codecContext.bitRate = BigInt(cap.maxBitrate);
 				} else if (this.avCodec.name?.endsWith('_nvenc')) {
-					// FFmpeg's NVENC wrapper discards the buffer size in this mode; the max bitrate is the bound
 					codecContext.setOption('rc', 'vbr');
 					codecContext.setOption('cq', String(mapped));
 					codecContext.rcMaxRate = BigInt(cap.maxBitrate);
@@ -686,7 +759,6 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 				}
 
 				if (cap.bufferSize !== undefined && !honoursBufferSize) {
-					// Measured: nothing sizes a buffer these have, so silence would be a cap they do not have
 					Logging._warn(
 						`bufferSize has no effect with '${this.avCodec.name}', whose capped mode bounds the bitrate`
 						+ ' rather than a buffer, so maxBitrate alone is the cap. Encode avc, hevc or av1 with'
@@ -698,7 +770,6 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 			} else if (this.avCodec.name === 'libvpx-vp9' || this.avCodec.name === 'libaom-av1') {
 				codecContext.setOption('crf', String(mapped));
 			} else if (this.avCodec.name === 'libsvtav1') {
-				// SVT-AV1 reads crf 0 as unset
 				codecContext.setOption('crf', String(Math.max(mapped, 1)));
 			} else if (this.avCodec.name === 'librav1e') {
 				codecContext.setOption('qp', String(mapped));
@@ -709,7 +780,6 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 				throw new Error(`Encoder '${this.avCodec.name}' cannot be used for quantizer-based encoding.`);
 			}
 
-			// Pinning the range would make the documented CRF mode fixed-QP; the two without one keep the pin
 			if (!cap && (this.avCodec.name === 'librav1e' || this.avCodec.name?.endsWith('_nvenc'))) {
 				codecContext.qMin = mapped;
 				codecContext.qMax = mapped;
@@ -739,16 +809,14 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 		const controls = (this.config as QualityCappedVideoEncoderConfig)._encoderControls;
 		const paramsOption = PARAMS_OPTION[name] ?? null;
 
-		const refuse = (control: string): never => {
-			throw new Error(
-				`encoderControls.${control} is not supported by the selected encoder (${name}).`
+		const refuse = (control: string, because?: string): never => {
+			throw new UnsupportedEncoderControlError(
+				`encoderControls.${control} is not supported by the selected encoder (${name})`
+				+ `${because ? `: ${because}` : '.'}`
 				+ ` Use encoderControls.options to pass an option this encoder has.`,
 			);
 		};
 
-		// The encoder is asked, rather than checked against a list of names, so a control an encoder nobody
-		// tested does support is not refused. Any error counts: a missing option and a value the option
-		// will not take are both "this encoder cannot do what was asked".
 		const setOrRefuse = (option: string, value: string, control: string) => {
 			if (codecContext.setOption(option, value) < 0) {
 				refuse(control);
@@ -764,15 +832,11 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 		const profile = controls?.profile ?? fromCodecString.profile ?? undefined;
 		const level = controls?.level ?? fromCodecString.level ?? undefined;
 
-		// A profile read off the codec string is only passed on where the encoder's vocabulary is the same as
-		// the codec string's. libvpx and libaom take a profile *number*, and accept the string before
-		// failing to open, so asking them is not enough.
 		if (profile !== undefined && (controls?.profile !== undefined || NAMES_H26X_PROFILES.has(name))) {
 			setOrRefuse('profile', profile, 'profile');
 		}
 
 		if (level !== undefined && (controls?.level !== undefined || NAMES_H26X_PROFILES.has(name))) {
-			// x265 states the level in its own params, as a tenfold integer; x264 has an AVOption for it
 			if (name === 'libx265') {
 				ownParams.set('level-idc', String(Math.round(level * 10)));
 			} else {
@@ -805,15 +869,195 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 					ownParams.set('scenecut', String(controls.sceneCut));
 					ownParams.set('min-keyint', String(SCENE_CUT_MIN_KEYINT));
 				} else if (name === 'libsvtav1') {
-					// SVT-AV1 has no threshold, only on or off
 					ownParams.set('scd', '1');
 				} else {
 					refuse('sceneCut');
 				}
 			}
 
+			const dnx = dnxProfileOf(controls);
+			if (dnx !== null) {
+				if (name !== 'dnxhd') {
+					refuse('dnxProfile', 'VC-3 and DNxHR are what the dnxhd encoder writes, and no other');
+				}
+
+				if (dnx.kind === 'dnxhr') {
+					setOrRefuse('profile', dnx.name, 'dnxProfile');
+				} else {
+					// A VC-3 class is a frame size, and ffmpeg picks the class by matching the stated
+					// bitrate against its own table, so only the exact value it holds will do. The rate
+					// follows from the class and the frame rate: 145 at 29.97 and 120 at 25 are both
+					// 606,208 octets a frame.
+					const fps = this.config.framerate ?? 0;
+					const rounded = Math.abs(fps - 30000 / 1001) < 0.01 ? 29.97 : Math.round(fps);
+					const megabits = (dnx.megabits as Record<number, number | undefined>)[rounded];
+
+					if (megabits === undefined) {
+						throw new UnsupportedEncoderControlError(
+							`VC-3 class '${dnx.class}' is defined at 25 and 29.97 frames per second, and this`
+							+ ` encode states ${fps || 'none'}. State one of those as the track's frameRate.`,
+						);
+					}
+
+					// DNxHD defines no progressive 10-bit identifier at 29.97; the interlaced one exists
+					if (dnx.class === '220x' && rounded === 29.97 && controls.interlaced === undefined) {
+						throw new UnsupportedEncoderControlError(
+							'VC-3 220x at 29.97 frames per second exists only interlaced - DNxHD defines no'
+							+ ' progressive 10-bit identifier at that rate. Set encoderControls.interlaced,'
+							+ ' or encode at 25, or use the 8-bit 220 class.',
+						);
+					}
+
+					codecContext.bitRate = BigInt(megabits * 1_000_000);
+				}
+			}
+
+			if (controls.d10 !== undefined) {
+				if (name !== 'mpeg2video') {
+					refuse('d10', 'D-10 is an MPEG-2 mapping (SMPTE 356M) and no other codec defines it');
+				}
+
+				// Two different jobs here, and only measurement separates them. The RATE and
+				// `rc_init_occupancy` are what make every frame come out at exactly rate/fps octets,
+				// which an MXF D-10 mapping requires because it indexes the essence by that fixed unit;
+				// removing `rc_init_occupancy` alone brings back the `frame size does not match index
+				// unit size` the container refuses. The rest - intra VLC, non-linear quantisation,
+				// 10-bit DC precision, the quantiser range - are SMPTE 356M bitstream constraints that
+				// have no effect on the frame size at all, measured one by one, and are asserted
+				// through `trace_headers` instead.
+				const bitsPerSecond = controls.d10 * 1_000_000;
+				codecContext.bitRate = BigInt(bitsPerSecond);
+				codecContext.rcMinRate = BigInt(bitsPerSecond);
+				codecContext.rcMaxRate = BigInt(bitsPerSecond);
+				codecContext.rcBufferSize = D10_VBV_BITS;
+				codecContext.flags = (
+					codecContext.flags
+					| NodeAv.AV_CODEC_FLAG_INTERLACED_DCT
+					| NodeAv.AV_CODEC_FLAG_LOW_DELAY
+				) as NodeAv.AVCodecFlag;
+
+				for (const [option, value] of [
+					['rc_init_occupancy', String(D10_VBV_BITS)],
+					// These two have no measured effect on a short clip of static content - the rate
+					// and `rc_init_occupancy` settle the frame size on their own - and they are kept
+					// because they bound how much of the buffer one frame may take, which only varying
+					// material exercises. Not deleted on the strength of a ten-frame test.
+					['rc_max_vbv_use', '1'],
+					['rc_min_vbv_use', '1'],
+					['dc', '10'],
+					['non_linear_quant', '1'],
+					['intra_vlc', '1'],
+					['qmin', '1'],
+					['qmax', '3'],
+					// No `ps`: the widely-copied IMX recipe sets `-ps 1`, and measured that gives one
+					// slice per MACROBLOCK - 1,620 slice start codes a picture at 720x576 against the 36
+					// a slice-per-row structure gives, since `ff_mpeg1_encode_slice_header` codes the row
+					// in the start code and ffmpeg will emit several slices inside one row. That is legal
+					// MPEG-2, it is not D-10's slice structure, and it spends about 7 KB of every frame
+					// on slice headers for no effect this can demonstrate.
+					['g', '1'], // Intra only: D-10 has no inter-coded pictures
+				] as const) {
+					setOrRefuse(option, value, 'd10');
+				}
+			}
+
+			if (controls.picStruct) {
+				if (name !== 'libx264') {
+					// x265 writes `pic_struct` into its own `pic_timing` message without an SPS flag to
+					// declare, and every other encoder has no such parameter
+					refuse('picStruct');
+				}
+
+				ownParams.set('pic-struct', '1');
+			}
+
+			if (controls.nalHrd !== undefined) {
+				// The model being signalled is the buffer the encoder was given, so without one there is
+				// nothing to state. A VBV needs BOTH a rate ceiling and a buffer: x264 ignores
+				// `vbv-bufsize` on its own and writes nal_hrd_parameters_present_flag 0, so a buffer
+				// size with no ceiling produced a stream that silently declared nothing. The ceiling is
+				// either the cap's maxBitrate or, for a constant rate, the target itself.
+				const cap = getQualityCap(this.config);
+				const { _bufferSize } = this.config as QualityCappedVideoEncoderConfig;
+				const hasCeiling = cap !== null || this.config.bitrateMode === 'constant';
+				const hasBuffer = cap?.bufferSize !== undefined || cap !== null || _bufferSize !== undefined;
+				if (!hasCeiling || !hasBuffer) {
+					throw new UnsupportedEncoderControlError(
+						'encoderControls.nalHrd needs a buffer model to state, and this encode has none.'
+						+ ' A buffer model is a rate ceiling and a buffer size together: state maxBitrate'
+						+ ' and bufferSize on the Quality, or bitrateMode \'constant\' with a bufferSize.'
+						+ ' A bufferSize on its own is dropped by the encoder, which would then declare'
+						+ ' no buffer model at all.',
+					);
+				}
+
+				// x264 writes cbr_flag only where the rate really is constant - a target equal to its own
+				// cap. A capped quantizer is not that, however tightly it is capped, so asking for 'cbr'
+				// there would quietly produce a stream whose flag says 'vbr'.
+				if (controls.nalHrd === 'cbr' && this.config.bitrateMode !== 'constant') {
+					throw new UnsupportedEncoderControlError(
+						'encoderControls.nalHrd \'cbr\' needs bitrateMode \'constant\': the cbr_flag it'
+						+ ' writes says the arrival rate IS constant, and an encoder whose rate merely has'
+						+ ' a ceiling - a capped quantizer - states \'vbr\' whatever is asked for here.'
+						+ ' Use an explicit bitrate with bitrateMode \'constant\' and a bufferSize, or'
+						+ ' nalHrd \'vbr\'.',
+					);
+				}
+
+				if (name === 'libx264') {
+					setOrRefuse('nal-hrd', controls.nalHrd, 'nalHrd');
+				} else if (name === 'libx265') {
+					// x265 has only `--hrd`, an on/off switch, and takes the cbr_flag from the rate
+					// control rather than from a stated mode
+					if (paramsOption === null) {
+						refuse('nalHrd');
+					}
+					ownParams.set('hrd', '1');
+				} else {
+					refuse('nalHrd');
+				}
+			}
+
+			if (controls.interlaced !== undefined && this.codec === 'dnxhd') {
+				// DNxHD picks its CID at open time from AV_CODEC_FLAG_INTERLACED_DCT - 1241 and 1242 are
+				// the interlaced identifiers of the same classes 1235 and 1237 name progressively - and
+				// reads the field order per frame from AV_FRAME_FLAG_TOP_FIELD_FIRST, which the encode
+				// path sets. There is no parameter string to go through.
+				codecContext.flags = (
+					codecContext.flags | NodeAv.AV_CODEC_FLAG_INTERLACED_DCT
+				) as NodeAv.AVCodecFlag;
+			} else if (controls.interlaced !== undefined) {
+				// The field ORDER has to be stated before the encoder opens. ffmpeg's x264 wrapper does
+				// reconfigure `b_tff` from each frame's AV_FRAME_FLAG_TOP_FIELD_FIRST, but x264 cannot
+				// change it after opening, so that route silently yields top-field-first either way:
+				// measured, ffmpeg's own CLI produces pic_struct 3 for bottom-field content given
+				// `-flags +ilme` and nothing else. The parameter is what works - pic_struct 3 for
+				// `tff=1` and 4 for `bff=1` - and AV_CODEC_FLAG_INTERLACED_DCT/_ME turn out to add
+				// nothing on top of it for either encoder.
+				if (paramsOption === null) {
+					refuse('interlaced');
+				}
+
+				if (name !== 'libx264') {
+					// x265 accepts an `interlace` parameter and calls its own interlaced support
+					// experimental. Through this pipeline it produced a stream whose field order reads
+					// back as `unknown` rather than the stated one, so the order cannot be shown to
+					// reach the bitstream - and a control that silently does not take is worse than
+					// one that is refused. `options` still passes it through for anyone who wants it.
+					refuse(
+						'interlaced',
+						name === 'libx265'
+							? 'x265 calls its interlaced support experimental and the stated field order'
+							+ ' did not reach the bitstream when measured'
+							: undefined,
+					);
+				}
+
+				// x264 names the two orders as separate boolean parameters, each implying interlaced
+				ownParams.set(controls.interlaced, '1');
+			}
+
 			if (controls.pass) {
-				// The stats file is an x264/x265 parameter, but which pass this is lives in the context flags
 				if (paramsOption === null) {
 					refuse('pass');
 				}
@@ -915,7 +1159,6 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 			this.lastBuffer = await copyVideoSampleToAvFrame(videoSample, this.frame, this.lastBuffer);
 		}
 
-		// Must run after the frame is prepared: the pixel format and color the context is opened with follow from it
 		if (this.codecContext === null) {
 			await this.createCodecContextWithSoftwareFallback();
 		}
@@ -933,10 +1176,6 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 				// Left unconfigured on purpose: getContext/initContext ignore color properties and use BT.601
 				this.scaler = new NodeAv.SoftwareScaleContext();
 				this.scaler.allocContext();
-				// The same flags the transform uses, for a format change as much as a size change: a
-				// format-only conversion still resamples CHROMA whenever the subsampling differs. Measured
-				// on a same-size 4:4:4 -> 4:2:0 convert, fast_bilinear against these flags leaves luma
-				// identical and chroma at ~34 dB, which is where a 4:2:0 encode loses its colour detail.
 				this.scaler.setOption('sws_flags', 'lanczos+accurate_rnd+full_chroma_int');
 			}
 
@@ -948,6 +1187,12 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 				this.dstFrame.format = this.codecContext.pixelFormat;
 				this.dstFrame.allocBuffer();
 			}
+
+			// An encoder that delays (DNxHD, and any other that holds the frame past sendFrame) keeps a
+			// reference to this buffer, and swscale writes into it without checking - which corrupts the
+			// frame being encoded and aborts the process. No-op while we are the only owner.
+			const writableRet = this.dstFrame.makeWritable();
+			NodeAv.FFmpegError.throwIfError(writableRet, 'Make frame writable');
 
 			this.dstFrame.copyProps(this.frame);
 			this.dstFrame.colorPrimaries = this.codecContext.colorPrimaries;
@@ -971,6 +1216,19 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 		frameToEncode.duration = BigInt(this.toTicks(videoSample.microsecondDuration));
 		frameToEncode.timeBase = new NodeAv.Rational(this.ptsTimeBase.num, this.ptsTimeBase.den);
 
+		const interlaced = (this.config as QualityCappedVideoEncoderConfig)._encoderControls?.interlaced;
+		if (interlaced !== undefined) {
+			// x265 needs the frames themselves marked or it encodes progressive whatever its `interlace`
+			// parameter says - measured: without this, field order reads back as `progressive`. x264 does
+			// not need it, and it costs nothing there.
+			frameToEncode.setFlags(NodeAv.AV_FRAME_FLAG_INTERLACED);
+			if (interlaced === 'tff') {
+				frameToEncode.setFlags(NodeAv.AV_FRAME_FLAG_TOP_FIELD_FIRST);
+			} else {
+				frameToEncode.clearFlags(NodeAv.AV_FRAME_FLAG_TOP_FIELD_FIRST);
+			}
+		}
+
 		// Let's just set both for good measure
 		frameToEncode.pictType = options?.keyFrame
 			? NodeAv.AV_PICTURE_TYPE_I
@@ -979,15 +1237,12 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 			? 1
 			: 0;
 
-		const preciseTimingIndex = binarySearchLessOrEqual(
-			this.preciseTimings,
-			videoSample.microsecondTimestamp,
-			x => x.microsecondTimestamp,
-		);
+		const tick = Number(frameToEncode.pts);
+		const preciseTimingIndex = binarySearchLessOrEqual(this.preciseTimings, tick, x => x.tick);
 		const existingEntry = preciseTimingIndex !== -1
 			? this.preciseTimings[preciseTimingIndex]
 			: null;
-		if (existingEntry && existingEntry.microsecondTimestamp === videoSample.microsecondTimestamp) {
+		if (existingEntry && existingEntry.tick === tick) {
 			if (existingEntry.timestamp !== videoSample.timestamp) {
 				// Mapping isn't unique, can't use the timestamp
 				existingEntry.timestampIsValid = false;
@@ -998,7 +1253,7 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 			}
 		} else {
 			this.preciseTimings.splice(preciseTimingIndex + 1, 0, {
-				microsecondTimestamp: videoSample.microsecondTimestamp,
+				tick,
 				timestamp: videoSample.timestamp,
 				duration: videoSample.duration,
 				timestampIsValid: true,
@@ -1011,7 +1266,6 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 			}
 		}
 
-		// A native encoder must not see A/53 side data: VideoToolbox errors on it, libx265 drops it
 		frameToEncode.removeSideData(NodeAv.AV_FRAME_DATA_A53_CC);
 
 		const ret = await this.codecContext.sendFrame(frameToEncode);
@@ -1037,22 +1291,19 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 		}
 		let packetData = toUint8Array(this.packet.data);
 
-		const pts = this.toMicroseconds(Number(this.packet.pts));
+		const ptsTick = Number(this.packet.pts);
+		const pts = this.toMicroseconds(ptsTick);
 		let timestamp = pts / 1e6;
 		let duration = this.toMicroseconds(Number(this.packet.duration)) / 1e6;
 
-		const preciseTimingIndex = binarySearchLessOrEqual(
-			this.preciseTimings,
-			pts,
-			x => x.microsecondTimestamp,
-		);
+		const preciseTimingIndex = binarySearchLessOrEqual(this.preciseTimings, ptsTick, x => x.tick);
 		const entry = preciseTimingIndex !== -1
 			? this.preciseTimings[preciseTimingIndex]
 			: null;
 
 		// If there's a relevant timing entry, refine the packet's timing data to get better accuracy than
 		// microseconds
-		if (entry && entry.microsecondTimestamp === pts) {
+		if (entry && entry.tick === ptsTick) {
 			if (entry.timestampIsValid) {
 				timestamp = entry.timestamp;
 			}
@@ -1244,8 +1495,6 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 					hevcCodecInfo: null,
 					vp9CodecInfo: null,
 					av1CodecInfo: null,
-					// The profile asked for is not always the profile written, so the string states what
-					// the sequence extension does
 					mpeg2CodecInfo: extractMpeg2CodecInfoFromPacket(packetData),
 					proresFormat: null,
 				});
@@ -1268,6 +1517,27 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 					proresFormat: this.config.codec as ProresFourCc,
 				});
 			}
+		} else if (this.codec === 'dnxhd') {
+			// VC-3 has no RFC 6381 registration, so the four-character code is the whole string, the
+			// way it is for ProRes. Reaching the `throw` below instead aborts the process rather than
+			// failing the encode: this runs inside a node-av thread-safe callback, which cannot carry
+			// a JavaScript exception back out.
+			decoderConfigCodecString = DNXHD_FOURCC;
+		} else if (this.codec === 'rawvideo') {
+			decoderConfigCodecString = RAWVIDEO_CODEC_STRING;
+
+			// Uncompressed frames say nothing about themselves, so the pixel format has to be stated
+			// beside them or nothing downstream can read the planes
+			assert(this.codecContext);
+			const tag = pixelFormatToY4mTag(this.codecContext.pixelFormat);
+			if (tag === null) {
+				throw new Error(
+					`Uncompressed video cannot be written in pixel format ${String(this.codecContext.pixelFormat)}:`
+					+ ' Y4M names no colour space for it.',
+				);
+			}
+
+			decoderConfigDescription = textEncoder.encode(tag);
 		} else {
 			throw new Error('Unreachable.');
 		}
@@ -1278,7 +1548,6 @@ export class NodeAvVideoEncoder extends CustomVideoEncoder {
 			sideData.alpha = toUint8Array(matroskaBlockAdditional).subarray(8); // Skip the BlockAddId
 		}
 
-		// MPEG-TS needs a decode time and it cannot be derived from presentation timestamps alone
 		const rawDts = this.packet.dts;
 		const decodeTimestamp = rawDts === null || rawDts === NodeAv.AV_NOPTS_VALUE
 			? undefined

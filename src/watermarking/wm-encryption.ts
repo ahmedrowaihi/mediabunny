@@ -38,8 +38,6 @@ export const variantIv = (baseIv: Uint8Array, variant: number): Uint8Array => {
 	return iv;
 };
 
-// `tenc` layout after the FullBox header: reserved, pattern, default_is_protected,
-// default_per_sample_IV_size, default_KID[16], then the constant IV when there is no per-sample one.
 const TENC_IS_PROTECTED = 6;
 const TENC_PER_SAMPLE_IV_SIZE = 7;
 const TENC_CONSTANT_IV_SIZE = 24;
@@ -114,8 +112,6 @@ export const encryptVariantSegment = (
 	const iv = variantIv(options.baseIv, options.variant);
 
 	if (scheme === 'cbcs') {
-		// cbcs keeps its IV as a constant in the init rather than per sample, so the init has to be
-		// this variant's own. Checking it is what makes cbcs safe here: a shared init cannot pass.
 		const constants = tencConstantIvs(init);
 		if (constants.length === 0) {
 			throw new InvalidUsageError(

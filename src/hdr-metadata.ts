@@ -68,6 +68,25 @@ export type HdrStaticMetadata = {
 };
 
 /**
+ * The boxes next to `hvcC` that describe a layered or stereo track, as they appeared in the file.
+ *
+ * @group Codecs
+ * @public
+ */
+export type MultiviewConfiguration = {
+	/** The `lhvC` payload: the parameter sets of every layer above the base. */
+	layerConfiguration: Uint8Array;
+	/** The `vexu` payload, where the track carries one. */
+	viewExtension?: Uint8Array;
+	/**
+	 * The `hfov` box's horizontal field of view in thousandths of a degree, where the sample entry
+	 * carries one. It sits beside `vexu` rather than inside it, but visionOS requires all three
+	 * before it will treat a file as spatial media, so it travels with them.
+	 */
+	fieldOfViewMillidegrees?: number;
+};
+
+/**
  * A [video decoder config](https://www.w3.org/TR/webcodecs/#video-decoder-config) that may additionally carry the
  * HDR10 static metadata stored next to it in the container. WebCodecs has no field for it, so it travels alongside the
  * config: the ISOBMFF demuxer fills it in from the `mdcv` / `clli` boxes, and the ISOBMFF muxer writes those boxes
@@ -81,6 +100,19 @@ export type VideoDecoderConfigWithHdr = VideoDecoderConfig & {
 	hdrStaticMetadata?: HdrStaticMetadata;
 	/** The track's Dolby Vision configuration record, absent when the track carries none. */
 	dolbyVision?: DoviConfig;
+	/**
+	 * A layered track's second view, absent when the track carries only one.
+	 *
+	 * Carried as the raw box payloads rather than as a parsed model, because the only thing a packager
+	 * has to get right about them is that they come out unchanged: `hvcC` describes the base layer
+	 * alone, so dropping `lhvC` turns a stereo track into a mono one, and dropping `vexu` turns a
+	 * spatial video into a picture that merely happens to be two views. Read them with
+	 * `parseLhvcConfigRecord` and `parseVexuBox`.
+	 *
+	 * A file carrying only an `hfov` has this with an empty `layerConfiguration`, so check that
+	 * rather than this field's presence to tell a layered track from a flat one.
+	 */
+	multiview?: MultiviewConfiguration;
 	/**
 	 * Bits per coded sample, as an ISO BMFF video sample entry's depth field states it. It is the only
 	 * thing distinguishing QuickTime RLE or PNG with an alpha channel (32) from the same codec without

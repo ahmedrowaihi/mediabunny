@@ -26,6 +26,9 @@ import { Input } from '../../src/input.js';
 import { Output } from '../../src/output.js';
 import { Mp4OutputFormat } from '../../src/output-format.js';
 import { FilePathSource } from '../../src/source.js';
+import { AudioSampleSource, VideoSampleSource } from '../../src/media-source.js';
+import { AudioSample, VideoSample } from '../../src/sample.js';
+import { bytesToHexString } from '../../src/misc.js';
 import { Conversion } from '../../src/conversion.js';
 
 registerMediabunnyServer();
@@ -261,6 +264,159 @@ describe.skipIf(!hasFfmpeg)('MxfTarget', () => {
 		const looseAgain = await writeMxf('loose-b.mxf');
 		expect(readFileSync(looseAgain.file).equals(readFileSync(loose.file))).toBe(false);
 	}, 600_000);
+
+	// `bitexact` on the target reaches the muxer, and a file repeats only if the encoder repeats too.
+	// The gap is one octet: an AVC essence element's `user_data_unregistered` SEI, written by
+	// `h264_videotoolbox`. The shape here is the one that found it - a video track and four mono PCM
+	// tracks, fed concurrently so they finish at different times - and both halves are measured
+	// rather than assumed, since the whole claim is about two runs of the same job.
+	describe('reproducible bytes need the encoder as well as the muxer', () => {
+		const FRAMES = 5;
+		const MONO_TRACKS = 4;
+
+		/** Every top-level KLV triplet in the file: a 16-octet key, a BER length, that many octets. */
+		const topLevelKlv = (bytes: Buffer) => {
+			const out: { key: Uint8Array; valueStart: number; length: number }[] = [];
+			let at = 0;
+			while (at + 17 <= bytes.length) {
+				const key = bytes.subarray(at, at + 16);
+				let pos = at + 16;
+				const first = bytes[pos++]!;
+				let length = first;
+				if (first & 0x80) {
+					const count = first & 0x7f;
+					length = 0;
+					for (let i = 0; i < count; i++) {
+						length = length * 256 + bytes[pos++]!;
+					}
+				}
+
+				out.push({ key, valueStart: pos, length });
+				at = pos + length;
+			}
+
+			return out;
+		};
+
+		/** One video plus four mono PCM tracks, through the software or the hardware AVC encoder. */
+		const writeMultiTrack = async (name: string, software: boolean) => {
+			const file = path.join(workDir, name);
+			const output = new Output({
+				format: new Mp4OutputFormat({ fastStart: 'fragmented' }),
+				target: new MxfTarget(file, { bitexact: true, startTimecode: '10:00:00:00' }),
+			});
+
+			const video = new VideoSampleSource({
+				codec: 'avc',
+				bitrate: 100e6,
+				keyFrameInterval: 0,
+				hardwareAcceleration: software ? 'prefer-software' : 'prefer-hardware',
+			});
+			output.addVideoTrack(video, { frameRate: 25 });
+
+			const audio = Array.from({ length: MONO_TRACKS }, () => {
+				const source = new AudioSampleSource({ codec: 'pcm-s24' });
+				output.addAudioTrack(source);
+				return source;
+			});
+
+			await output.start();
+
+			const pixels = new Uint8Array(1920 * 1080 * 3 / 2).fill(0x80);
+			const pushVideo = (async () => {
+				for (let i = 0; i < FRAMES; i++) {
+					using sample = new VideoSample(pixels, {
+						format: 'I420',
+						codedWidth: 1920,
+						codedHeight: 1080,
+						timestamp: i / 25,
+						duration: 1 / 25,
+					});
+					await video.add(sample);
+				}
+				video.close();
+			})();
+
+			const perFrame = 48000 / 25;
+			const pushAudio = audio.map((source, channel) => (async () => {
+				for (let i = 0; i < FRAMES; i++) {
+					const data = new Float32Array(perFrame);
+					for (let n = 0; n < perFrame; n++) {
+						// A different waveform per track, so a swapped track shows in the bytes
+						data[n] = Math.sin((n + i * perFrame) * (channel + 1) / 400) * 0.25;
+					}
+					const sample = new AudioSample({
+						data,
+						format: 'f32',
+						numberOfChannels: 1,
+						sampleRate: 48000,
+						timestamp: i / 25,
+					});
+					await source.add(sample);
+					sample.close();
+				}
+				source.close();
+			})());
+
+			await Promise.all([pushVideo, ...pushAudio]);
+			await output.finalize();
+			return file;
+		};
+
+		const writeTwice = async (tag: string, software: boolean) => {
+			const [a, b] = await Promise.all([
+				writeMultiTrack(`${tag}-a.mxf`, software),
+				writeMultiTrack(`${tag}-b.mxf`, software),
+			]);
+			return [readFileSync(a), readFileSync(b), a] as const;
+		};
+
+		test('through a software encoder, two writes of one job are byte-identical', async () => {
+			// The target's `bitexact` plus a deterministic encoder. Three attempts, because the claim
+			// is about repetition and one pass cannot show it.
+			for (let attempt = 1; attempt <= 3; attempt++) {
+				const [first, second] = await writeTwice(`exact${attempt}`, true);
+				expect(first.equals(second), `attempt ${attempt}`).toBe(true);
+			}
+		}, 600_000);
+
+		// Only where a hardware AVC encoder exists, which means VideoToolbox and so macOS. A Linux CI
+		// runner has no usable one - `prefer-hardware` falls back to libx264 there, which is
+		// deterministic - so this asserted a difference that cannot happen and failed the release it
+		// was pushed in. The claim is about VideoToolbox, so it runs where VideoToolbox is.
+		test.skipIf(process.platform !== 'darwin')(
+			'through the hardware encoder they differ, by one octet in its SEI',
+			async () => {
+			// The control, and the reason the test above is worth running. `h264_videotoolbox` - which
+			// this machine picks for AVC by default - writes an SEI whose contents vary between runs,
+			// and no flag on the codec context changes that: measured with AV_CODEC_FLAG_BITEXACT set
+			// before the codec opened, the SEI was still there and the octet still varied. A hardware
+			// encoder's bitstream is not FFmpeg's to normalise.
+				const [first, second, file] = await writeTwice('loose', false);
+				expect(first.equals(second)).toBe(false);
+
+				// One octet in the whole file, and it lands in a Generic Container picture element rather
+				// than in header metadata or an index segment
+				const differing: number[] = [];
+				for (let i = 0; i < Math.min(first.length, second.length); i++) {
+					if (first[i] !== second[i]) {
+						differing.push(i);
+					}
+				}
+				expect(differing).toHaveLength(1);
+
+				const inPictureElement = topLevelKlv(first)
+					.find(klv => differing[0]! >= klv.valueStart && differing[0]! < klv.valueStart + klv.length);
+				expect(inPictureElement, 'the differing octet is in no KLV at all').toBeDefined();
+				expect(bytesToHexString(inPictureElement!.key).startsWith('060e2b34010201010d01030115')).toBe(true);
+
+				// And the pictures themselves are the same, which is what makes this a metadata
+				// difference
+				expect(decodeErrors(file)).toBe('');
+			},
+			600_000,
+		);
+	});
 
 	// RDD 9 wants the rung's nominal rate in the MPEG2VideoDescriptor's BitRate. ffprobe reports
 	// `bit_rate=N/A` for an MXF video stream whatever is written there - FFmpeg's mxf *demuxer* never

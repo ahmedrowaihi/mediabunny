@@ -321,3 +321,144 @@ test('against real encoders, the harder programme takes the larger share', { tim
 	expect(Math.abs(Math.log2(settled / 2e6)), `from ${baseline.toFixed(0)} b/s to ${settled.toFixed(0)}`)
 		.toBeLessThan(Math.abs(Math.log2(baseline / 2e6)) * 0.6);
 });
+
+// A floor is a claim on the pool, not a promise the encoder will fill it. Static content - a slate, a
+// black channel, a still caption card - makes a few kilobits per second *at any quality*, so a loop
+// that reads "under its floor" as "needs a finer quantizer" never stops refining. The quantizer walks
+// to the codec's minimum, which for x264 is lossless: several times slower than real time, and still
+// nowhere near the floor.
+
+/**
+ * Bits that stop responding to quality past a point, which is what content with nothing in it does.
+ *
+ * `startAt` continues the timeline across calls. Restarting it at zero makes the loop see time go
+ * backwards, so it never reaches another interval boundary and never reallocates - which reads
+ * exactly like a loop that has stopped responding.
+ */
+const saturatingRun = (statMux: StatMux, ceilings: number[], seconds: number, startAt = 0) => {
+	for (let frame = 0; frame < seconds * FPS; frame++) {
+		const timestamp = startAt + frame / FPS;
+		const quantizers = statMux.quantizers;
+
+		for (let program = 0; program < ceilings.length; program++) {
+			const unbounded = modelBitrate(1e6, quantizers[program]!);
+			const bits = Math.min(unbounded, ceilings[program]!) / FPS;
+			statMux.report(program, bits / 8, timestamp);
+		}
+	}
+};
+
+test('a program that cannot spend its floor is not refined to lossless chasing it', () => {
+	// One ordinary program and one static one, whose 3 kb/s is far under a 50 kb/s floor at any quality
+	const options: StatMuxOptions = {
+		programs: [
+			{ minBitrate: 1e6, maxBitrate: 5e6 },
+			{ minBitrate: 50_000, maxBitrate: 5e6, minQuantizer: 18 },
+		],
+		totalBitrate: 6e6,
+		codec: 'avc',
+		interval: 2,
+	};
+
+	// Program 0's content can fill the pool, so the shared quantizer settles somewhere sensible and
+	// program 1's behaviour is its own rather than the pool's
+	const bounded = new StatMux(options);
+	saturatingRun(bounded, [1e9, 3000], 60);
+	// It stops where it was told to, rather than walking to 0
+	expect(bounded.quantizers[1]!).toBeGreaterThanOrEqual(18);
+
+	// And the bound is what does it: the same run without one reaches the codec's own minimum
+	const unbounded = new StatMux({
+		...options,
+		programs: [options.programs[0]!, { minBitrate: 50_000, maxBitrate: 5e6 }],
+	});
+	saturatingRun(unbounded, [1e9, 3000], 60);
+	expect(unbounded.quantizers[1]!).toBeLessThan(18);
+
+	// The other program is unaffected either way: one program's unfillable floor is not the others'
+	// problem, and it stays at a working quantizer rather than being dragged down with it
+	expect(bounded.quantizers[0]!).toBeGreaterThan(0);
+	expect(bounded.quantizers[0]).toBe(unbounded.quantizers[0]);
+});
+
+test('a program may state no floor at all', () => {
+	// A filler or slate channel claims nothing and takes whatever the shared quantizer gives it.
+	// minBitrate 0 used to be refused outright, which left no way to say that.
+	const statMux = new StatMux({
+		programs: [{ minBitrate: 2e6, maxBitrate: 5e6 }, { minBitrate: 0, maxBitrate: 5e6 }],
+		totalBitrate: 6e6,
+		codec: 'avc',
+		interval: 2,
+	});
+
+	saturatingRun(statMux, [1e9, 3000], 40);
+
+	// No floor means no floor correction. The same run with an unreachable floor drags this program
+	// off the shared quantizer; without one it is left where the pool put it.
+	const withFloor = new StatMux({
+		programs: [{ minBitrate: 2e6, maxBitrate: 5e6 }, { minBitrate: 50_000, maxBitrate: 5e6 }],
+		totalBitrate: 6e6,
+		codec: 'avc',
+		interval: 2,
+	});
+	saturatingRun(withFloor, [1e9, 3000], 40);
+	expect(statMux.quantizers[1]!).toBeGreaterThanOrEqual(withFloor.quantizers[1]!);
+
+	expect(() => new StatMux({
+		programs: [{ minBitrate: -1, maxBitrate: 5e6 }],
+		totalBitrate: 6e6,
+		codec: 'avc',
+	})).toThrow(/non-negative/);
+	// A ceiling of zero is still nonsense: it leaves no allocation at all
+	expect(() => new StatMux({
+		programs: [{ minBitrate: 0, maxBitrate: 0 }],
+		totalBitrate: 6e6,
+		codec: 'avc',
+	})).toThrow(/positive/);
+});
+
+test('minQuantizer is checked against the codec\'s own scale', () => {
+	// AV1 counts 0-255 and AVC 0-51, so a value valid for one is not for the other
+	expect(() => new StatMux({
+		programs: [{ minBitrate: 0, maxBitrate: 5e6, minQuantizer: 200 }],
+		totalBitrate: 6e6,
+		codec: 'avc',
+	})).toThrow(/between 0 and 51/);
+
+	expect(() => new StatMux({
+		programs: [{ minBitrate: 0, maxBitrate: 5e6, minQuantizer: 200 }],
+		totalBitrate: 6e6,
+		codec: 'av1',
+	})).not.toThrow();
+});
+
+test('a program that was static recovers at once when its content gets busy', () => {
+	// Windup: every interval under an unspendable floor banks another step of correction. The
+	// quantizer is clamped so nothing looks wrong while the content stays static - but the offset is
+	// not what is clamped, and when the picture starts moving again the program stays pinned at
+	// maximum quality until all that banked correction unwinds, taking the pool with it.
+	const options: StatMuxOptions = {
+		programs: [
+			{ minBitrate: 1e6, maxBitrate: 5e6 },
+			{ minBitrate: 2e6, maxBitrate: 5e6 },
+		],
+		totalBitrate: 6e6,
+		codec: 'avc',
+		interval: 2,
+	};
+
+	const statMux = new StatMux(options);
+	// Two minutes of a slate it cannot spend its floor on - sixty intervals of banked correction
+	saturatingRun(statMux, [1e9, 3000], 120);
+
+	// Now it is live content, easily over the floor, for long enough that the loop has settled
+	saturatingRun(statMux, [1e9, 1e9], 60, 120);
+
+	// Close to where it would have been having never seen the slate. Not identical: the per-program
+	// offset is an integrator with no restoring term, so a correction earned under the slate persists
+	// until the ceiling pushes back. Measured, that is worth about three steps on a 0-51 scale - small
+	// enough to leave alone, and stated here so a change to the loop that made it worse would show.
+	const reference = new StatMux(options);
+	saturatingRun(reference, [1e9, 1e9], 60);
+	expect(Math.abs(statMux.quantizers[1]! - reference.quantizers[1]!)).toBeLessThanOrEqual(4);
+});

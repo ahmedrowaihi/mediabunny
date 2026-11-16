@@ -18,15 +18,15 @@
 
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { copyFileSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { expect, test } from 'vitest';
 import { Input } from '../../src/input.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
 import type { InputVideoTrack } from '../../src/input-track.js';
-import { EncodedPacketSink } from '../../src/media-sink.js';
-import { bytesToHexString } from '../../src/misc.js';
+import { EncodedPacketSink, SubtitleCueSink } from '../../src/media-sink.js';
+import { assert, bytesToHexString } from '../../src/misc.js';
 import { BufferSource, FilePathSource } from '../../src/source.js';
 import {
 	editUnitsToSeconds,
@@ -1404,3 +1404,353 @@ test.skipIf(!hasFfmpeg())('an audio resource counting in samples is cut where th
 		rmSync(dir, { recursive: true, force: true });
 	}
 }, 60_000);
+
+// A subtitle resource is a CUT, exactly as an image one is: the document covers the whole track file
+// and the composition takes a span out of it. The cues inside carry FILE times, so a reader that
+// hands them over unshifted puts every subtitle at the wrong place in the composition - and one that
+// forgets to clip shows cues the composition never reaches.
+
+const SUBTITLE_TRACK_FILE = '9a7f1c2d-55b6-4e8a-91cd-3f0e6b8a7d41';
+const SUBTITLE_TRACK_ID = '7e5d4c3b-2a19-4867-9f0e-1d2c3b4a5968';
+
+/** One `<Resource>` of a subtitle sequence, in the document's own edit units. */
+const subtitleResource = (
+	id: string,
+	entryPoint: number,
+	sourceDuration: number,
+	repeatCount: number,
+) => `
+            <Resource>
+              <Id>urn:uuid:${id}</Id>
+              <EditRate>24000 1001</EditRate>
+              <IntrinsicDuration>6240</IntrinsicDuration>
+              <EntryPoint>${entryPoint}</EntryPoint>
+              <SourceDuration>${sourceDuration}</SourceDuration>
+              <RepeatCount>${repeatCount}</RepeatCount>
+              <TrackFileId>urn:uuid:${SUBTITLE_TRACK_FILE}</TrackFileId>
+            </Resource>`;
+
+/** An IMP whose only sequence is subtitles, with the resources given, in the file's own edit rate. */
+const writeSubtitleResources = (
+	dir: string,
+	resources: { entryPoint: number; sourceDuration: number; repeatCount?: number }[],
+) => {
+	copyFileSync(
+		new URL('../public/imf-timed-text.mxf', import.meta.url).pathname,
+		path.join(dir, 'subs.mxf'),
+	);
+
+	writeFileSync(path.join(dir, 'ASSETMAP.xml'), `<?xml version="1.0" encoding="UTF-8"?>
+<AssetMap xmlns="http://www.smpte-ra.org/schemas/429-9/2007/AM">
+  <Id>urn:uuid:11111111-1111-4111-8111-111111111113</Id>
+  <AssetList>
+    <Asset>
+      <Id>urn:uuid:${SUBTITLE_TRACK_FILE}</Id>
+      <ChunkList><Chunk><Path>subs.mxf</Path></Chunk></ChunkList>
+    </Asset>
+  </AssetList>
+</AssetMap>`);
+
+	const cplPath = path.join(dir, 'CPL_subs_multi.xml');
+	writeFileSync(cplPath, `<?xml version="1.0" encoding="UTF-8"?>
+<CompositionPlaylist xmlns="http://www.smpte-ra.org/schemas/2067-3/2016">
+  <Id>urn:uuid:22222222-2222-4222-8222-222222222224</Id>
+  <ContentTitleText>Subtitle resources</ContentTitleText>
+  <EditRate>24000 1001</EditRate>
+  <SegmentList>
+    <Segment>
+      <Id>urn:uuid:33333333-3333-4333-8333-333333333335</Id>
+      <SequenceList>
+        <SubtitlesSequence>
+          <Id>urn:uuid:44444444-4444-4444-8444-444444444446</Id>
+          <TrackId>urn:uuid:${SUBTITLE_TRACK_ID}</TrackId>
+          <ResourceList>${resources.map((resource, index) => subtitleResource(
+				`5555555${index}-5555-4555-8555-55555555555${index}`,
+				resource.entryPoint,
+				resource.sourceDuration,
+				resource.repeatCount ?? 1,
+			)).join('')}
+          </ResourceList>
+        </SubtitlesSequence>
+      </SequenceList>
+    </Segment>
+  </SegmentList>
+</CompositionPlaylist>`);
+
+	return cplPath;
+};
+
+/** An IMP whose only sequence is subtitles, cutting `[entry, entry + duration)` out of the document. */
+const writeSubtitleImp = (dir: string, entryPoint: number, sourceDuration: number, repeatCount = 1) => {
+	copyFileSync(
+		new URL('../public/imf-timed-text.mxf', import.meta.url).pathname,
+		path.join(dir, 'subs.mxf'),
+	);
+
+	writeFileSync(path.join(dir, 'ASSETMAP.xml'), `<?xml version="1.0" encoding="UTF-8"?>
+<AssetMap xmlns="http://www.smpte-ra.org/schemas/429-9/2007/AM">
+  <Id>urn:uuid:11111111-1111-4111-8111-111111111112</Id>
+  <AssetList>
+    <Asset>
+      <Id>urn:uuid:${SUBTITLE_TRACK_FILE}</Id>
+      <ChunkList><Chunk><Path>subs.mxf</Path></Chunk></ChunkList>
+    </Asset>
+  </AssetList>
+</AssetMap>`);
+
+	const cplPath = path.join(dir, 'CPL_subs.xml');
+	writeFileSync(cplPath, `<?xml version="1.0" encoding="UTF-8"?>
+<CompositionPlaylist xmlns="http://www.smpte-ra.org/schemas/2067-3/2016">
+  <Id>urn:uuid:22222222-2222-4222-8222-222222222223</Id>
+  <ContentTitleText>Subtitle cut test</ContentTitleText>
+  <EditRate>1 1</EditRate>
+  <SegmentList>
+    <Segment>
+      <Id>urn:uuid:33333333-3333-4333-8333-333333333334</Id>
+      <SequenceList>
+        <SubtitlesSequence>
+          <Id>urn:uuid:44444444-4444-4444-8444-444444444445</Id>
+          <TrackId>urn:uuid:${SUBTITLE_TRACK_ID}</TrackId>
+          <ResourceList>
+            <Resource>
+              <Id>urn:uuid:55555555-5555-4555-8555-555555555556</Id>
+              <EditRate>1 1</EditRate>
+              <IntrinsicDuration>300</IntrinsicDuration>
+              <EntryPoint>${entryPoint}</EntryPoint>
+              <SourceDuration>${sourceDuration}</SourceDuration>
+              <RepeatCount>${repeatCount}</RepeatCount>
+              <TrackFileId>urn:uuid:${SUBTITLE_TRACK_FILE}</TrackFileId>
+            </Resource>
+          </ResourceList>
+        </SubtitlesSequence>
+      </SequenceList>
+    </Segment>
+  </SegmentList>
+</CompositionPlaylist>`);
+
+	return cplPath;
+};
+
+const cuesOf = async (cplPath: string) => {
+	using input = new Input({ source: new FilePathSource(cplPath), formats: ALL_FORMATS });
+	const tracks = await input.getTracks();
+	expect(tracks).toHaveLength(1);
+	const track = tracks[0]!;
+	expect(track.type).toBe('subtitle');
+	expect(track.isSubtitleTrack()).toBe(true);
+	assert(track.isSubtitleTrack());
+
+	const out: { timestamp: number; duration: number; text: string }[] = [];
+	for await (const cue of new SubtitleCueSink(track).cues()) {
+		out.push({
+			timestamp: Number(cue.timestamp.toFixed(4)),
+			duration: Number(cue.duration.toFixed(4)),
+			text: cue.text,
+		});
+	}
+	return out;
+};
+
+test('a subtitles sequence is a track, and its cues are the whole document uncut', async () => {
+	const dir = mkdtempSync(path.join(tmpdir(), 'mediabunny-imf-subs-'));
+	try {
+		// The document runs to 255.255 s; a cut of [0, 300) takes all of it
+		const cues = await cuesOf(writeSubtitleImp(dir, 0, 300));
+
+		expect(cues).toHaveLength(36);
+		expect(cues[0]!.timestamp).toBeCloseTo(216 * 1001 / 24000, 3);
+		expect(cues[cues.length - 1]!.timestamp).toBeCloseTo(255.255, 3);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+}, 120_000);
+
+test('a cut drops the cues outside it and shifts the rest onto the composition', async () => {
+	const dir = mkdtempSync(path.join(tmpdir(), 'mediabunny-imf-subs-'));
+	try {
+		// EntryPoint 60 s, SourceDuration 30 s: the composition is 30 s long and shows what the document
+		// has between 60 and 90 s, starting at zero
+		const cues = await cuesOf(writeSubtitleImp(dir, 60, 30));
+		const whole = await cuesOf(writeSubtitleImp(dir, 0, 300));
+
+		const expected = whole.filter(cue => cue.timestamp + cue.duration > 60 && cue.timestamp < 90);
+		expect(expected.length).toBeGreaterThan(2);
+		expect(cues).toHaveLength(expected.length);
+
+		// Every cue moved down by exactly the entry point, and none sits outside the composition
+		for (const [index, cue] of cues.entries()) {
+			expect(cue.timestamp).toBeCloseTo(Math.max(expected[index]!.timestamp, 60) - 60, 3);
+			expect(cue.timestamp).toBeGreaterThanOrEqual(-1e-6);
+			expect(cue.timestamp).toBeLessThan(30 + 1e-6);
+			expect(cue.text).toBe(expected[index]!.text);
+		}
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+}, 120_000);
+
+/** Every packet of a subtitle track, as (start, end) on the composition, to three decimals. */
+const subtitlePacketsOf = async (cplPath: string) => {
+	using input = new Input({ source: new FilePathSource(cplPath), formats: ALL_FORMATS });
+	const track = (await input.getTracks())[0]!;
+	assert(track.isSubtitleTrack());
+
+	const out: [number, number][] = [];
+	for await (const packet of new EncodedPacketSink(track).packets()) {
+		out.push([
+			Number(packet.timestamp.toFixed(3)),
+			Number((packet.timestamp + packet.duration).toFixed(3)),
+		]);
+	}
+	return out;
+};
+
+test('every resource of a subtitle sequence is read, not only the first', async () => {
+	// A clip-wrapped document is ONE element covering the whole track file, so its packet starts at
+	// file time 0 whatever the entry point is. Asking whether it STARTS inside the cut answers no for
+	// every cut but one beginning at zero, which left each later resource reading as empty.
+	const dir = mkdtempSync(path.join(tmpdir(), 'mediabunny-imf-subs-'));
+	try {
+		const unit = 1001 / 24000;
+		// Both cuts chosen to contain cues: the document's first is at 9.009 s, so a cut of
+		// [0, 168) edit units - the first seven seconds - holds none at all, and asserting on it would
+		// be asserting on the document rather than on the reader
+		const cpl = writeSubtitleResources(dir, [
+			{ entryPoint: 288, sourceDuration: 168 },
+			{ entryPoint: 576, sourceDuration: 168 },
+		]);
+
+		const packets = await subtitlePacketsOf(cpl);
+		expect(packets).toHaveLength(2);
+		// Each cut is 168 edit units long and they abut on the composition
+		expect(packets[0]![1] - packets[0]![0]).toBeCloseTo(168 * unit, 2);
+		expect(packets[1]![0]).toBeCloseTo(168 * unit, 2);
+		expect(packets[1]![1]).toBeCloseTo(336 * unit, 2);
+
+		// And the cues of BOTH cuts come out, each shifted onto its own cut
+		const cues = await cuesOf(cpl);
+		const first = cues.filter(cue => cue.timestamp < 168 * unit);
+		const second = cues.filter(cue => cue.timestamp >= 168 * unit);
+		expect(first.length).toBeGreaterThan(0);
+		expect(second.length).toBeGreaterThan(0);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+}, 120_000);
+
+test('a repeated cut yields one packet per repeat, each ending at its own end', async () => {
+	// RepeatCount lays the same cut down more than once. A packet bounded by the whole placement
+	// instead of by its own repeat claims every repeat at once, and a consumer sees one subtitle
+	// packet covering twice the span it should.
+	const dir = mkdtempSync(path.join(tmpdir(), 'mediabunny-imf-subs-'));
+	try {
+		const unit = 1001 / 24000;
+		const packets = await subtitlePacketsOf(
+			writeSubtitleResources(dir, [{ entryPoint: 288, sourceDuration: 168, repeatCount: 2 }]),
+		);
+
+		expect(packets).toHaveLength(2);
+		for (const [index, [, end]] of packets.entries()) {
+			// Each repeat ends 168 edit units after the repeat began, not after the placement did
+			expect(end).toBeCloseTo((index + 1) * 168 * unit, 2);
+		}
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+}, 120_000);
+
+test('a clamped packet states where its cut opens in the track file', async () => {
+	// The clamp places a clip-wrapped packet at the cut's start, which is right for ordering and
+	// wrong for anyone parsing the payload: an IMSC document states each cue's time against the FILE,
+	// and once the packet no longer carries the shift, nothing relates the two. `sourceTimestamp` is
+	// that missing half - a consumer adds a payload time to `timestamp - sourceTimestamp`.
+	const dir = mkdtempSync(path.join(tmpdir(), 'mediabunny-imf-subs-'));
+	try {
+		const unit = 1001 / 24000;
+		using input = new Input({
+			source: new FilePathSource(writeSubtitleResources(dir, [
+				{ entryPoint: 288, sourceDuration: 168 },
+				{ entryPoint: 1080, sourceDuration: 72, repeatCount: 2 },
+			])),
+			formats: ALL_FORMATS,
+		});
+		const track = (await input.getTracks())[0]!;
+		assert(track.isSubtitleTrack());
+
+		const seen: { timestamp: number; source: number | undefined }[] = [];
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			seen.push({ timestamp: packet.timestamp, source: packet.sideData.sourceTimestamp });
+		}
+
+		expect(seen).toHaveLength(3);
+		// Each cut opens where its own entry point is, whatever the composition placed it at
+		expect(seen[0]!.source).toBeCloseTo(288 * unit, 4);
+		expect(seen[1]!.source).toBeCloseTo(1080 * unit, 4);
+		// The second repeat opens at the SAME file time as the first: a repeat replays one span
+		expect(seen[2]!.source).toBeCloseTo(1080 * unit, 4);
+
+		// `timestamp - sourceTimestamp` is the shift a payload time needs, and it differs per cut and
+		// per repeat - which is the whole reason a single clamped timestamp cannot stand in for it
+		const shifts = seen.map(({ timestamp, source }) => Number((timestamp - source!).toFixed(4)));
+		expect(shifts).toEqual([
+			Number((0 - 288 * unit).toFixed(4)),
+			Number((168 * unit - 1080 * unit).toFixed(4)),
+			Number((240 * unit - 1080 * unit).toFixed(4)),
+		]);
+
+		// Applied to a real cue: the document's cue at 45.045 s falls in the second cut, and the shift
+		// puts it where the sink independently reports it
+		const cues = await cuesOf(writeSubtitleResources(dir, [
+			{ entryPoint: 288, sourceDuration: 168 },
+			{ entryPoint: 1080, sourceDuration: 72, repeatCount: 2 },
+		]));
+		const viaShift = 45.045 + (seen[1]!.timestamp - seen[1]!.source!);
+		expect(cues.some(cue => Math.abs(cue.timestamp - viaShift) < 0.002)).toBe(true);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+}, 120_000);
+
+test.skipIf(!hasFfmpeg())('a frame-wrapped packet states its own place in the track file', async () => {
+	// For a clip-wrapped payload the packet's timestamp is always the cut's start, so
+	// `sourceTimestamp` and the cut's entry point coincide and a reader cannot tell a correct
+	// implementation from one that just reports the entry point. Frame-wrapped essence separates them:
+	// each packet sits further into the file than the one before it.
+	const dir = mkdtempSync(path.join(tmpdir(), 'mediabunny-imp-src-'));
+	try {
+		execFileSync('ffmpeg', [
+			'-hide_banner', '-loglevel', 'error',
+			'-i', new URL('../public/demo.mp4', import.meta.url).pathname,
+			'-t', '4', '-an', '-c:v', 'libx264', '-g', '12', '-pix_fmt', 'yuv420p',
+			'-y', path.join(dir, 'video.mxf'),
+		], { stdio: 'ignore' });
+
+		// What the track file itself says, which is the ground truth for a source time
+		using whole = new Input({
+			source: new FilePathSource(path.join(dir, 'video.mxf')),
+			formats: ALL_FORMATS,
+		});
+		const fileTimes: number[] = [];
+		for await (const packet of new EncodedPacketSink((await whole.getPrimaryVideoTrack())!).packets()) {
+			fileTimes.push(Number(packet.timestamp.toFixed(6)));
+		}
+		expect(fileTimes.length).toBeGreaterThan(80);
+
+		// A cut starting one second in, so a correct source time is never the cut's own start
+		const cplPath = writeImp(dir, 25, 50, fileTimes.length);
+		using input = new Input({ source: new FilePathSource(cplPath), formats: ALL_FORMATS });
+		const track = (await input.getPrimaryVideoTrack())!;
+
+		const sources: number[] = [];
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			expect(packet.sideData.sourceTimestamp).toBeDefined();
+			sources.push(Number(packet.sideData.sourceTimestamp!.toFixed(6)));
+		}
+
+		expect(sources.length).toBe(50);
+		// Each one is a real packet time from the file, and they are the fifty starting at edit unit 25
+		expect(sources).toEqual(fileTimes.slice(25, 75));
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+}, 300_000);

@@ -137,14 +137,12 @@ const audioCodec = (sampleEntryType: string): EncryptionCodec => {
 	if (sampleEntryType === 'ec-3') {
 		return 'eac3';
 	}
-	// AC-4 is pattern-encrypted and has its own TOC parse, so reaching the fallback would mis-encrypt it
 	if (sampleEntryType === 'ac-4') {
 		return 'ac4';
 	}
 	return 'aac';
 };
 
-// Only H26x needs the record: AV1 and VP9 subsampling reads the frame itself
 const videoStreamInfo = (sampleEntry: MutableBox): EncryptionStreamInfo => {
 	if (sampleEntry.type === 'av01') {
 		return { codec: 'av1', codecConfig: new Uint8Array(0), naluLengthSize: 0 };
@@ -176,7 +174,6 @@ const videoStreamInfo = (sampleEntry: MutableBox): EncryptionStreamInfo => {
 	return { codec: isHevc ? 'hevc' : 'avc', codecConfig, naluLengthSize };
 };
 
-// trex payload: version/flags(4), track_ID(4), sample_description_index(4), default_sample_duration(4).
 const trexSampleDuration = (moov: MutableBox, trackId: number): number => {
 	const mvex = (moov.children ?? []).find(box => box.type === 'mvex');
 	for (const trex of (mvex?.children ?? []).filter(box => box.type === 'trex')) {
@@ -264,9 +261,16 @@ export type EncryptCmafOptions = {
 	/**
 	 * Complete `pssh` boxes to write into the init's `moov`, as built by {@link buildWidevinePssh},
 	 * {@link buildPlayReadyPssh} or {@link buildCommonPssh}. Omitted, no `pssh` is written and the
-	 * output is unchanged — players that read their init data from the manifest need none.
+	 * output is unchanged — players that read their init data from the manifest need none. Set
+	 * {@link EncryptCmafOptions.inBandPssh} to put them in every `moof` as well.
 	 */
 	pssh?: Uint8Array[];
+	/**
+	 * Also write {@link EncryptCmafOptions.pssh} into every `moof`, not just the init's `moov`. A player
+	 * that joins mid-stream never sees the init, so DASH-IF IOP v5 Part 6 asks for the header in band on
+	 * every segment. Defaults to `false`, which writes the boxes in the `moov` alone.
+	 */
+	inBandPssh?: boolean;
 	/** CENC scheme. Defaults to `cbcs` (single copy for Widevine + PlayReady + FairPlay). */
 	scheme?: ProtectionScheme;
 	/** cbcs/cens pattern: encrypted 16-byte blocks per pattern cycle (video). Defaults to 1. */
@@ -424,21 +428,16 @@ const keyMaterial = (tracks: TrackInfo[], options: EncryptCmafOptions): Map<numb
 const usesPerSampleIv = (scheme: ProtectionScheme): boolean =>
 	scheme === 'cenc' || scheme === 'cens' || scheme === 'cbc1';
 
-// Pattern schemes (cbcs/cens) pattern only video and AC-4; everything else encrypts whole blocks.
-// Mirrors shaka's `EncryptionHandler::SetupProtectionPattern`.
 const usesPatternEncryption = (track: TrackInfo, scheme: ProtectionScheme): boolean =>
 	(scheme === 'cbcs' || scheme === 'cens') && (track.kind === 'video' || track.streamInfo.codec === 'ac4');
 
 const patternFor = (track: TrackInfo, scheme: ProtectionScheme, cryptByteBlock: number, skipByteBlock: number) =>
 	usesPatternEncryption(track, scheme) ? { cryptByteBlock, skipByteBlock } : { cryptByteBlock: 0, skipByteBlock: 0 };
 
-// Rewrite each init sample entry to encv/enca + sinf/tenc, in place.
 const transformInit = (
 	tracks: TrackInfo[], scheme: ProtectionScheme, options: EncryptCmafOptions,
 	material: Map<number, TrackKeyMaterial>,
 ): void => {
-	// A second pass would leave the entry carrying two sinf boxes, declaring two schemes over samples
-	// encrypted twice — a file that looks encrypted and plays back as neither.
 	if (tracks.some(track => findBox([track.sampleEntry], 'sinf') !== null)) {
 		throw new InvalidUsageError(
 			'The sample entries already declare protection; encrypt the cleartext input instead.',
@@ -480,8 +479,6 @@ const makeEncryptors = (
 /** Everything a rotating track needs at fragment time: its periods and their `seig` entries. */
 type TrackRotation = { periods: CmafKeyPeriod[]; entries: Uint8Array[] };
 
-// A `seig` entry states the same protection as `tenc` does, so it is built the same way and differs
-// only in the KID. Mirrors `buildProtectionSinf`'s choice between a constant and a per-sample IV.
 const rotationOf = (
 	track: TrackInfo, scheme: ProtectionScheme, options: EncryptCmafOptions, material: TrackKeyMaterial,
 ): TrackRotation | null => {
@@ -552,6 +549,8 @@ const encryptFragments = (
 	offsetsBefore: number[], applyCipher = true,
 ): void => {
 	const clear = options.clear === true;
+	// Same on the whole-file and split paths, so they still produce identical bytes
+	const inBandPssh = options.inBandPssh === true ? options.pssh ?? [] : [];
 	const perSampleIvSize = usesPerSampleIv(scheme) ? options.iv.length : 0;
 	const rotations = new Map<number, TrackRotation>();
 	for (const track of tracks) {
@@ -560,10 +559,8 @@ const encryptFragments = (
 			rotations.set(track.trackId, rotation);
 		}
 	}
-	// Every encryptor starts on its track's first period, which is what `tenc` states.
 	const currentPeriod = new Map(tracks.map(track => [track.trackId, 0]));
 
-	// A `sidx` indexes what follows it, so it may sit at the front or be chained per fragment.
 	const indexes: number[] = [];
 	let encryptedFragments = 0;
 	for (let i = 0; i < boxes.length; i++) {
@@ -573,7 +570,7 @@ const encryptFragments = (
 		if (boxes[i]!.type === 'moof' && boxes[i + 1]?.type === 'mdat') {
 			encryptFragmentInPlace(
 				boxes[i]!, boxes[i + 1]!, tracks, encryptors, perSampleIvSize, offsetsBefore[i]!,
-				rotations, currentPeriod, applyCipher && !clear, clear,
+				rotations, currentPeriod, applyCipher && !clear, clear, inBandPssh,
 			);
 			encryptedFragments++;
 		}
@@ -651,7 +648,6 @@ const restateTfraOffsets = (tfra: MutableBox, movedMoofs: Map<number, number>): 
 		const stated = version === 1 ? Number(view.getBigUint64(at)) : view.getUint32(at);
 		const moved = movedMoofs.get(stated);
 		if (moved === undefined) {
-			// An entry naming something other than a fragment we re-wrote is not ours to restate.
 			continue;
 		}
 
@@ -733,8 +729,6 @@ const restateSidx = (
 	let cursor = endBefore
 		+ (version === 0 ? view.getUint32(firstOffsetPos) : Number(view.getBigUint64(firstOffsetPos)));
 	if (cursor > endOfInput) {
-		// The sidx indexes material this call did not receive — a segment indexing the one after it —
-		// so nothing it states was invalidated here.
 		return;
 	}
 
@@ -754,7 +748,6 @@ const restateSidx = (
 		// The top bit is reference_type, which the restated size has to keep.
 		const next = cursor + (raw & 0x7fffffff);
 		if (next > endOfInput) {
-			// Left as they arrived: the sizes depend on segments this call was not given, so they are stale
 			Logging._warn(
 				`This sidx states ${referenceCount} references but only ${i} of them index material in this`
 				+ ' call; the rest keep their original sizes and are now wrong. Restate them with'
@@ -792,7 +785,6 @@ const addPsshBoxes = (parent: MutableBox, boxes: Uint8Array[] | undefined): void
 			);
 		}
 
-		// Tracks rotating together name the same header, and one copy per box is what a CDM reads
 		if (written.some(seen => sameBytes(seen, bytes))) {
 			continue;
 		}
@@ -843,7 +835,6 @@ export const encryptCmaf = (bytes: Uint8Array, options: EncryptCmafOptions): Uin
 	const tracks = requireTracks(moov);
 	const material = keyMaterial(tracks, options);
 	transformInit(tracks, scheme, options, material);
-	// Must precede the encryptors: they correct stco/tfra against the moov's final size.
 	addPsshBoxes(moov, options.pssh);
 	const encryptors = makeEncryptors(tracks, scheme, options, material, (_, iv) => iv);
 	if (boxes.some((box, i) => box.type === 'moof' && boxes[i + 1]?.type === 'mdat')) {
@@ -1006,6 +997,8 @@ const encryptFragmentInPlace = (
 	// formula that could drift
 	applyCipher = true,
 	clear = false,
+	// Seeds every moof's pssh set; rotation adds each period's own on top and addPsshBoxes dedupes
+	inBandPssh: Uint8Array[] = [],
 ): void => {
 	const moofSizeBefore = measureBox(moof);
 	const mdatDataStart = moofOffset + moofSizeBefore + 8;
@@ -1014,7 +1007,7 @@ const encryptFragmentInPlace = (
 			.map(({ trackId, base }) => [trackId, base]),
 	);
 	const auxTrafs: MutableBox[] = [];
-	const fragmentPssh: Uint8Array[] = [];
+	const fragmentPssh: Uint8Array[] = [...inBandPssh];
 
 	for (const track of tracks) {
 		const traf = findTrafByTrackId(moof, track.trackId);
@@ -1031,7 +1024,6 @@ const encryptFragmentInPlace = (
 		const defaultSampleSize = defaultSampleSizeOf(tfhd);
 
 		const encryptor = encryptors.get(track.trackId)!;
-		// A clear fragment encrypts nothing, so it draws on no key period
 		const rotation = clear ? undefined : rotations.get(track.trackId);
 		let clearSamples = 0;
 		const subsamplesPerSample: SubsampleEntry[][] = [];
@@ -1086,8 +1078,6 @@ const encryptFragmentInPlace = (
 		}
 
 		if (clear) {
-			// No senc, saiz or saio: the group is the whole statement, and anything else here would be
-			// aux data for samples that have none
 			if (clearSamples > 0) {
 				traf.children = [
 					...(traf.children ?? []),
@@ -1356,7 +1346,6 @@ const encryptSampleTables = (
 		);
 	}
 
-	// The moov grew by every sinf/senc/saiz/saio just added, so the media moved with it.
 	const offsetsAfter = boxOffsets(boxes);
 	const shifts = new Map<MutableBox, number>();
 	for (let i = 0; i < boxes.length; i++) {

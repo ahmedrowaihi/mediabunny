@@ -269,8 +269,6 @@ export type VideoSampleInit = {
 	_doNotCopy?: boolean;
 };
 
-// A transformer is free to carry over part of the source's color (FFmpeg's filter graph keeps transfer and matrix
-// but loses primaries), so state nothing rather than a half-stale claim about re-rendered pixels.
 const dropColorSpace = (sample: VideoSample) => {
 	(sample as { colorSpace: VideoSampleColorSpace }).colorSpace = new VideoSampleColorSpace();
 	return sample;
@@ -1767,14 +1765,10 @@ export class VideoSample implements Disposable {
 			if (isThenable(result)) result = await result;
 
 			if (result !== null) {
-				// A transformer builds its own sample, so the invariant holds here rather than in each of them
 				result.setClosedCaptions(this.closedCaptions);
 				result.setDolbyVisionRpu(this.dolbyVisionRpu);
 				result.setHdr10Plus(this.hdr10Plus);
 
-				// Same rule as the canvas path below: landing in RGB means the colour was flattened to
-				// whatever the rasteriser chose, so it describes that conversion and not the content.
-				// A transformer that stays in YUV filtered the frame and its colour still holds.
 				return isRgbFormat(result.format) ? dropColorSpace(result) : result;
 			}
 		}
@@ -1799,7 +1793,6 @@ export class VideoSample implements Disposable {
 			rotation: 0,
 			flip: false,
 			encodeOptions: this.encodeOptions,
-			// A geometric transform does not change what is in the picture
 			closedCaptions: this.closedCaptions,
 			dolbyVisionRpu: this.dolbyVisionRpu,
 			hdr10Plus: this.hdr10Plus,

@@ -151,6 +151,13 @@ export type VideoInfo = {
 	colorPrimaries?: number;
 	/** ISO/IEC 23001-8 matrix coefficients. */
 	matrixCoefficients?: number;
+	/**
+	 * `@scanType`: `'interlaced'` for a field-coded stream, `'progressive'` otherwise. Read from the
+	 * bitstream rather than from what the encoder was asked for, so the manifest describes the stream
+	 * that exists. Only stated in the manifest when it is `'interlaced'`, since progressive is the
+	 * default a reader assumes.
+	 */
+	scanType?: 'progressive' | 'interlaced' | 'unknown';
 	/** Supplemental codec for Dolby Vision dual-track signaling. */
 	supplementalCodec?: string;
 	/** Compatible-brand FourCC (uint32) for Dolby Vision dual-track signaling. */

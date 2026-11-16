@@ -9,6 +9,7 @@
 import { MalformedInputError } from '../errors';
 import { DASH_MIME_TYPE } from './dash-misc';
 import { declaredVideoCodec, type ParameterSetPlacement } from '../isobmff/isobmff-boxes';
+import { firstSpsFromAvcRecord, parseAvcSps } from '../codec-data';
 import type { ManifestEmitter, MediaPipelineHost } from '../manifest-emitter';
 import type { Playlist } from '../segment-pipeline-muxer';
 import {
@@ -17,6 +18,7 @@ import {
 	joinPaths,
 	MATRIX_COEFFICIENTS_MAP,
 	textEncoder,
+	toUint8Array,
 	TRANSFER_CHARACTERISTICS_MAP,
 } from '../misc';
 import type { OutputAudioTrack, OutputTrack, OutputVideoTrack } from '../output';
@@ -31,7 +33,6 @@ import { createDefaultMpdOptions } from './dash-types';
 
 const DEFAULT_VIDEO_TIMESCALE = 90_000;
 
-// DASH-IF IOP names in-band CEA-608 captions with this Accessibility scheme, whose value lists the channels.
 const CEA_608_SCHEME_ID_URI = 'urn:scte:dash:cc:cea-608:2015';
 
 type RegisteredRepresentation = {
@@ -113,8 +114,6 @@ export class DashManifestEmitter implements ManifestEmitter {
 			this.options.mpdParams?.timeShiftBufferDepth === undefined
 			&& Number.isFinite(this.host.maxLiveSegmentCount)
 		) {
-			// Summed from what the playlists still hold: a nominal count times a nominal duration overstates a
-			// ragged window, and a player believing it seeks to a deleted segment
 			let longest = 0;
 			for (const playlist of this.host.playlists) {
 				longest = Math.max(longest, playlist.windowDuration);
@@ -130,7 +129,6 @@ export class DashManifestEmitter implements ManifestEmitter {
 		}
 		this.refreshLiveWindow();
 
-		// `writtenSegments` is a sliding window under `live`.
 		const totalAppended = playlist.mediaSequence + playlist.writtenSegments.length;
 
 		while (reg.emittedSegments < totalAppended) {
@@ -147,7 +145,6 @@ export class DashManifestEmitter implements ManifestEmitter {
 
 			if (segment.parts !== null && this.mpdOptions.mpdParams.lowLatencyDashMode) {
 				const longestPart = Math.max(...segment.parts.map(part => part.duration));
-				// DASH-IF IOP low-latency: a segment is announced as available once its longest chunk could be complete
 				if (longestPart > reg.largestPartDuration) {
 					reg.largestPartDuration = longestPart;
 					reg.representation.setAvailabilityTimeOffset(longestPart);
@@ -189,8 +186,6 @@ export class DashManifestEmitter implements ManifestEmitter {
 
 	async onFinalize(): Promise<void> {
 		assert(this.mpd);
-		// A top-level `sidx` describes every subsegment on its own, so the MPD can point at that one
-		// range instead of listing them.
 		if (
 			this.options.mpdParams?.useSegmentList === undefined
 			&& this.host.playlists.every(p => p.indexRange !== null)
@@ -199,8 +194,6 @@ export class DashManifestEmitter implements ManifestEmitter {
 		}
 		const mpdText = this.mpd.toString();
 		if (mpdText === null) {
-			// Writing nothing and reporting success would leave the caller with segments no manifest
-			// describes, which looks like a successful output until a player asks for the MPD.
 			throw new MalformedInputError(
 				'The MPD could not be built: a representation is missing information the manifest requires,'
 				+ ' such as a video track whose width or height is unknown.',
@@ -245,7 +238,6 @@ export class DashManifestEmitter implements ManifestEmitter {
 			assert(track.isSubtitleTrack());
 
 			if (track.source._codec === 'ttml') {
-				// TTML rides in the same fragmented MP4 as the media, so it is described like the media is.
 				const base = this.isSingleFile
 					? buildSingleFileBase(playlist, playlistDir)
 					: buildSegmentTemplateBase(
@@ -269,7 +261,6 @@ export class DashManifestEmitter implements ManifestEmitter {
 			? buildSingleFileBase(playlist, playlistDir)
 			: buildSegmentTemplateBase(playlist, playlistDir, this.options.initSegmentName, segmentTemplate);
 
-		// One file may carry both media types; see `isMultiplexed` for the deviation.
 		let videoInfo: VideoInfo | undefined;
 		let audioInfo: AudioInfo | undefined;
 		let dashAccessibilities: string[] | undefined;
@@ -295,7 +286,6 @@ export class DashManifestEmitter implements ManifestEmitter {
 			}
 		}
 
-		// Timing is stated in one timescale, and video's wins when the file carries both.
 		let referenceTimeScale: number;
 		if (videoInfo) {
 			referenceTimeScale = videoInfo.timeScale ?? DEFAULT_VIDEO_TIMESCALE;
@@ -414,6 +404,17 @@ const videoInfoFromDecoderConfig = (
 	}
 	if (frameRate !== undefined && frameRate > 0) {
 		videoInfo.frameDuration = Math.round(DEFAULT_VIDEO_TIMESCALE / frameRate);
+	}
+
+	// Read from the SPS, not from the encoder control that asked for it: a manifest describes the
+	// stream it points at. `frame_mbs_only_flag` 0 is what an interlaced AVC stream states, and it is
+	// also the only scan type this library can produce - HEVC interlaced encoding is refused.
+	if (track.source._codec === 'avc' && config.description) {
+		const sps = firstSpsFromAvcRecord(toUint8Array(config.description));
+		const info = sps === null ? null : parseAvcSps(sps);
+		if (info !== null && info.frameMbsOnlyFlag === 0) {
+			videoInfo.scanType = 'interlaced';
+		}
 	}
 
 	const colorSpace = config.colorSpace;

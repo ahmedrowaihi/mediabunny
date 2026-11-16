@@ -234,8 +234,6 @@ export class XmlNode {
 		for (const attrName of this.attributes.keys()) {
 			collectNamespaceFromName(attrName, namespaces);
 		}
-		// Raw children are emitted verbatim, so their prefixes still need declaring on the root;
-		// without this a kept <scte35:Signal> rides out under no xmlns:scte35 and the XML is invalid.
 		for (const raw of this.rawChildren) {
 			for (const [, prefix] of raw.matchAll(/<\s*([A-Za-z_][\w.-]*):/g)) {
 				namespaces.add(prefix!);
@@ -291,7 +289,6 @@ export class XmlNode {
 			return;
 		}
 
-		// Content-only element renders inline on a single line.
 		lines.push(`${indent}<${open}>${escapeXmlText(this.content)}</${this.nodeName}>`);
 	}
 

@@ -22,7 +22,6 @@ export const WEBVTT_FILE_EXTENSION = '.vtt';
 
 const DEFAULT_PREAMBLE = 'WEBVTT';
 
-// Cue timestamps stay on the media timeline; X-TIMESTAMP-MAP is what anchors it for the player.
 /** @internal */
 export const buildWebvttSegment = (options: {
 	preamble: string | null;
@@ -34,8 +33,6 @@ export const buildWebvttSegment = (options: {
 	const firstLine = newlineIndex === -1 ? preamble : preamble.slice(0, newlineIndex);
 	const restOfPreamble = newlineIndex === -1 ? '' : preamble.slice(newlineIndex);
 
-	// X-TIMESTAMP-MAP must live in the header block, i.e. before the first blank line, so it is
-	// spliced in right after the WEBVTT line rather than appended to the preamble.
 	const timestampMap = `X-TIMESTAMP-MAP=LOCAL:${formatSubtitleTimestamp(options.startTimestamp)}`
 		+ `,MPEGTS:${Math.round(options.startTimestamp * MPEG_TS_TIMESCALE)}`;
 
@@ -99,8 +96,6 @@ export class WebvttMuxer extends Muxer {
 		}
 	}
 
-	// A .vtt segment has no container framing, so the whole document is written in one go here,
-	// once every cue of the segment is in.
 	async finalize() {
 		const release = await this.mutex.acquire();
 

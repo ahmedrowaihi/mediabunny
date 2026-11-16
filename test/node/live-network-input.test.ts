@@ -1,7 +1,7 @@
-import { ALL_FORMATS } from '../../src/input-format.js';
+import { ALL_FORMATS, MXF } from '../../src/input-format.js';
 import { AudioSampleSink, EncodedPacketSink, VideoSampleSink } from '../../src/media-sink.js';
 import { describe, expect, test } from 'vitest';
-import { Input } from '../../src/input.js';
+import { Input, UnsupportedInputFormatError } from '../../src/input.js';
 import { Conversion } from '../../src/conversion.js';
 import { Output } from '../../src/output.js';
 import { BufferTarget, PathedTarget } from '../../src/target.js';
@@ -652,3 +652,32 @@ test.skipIf(!hasFfmpeg)('an rtp:// source reads MPEG-TS over RTP as a transport 
 		sender.kill('SIGKILL');
 	}
 }, 120_000);
+
+// Format detection reads before it knows what the file is, and every format's probe runs on every
+// input. On a source whose size is unknown - an open stream - a probe that asks for more than has
+// arrived waits for bytes that may not come for minutes, and a live source may never close. So a
+// probe must ask for what it needs to recognise its own magic and no more. The MXF probe briefly
+// asked for 64 KB, to search the run-in allowance SMPTE 377-1 grants, which hung on any open stream.
+//
+// Asked of the MXF probe directly rather than through `getFormat`: the probes run in order, and
+// several of the others do wait for more than an open stream has given them, which is a separate
+// and older question than this one.
+test('the MXF probe does not wait on a source whose size is unknown', async () => {
+	const head = new Uint8Array(readFileSync(FIXTURE)).subarray(0, 2048);
+
+	// An open stream that delivers 2 KB and then nothing, ever
+	const stalling = new ReadableStream<Uint8Array>({
+		start(controller) {
+			controller.enqueue(head);
+		},
+	});
+
+	using input = new Input({
+		source: new ReadableStreamSource(stalling, { liveRefreshInterval: 0 }),
+		formats: [MXF],
+	});
+
+	// MPEG-TS bytes are not MXF, and saying so must not require 64 KB of them. The assertion is that
+	// this answers at all: before, it waited on the stream and the test timed out.
+	await expect(input.getFormat()).rejects.toThrow(UnsupportedInputFormatError);
+}, 10_000);

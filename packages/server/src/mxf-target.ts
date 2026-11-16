@@ -10,6 +10,7 @@ import { AppendOnlyStreamTarget } from 'mediabunny';
 import { Demuxer, Muxer } from 'node-av/api';
 import {
 	AVMEDIA_TYPE_AUDIO,
+	AV_CODEC_ID_MPEG2VIDEO,
 	AVMEDIA_TYPE_VIDEO,
 	AV_CODEC_ID_PCM_ALAW,
 	AV_CODEC_ID_PCM_F32BE,
@@ -37,6 +38,25 @@ import { Readable } from 'node:stream';
  */
 export type MxfTargetOptions = {
 	/**
+	 * Which MXF mapping to write; defaults to `'op1a'`.
+	 *
+	 * - `'op1a'`: the general operational pattern broadcast delivery specifications are written
+	 *   against — AS-11 (UK DPP) and RDD 9 (XDCAM HD422) both.
+	 * - `'d10'`: the D-10 mapping of SMPTE 356M, which is what an IMX deliverable is. MPEG-2 4:2:2 at
+	 *   30, 40 or 50 Mbit/s with every frame exactly `rate / fps / 8` octets, and **one** audio track
+	 *   of 16- or 24-bit PCM. Encode with `encoderControls.d10` to meet the frame-size rule; the
+	 *   container indexes the essence by that fixed unit and refuses anything else.
+	 */
+	mapping?: 'op1a' | 'd10';
+	/**
+	 * How many audio channels the D-10 AES3 element states, 4 or 8. Ignored for `'op1a'`.
+	 *
+	 * SMPTE 356M allows only those two, and a file with any other count is accepted by the muxer with a
+	 * warning while not complying — so this pads the element out to the stated count. Defaults to the
+	 * track's own channel count where that is 4 or 8, and to 4 otherwise.
+	 */
+	d10ChannelCount?: 4 | 8;
+	/**
 	 * Start timecode as `hh:mm:ss:ff`, or `hh:mm:ss;ff` for drop frame, written as the file's timecode
 	 * track. Broadcast delivery specifications generally require one; AS-11 does.
 	 */
@@ -49,17 +69,31 @@ export type MxfTargetOptions = {
 	/** Whether to keep the muxer's user-comment metadata. Defaults to true, as FFmpeg's does. */
 	storeUserComments?: boolean;
 	/**
-	 * Writes the same bytes on every run, by setting FFmpeg's `bitexact` flag.
+	 * Writes the same **container** bytes on every run, by setting FFmpeg's format-level `bitexact`
+	 * flag.
 	 *
-	 * MXF is the one container here where identical input does not give an identical file: `mxfenc` draws
-	 * the UMIDs at random, so two runs differ in those bytes while the essence repeats exactly. The flag
-	 * also drops the encoder and library version strings, which is what makes the file comparable.
+	 * MXF is the one container here where identical input does not give an identical file: `mxfenc`
+	 * draws the UMIDs at random, so two runs differ in those bytes. The flag fixes those and drops the
+	 * muxer's version strings.
+	 *
+	 * **It does not reach the essence, and nothing here can.** Measured on a 1-video-plus-4-mono-PCM
+	 * job written twice in one process with this set: the files differed by a single octet, inside a
+	 * `user_data_unregistered` SEI in the first picture element. The cause is the **encoder**, not the
+	 * muxer - `h264_videotoolbox`, which this machine picks for AVC by default, writes an SEI whose
+	 * contents vary between runs. FFmpeg's codec-level `bitexact` flag does not change that: set on
+	 * the codec context before it opens, the SEI is still there and the octet still varies, because a
+	 * hardware encoder's bitstream is not FFmpeg's to normalise.
+	 *
+	 * What does make the whole file repeat is a **deterministic encoder**. The same job through
+	 * `libx264` (`hardwareAcceleration: 'prefer-software'`) is byte-identical across runs, with or
+	 * without any bitexact flag on the codec. So reproducible output is this flag plus a software
+	 * encoder, and the test beside this pins both halves.
 	 */
 	bitexact?: boolean;
 	/**
 	 * The date written into the file's Preface and Identification sets. Defaults to the epoch, so two
-	 * runs of the same job produce the same bytes; `bitexact` alone does not, because it does not reach
-	 * these. Pass a `Date` for a real delivery date, or `null` for the wall clock.
+	 * runs of the same job produce the same container bytes; `bitexact` alone does not, because it does
+	 * not reach these. Pass a `Date` for a real delivery date, or `null` for the wall clock.
 	 */
 	creationTime?: Date | null;
 	/**
@@ -154,6 +188,65 @@ class MxfSink {
 		}
 	}
 
+	/**
+	 * Refuses the streams D-10 does not allow, before the muxer does.
+	 *
+	 * libavformat checks these itself and fails with bare messages — `error MXF D-10 only support
+	 * MPEG-2 Video`, `only support 30/40/50 mbit/s`, `only support one audio track` — through a stack
+	 * that gives the caller no idea which track or what to change. The limits are read straight out of
+	 * `mxfenc.c` rather than from the standard, so they are the ones that will actually be enforced.
+	 */
+	private checkD10Streams(streams: Demuxer['streams']) {
+		const video = streams.filter(x => x.codecpar.codecType === AVMEDIA_TYPE_VIDEO);
+		const audio = streams.filter(x => x.codecpar.codecType === AVMEDIA_TYPE_AUDIO);
+
+		for (const stream of video) {
+			if ((stream.codecpar.codecId as number) !== AV_CODEC_ID_MPEG2VIDEO) {
+				throw new Error(
+					'MxfTarget: the D-10 mapping carries MPEG-2 video and nothing else, and this output\'s'
+					+ ` video track is codec id ${String(stream.codecpar.codecId)}. Encode with`
+					+ ' `video: { codec: \'mpeg2\', encoderControls: { d10: 50 } }`.',
+				);
+			}
+
+			const megabits = Number(stream.codecpar.bitRate) / 1_000_000;
+			if (![30, 40, 50].includes(Math.round(megabits))) {
+				throw new Error(
+					`MxfTarget: the D-10 mapping allows 30, 40 or 50 Mbit/s, and this video track states`
+					+ ` ${megabits.toFixed(3)}. Encode with encoderControls.d10, which sets the rate and`
+					+ ' the frame size together — the container indexes the essence by that fixed size.',
+				);
+			}
+		}
+
+		if (audio.length > 1) {
+			throw new Error(
+				`MxfTarget: the D-10 mapping carries one audio track holding every channel, and this`
+				+ ` output has ${audio.length}. Add a single multi-channel PCM track instead of one per`
+				+ ' channel, which is what the OP1a mapping wants.',
+			);
+		}
+
+		for (const stream of audio) {
+			const codecId = stream.codecpar.codecId as number;
+			if (codecId !== AV_CODEC_ID_PCM_S16LE && codecId !== AV_CODEC_ID_PCM_S24LE) {
+				throw new Error(
+					'MxfTarget: the D-10 mapping carries 16- or 24-bit little-endian PCM, and this'
+					+ ` output's audio track is codec id ${String(codecId)}. Use`
+					+ ' `audio: { codec: \'pcm-s16\' }`.',
+				);
+			}
+
+			const channels = stream.codecpar.channelLayout?.nbChannels ?? 0;
+			if (channels > 8) {
+				throw new Error(
+					`MxfTarget: the D-10 mapping carries at most 8 audio channels, and this track has`
+					+ ` ${channels}.`,
+				);
+			}
+		}
+	}
+
 	private async run() {
 		const demuxer = await Demuxer.open(this.source, { format: 'mp4' });
 
@@ -165,14 +258,10 @@ class MxfSink {
 			muxerOptions['store_user_comments'] = this.options.storeUserComments ? '1' : '0';
 		}
 		if (this.options.bitexact) {
-			// The format flag, not a codec one: it is the muxer's random UMIDs that make two runs differ
 			muxerOptions['fflags'] = '+bitexact';
 		}
 
 		const startTimecode = this.options.startTimecode;
-		// `bitexact` fixes the UMIDs but not these: mxfenc stamps the Preface's LastModifiedDate and every
-		// Identification set's ModificationDate from the wall clock unless `creation_time` states one, so
-		// two runs either side of a second differ. Measured, and the default is the epoch for that reason.
 		const creationTime = this.options.creationTime === undefined ? new Date(0) : this.options.creationTime;
 		const metadata: Record<string, string> = {};
 		if (creationTime !== null) {
@@ -182,12 +271,22 @@ class MxfSink {
 			metadata['timecode'] = startTimecode;
 		}
 
+		const isD10 = this.options.mapping === 'd10';
+		if (isD10) {
+			this.checkD10Streams(demuxer.streams);
+
+			const channelCount = this.options.d10ChannelCount
+				?? (() => {
+					const audio = demuxer.streams.find(x => x.codecpar.codecType === AVMEDIA_TYPE_AUDIO);
+					const channels = audio?.codecpar.channelLayout?.nbChannels;
+					return channels === 8 ? 8 : 4;
+				})();
+			muxerOptions['d10_channelcount'] = String(channelCount);
+		}
+
 		const muxer = await Muxer.open(this.path, {
-			format: 'mxf',
+			format: isD10 ? 'mxf_d10' : 'mxf',
 			options: muxerOptions,
-			// The muxer's own `mxf` AVOptions carry neither of these; FFmpeg's CLI writes them as format
-			// metadata, which is what becomes the timecode track and the file's dates. `configure` is the
-			// one hook that runs after the streams exist and before the header is written.
 			configure: (context) => {
 				context.metadata = Dictionary.fromObject(metadata);
 			},
@@ -195,7 +294,8 @@ class MxfSink {
 
 		for (const stream of demuxer.streams) {
 			if (
-				stream.codecpar.codecType === AVMEDIA_TYPE_AUDIO
+				!isD10
+				&& stream.codecpar.codecType === AVMEDIA_TYPE_AUDIO
 				&& !MXF_AUDIO_CODEC_IDS.has(stream.codecpar.codecId as number)
 			) {
 				throw new Error(
@@ -210,10 +310,6 @@ class MxfSink {
 		for (const stream of demuxer.streams) {
 			const index = muxer.addStream(stream);
 
-			// MXF reads its edit rate off the video stream, and `addStream` copies the input's *average*
-			// rate. Over a short or trimmed fragmented MP4 that average is a ratio like 300/13, which the
-			// muxer refuses outright: `Unsupported frame rate 300/13`. ffmpeg's own CLI fails the same way
-			// on the same file, so taking the base rate is the truth rather than a workaround.
 			if (stream.codecpar.codecType === AVMEDIA_TYPE_VIDEO) {
 				const output = muxer.getStream(index);
 				if (output && stream.rFrameRate.num > 0) {
@@ -221,8 +317,6 @@ class MxfSink {
 					output.rFrameRate = stream.rFrameRate;
 				}
 
-				// The muxer takes the descriptor's BitRate off the output stream, so this has to be the
-				// output's rather than the input's
 				if (output && this.options.videoBitRate !== undefined) {
 					output.codecpar.bitRate = BigInt(Math.round(this.options.videoBitRate));
 				}
@@ -311,6 +405,14 @@ export class MxfTarget extends AppendOnlyStreamTarget {
 		) {
 			throw new TypeError(
 				'options.startTimecode, when provided, must be \'hh:mm:ss:ff\', or \'hh:mm:ss;ff\' for drop frame.',
+			);
+		}
+		if (options.mapping !== undefined && !['op1a', 'd10'].includes(options.mapping)) {
+			throw new TypeError('options.mapping, when provided, must be \'op1a\' or \'d10\'.');
+		}
+		if (options.d10ChannelCount !== undefined && ![4, 8].includes(options.d10ChannelCount)) {
+			throw new TypeError(
+				'options.d10ChannelCount, when provided, must be 4 or 8; SMPTE 356M allows no other count.',
 			);
 		}
 		if (options.storeUserComments !== undefined && typeof options.storeUserComments !== 'boolean') {

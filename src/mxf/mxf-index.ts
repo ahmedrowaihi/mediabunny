@@ -105,6 +105,13 @@ export const readIndexTableSegment = (set: LocalSet): MxfIndexSegment => {
 	const data = new DataView(array.buffer, array.byteOffset, array.byteLength);
 	const count = data.getUint32(0);
 	const entrySize = data.getUint32(4);
+	if (count === 0) {
+		// An array of no entries states no entry size either, and Avid writes exactly that. FFmpeg
+		// checks the size only when there are entries to apply it to (`mxf_read_index_entry_array`),
+		// and refusing it here refused every file Avid Media Composer writes.
+		return segment;
+	}
+
 	// 11 fixed bytes, then one 32-bit offset per slice and one 8-byte rational per pos table entry
 	const minimum = 11 + 4 * sliceCount + 8 * posTableCount;
 	if (entrySize < minimum) {
@@ -193,7 +200,6 @@ export const locateEditUnit = (
 			streamOffset: entry.streamOffset,
 			isKeyFrame: entry.isKeyFrame,
 			temporalOffset: entry.temporalOffset,
-			// The last entry of a segment states no end, so its size is only known from the essence
 			size: next ? next.streamOffset - entry.streamOffset : null,
 		};
 	}
@@ -211,7 +217,6 @@ export const keyEditUnitBefore = (segments: MxfIndexSegment[], position: number)
 
 	for (const segment of segments) {
 		if (segment.editUnitByteCount > 0) {
-			// Every unit is a key frame, so the answer is the position itself where the segment holds it
 			const offset = position - segment.startPosition;
 			const bounded = segment.duration !== null && segment.duration > 0;
 			if (offset >= 0 && (!bounded || offset < segment.duration!)) {

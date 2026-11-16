@@ -508,6 +508,25 @@ const avcProfileHasExtendedConfigurationData = (profileIdc: number) => {
 	return profileIdc !== 66 && profileIdc !== 77 && profileIdc !== 88;
 };
 
+/**
+ * The VUI's `hrd_parameters`, as E.1.2 states them.
+ *
+ * @public
+ * @group Miscellaneous
+ */
+export type AvcHrdParameters = {
+	cpbRemovalDelayLength: number;
+	dpbOutputDelayLength: number;
+	timeOffsetLength: number;
+	initialCpbRemovalDelayLength: number;
+	/** `BitRate[0]` in bits per second, or null for a schedule-less HRD. */
+	bitRate: number | null;
+	/** `CpbSize[0]` in bits. */
+	cpbSize: number | null;
+	/** `cbr_flag[0]`. */
+	constantBitRate: boolean;
+};
+
 export type AvcSpsInfo = {
 	emulationUnpreventedBytes: Uint8Array;
 	profileIdc: number;
@@ -531,8 +550,14 @@ export type AvcSpsInfo = {
 	vuiParametersFlagBitOffset: number;
 	/** VUI `pic_struct_present_flag`: without it a `pic_timing` SEI carries no clock timestamp. */
 	picStructPresentFlag: boolean;
-	/** The `pic_timing` field widths the HRD parameters state, or null when the VUI declares no HRD. */
-	hrd: { cpbRemovalDelayLength: number; dpbOutputDelayLength: number; timeOffsetLength: number } | null;
+	/**
+	 * What the VUI's HRD parameters state, or null when it declares none.
+	 *
+	 * The three field widths are what make a `pic_timing` SEI parsable at all - 7.3.2.1.1 states them
+	 * here and nowhere else. The rate and buffer size are the buffer model a broadcast receiver checks
+	 * the stream against.
+	 */
+	hrd: AvcHrdParameters | null;
 	bitstreamRestrictionFlagBitOffset: number | null;
 	bitstreamRestrictionFlag: number | null;
 };
@@ -706,8 +731,7 @@ export const parseAvcSps = (sps: Uint8Array): AvcSpsInfo | null => {
 		let bitstreamRestrictionFlagBitOffset: number | null = null;
 		let bitstreamRestrictionFlag: number | null = null;
 		let picStructPresentFlag = false;
-		let hrd: { cpbRemovalDelayLength: number; dpbOutputDelayLength: number; timeOffsetLength: number } | null
-			= null;
+		let hrd: AvcHrdParameters | null = null;
 
 		const vuiParametersFlagBitOffset = bitstream.pos;
 		const vuiParametersPresentFlag = bitstream.readBits(1);
@@ -766,7 +790,10 @@ export const parseAvcSps = (sps: Uint8Array): AvcSpsInfo | null => {
 
 			const vclHrdParametersPresentFlag = bitstream.readBits(1);
 			if (vclHrdParametersPresentFlag) {
-				hrd = readAvcHrdParameters(bitstream);
+				const vclHrd = readAvcHrdParameters(bitstream);
+				// The NAL parameters win where both are stated: that is the order E.2.2 derives the
+				// `pic_timing` field widths in, so a decoder reading the two apart would use these
+				hrd ??= vclHrd;
 			}
 
 			if (nalHrdParametersPresentFlag || vclHrdParametersPresentFlag) {
@@ -871,21 +898,41 @@ export const parseAvcSps = (sps: Uint8Array): AvcSpsInfo | null => {
  */
 const readAvcHrdParameters = (bitstream: Bitstream) => {
 	const cpb_cnt_minus1 = readExpGolomb(bitstream);
-	bitstream.skipBits(4); // bit_rate_scale
-	bitstream.skipBits(4); // cpb_size_scale
+	const bitRateScale = bitstream.readBits(4);
+	const cpbSizeScale = bitstream.readBits(4);
+
+	// The first schedule is the one a single-schedule stream states, and the one every encoder this
+	// library drives writes. The rest are walked to reach the field widths after them.
+	let bitRate: number | null = null;
+	let cpbSize: number | null = null;
+	let constantBitRate = false;
 
 	for (let i = 0; i <= cpb_cnt_minus1; i++) {
-		readExpGolomb(bitstream); // bit_rate_value_minus1[i]
-		readExpGolomb(bitstream); // cpb_size_value_minus1[i]
-		bitstream.skipBits(1); // cbr_flag[i]
+		const bitRateValue = readExpGolomb(bitstream) + 1;
+		const cpbSizeValue = readExpGolomb(bitstream) + 1;
+		const cbrFlag = bitstream.readBits(1);
+
+		if (i === 0) {
+			// E.2.2: BitRate in bits per second, CpbSize in bits
+			bitRate = bitRateValue * 2 ** (6 + bitRateScale);
+			cpbSize = cpbSizeValue * 2 ** (4 + cpbSizeScale);
+			constantBitRate = cbrFlag === 1;
+		}
 	}
 
-	bitstream.skipBits(5); // initial_cpb_removal_delay_length_minus1
+	const initialCpbRemovalDelayLength = bitstream.readBits(5) + 1;
 
 	return {
 		cpbRemovalDelayLength: bitstream.readBits(5) + 1,
 		dpbOutputDelayLength: bitstream.readBits(5) + 1,
 		timeOffsetLength: bitstream.readBits(5),
+		initialCpbRemovalDelayLength,
+		/** `BitRate[0]` in bits per second, the rate the buffer model is stated against. */
+		bitRate,
+		/** `CpbSize[0]` in bits. */
+		cpbSize,
+		/** `cbr_flag[0]`: the stream claims a constant arrival rate rather than a bounded one. */
+		constantBitRate,
 	};
 };
 
@@ -1355,19 +1402,31 @@ export const extractHevcDecoderConfigurationRecord = (packetData: Uint8Array) =>
 export const parseProfileTierLevel = (
 	bitstream: Bitstream,
 	maxNumSubLayersMinus1: number,
+	// H.265 7.3.3: `profile_tier_level(profilePresentFlag, ...)`. An SPS or the VPS's own call passes 1;
+	// the one at the head of `vps_extension()` passes 0, which omits the first 88 bits - the profile
+	// space, tier, idc, the 32 compatibility flags and the 48 constraint bits - and begins at the level.
+	// Reading those 88 bits anyway lands the rest of the extension on the wrong bit.
+	profilePresentFlag = true,
 ) => {
-	const general_profile_space = bitstream.readBits(2);
-	const general_tier_flag = bitstream.readBits(1);
-	const general_profile_idc = bitstream.readBits(5);
-
+	let general_profile_space = 0;
+	let general_tier_flag = 0;
+	let general_profile_idc = 0;
 	let general_profile_compatibility_flags = 0;
-	for (let i = 0; i < 32; i++) {
-		general_profile_compatibility_flags = (general_profile_compatibility_flags << 1) | bitstream.readBits(1);
-	}
-
 	const general_constraint_indicator_flags = new Uint8Array(6);
-	for (let i = 0; i < 6; i++) {
-		general_constraint_indicator_flags[i] = bitstream.readBits(8);
+
+	if (profilePresentFlag) {
+		general_profile_space = bitstream.readBits(2);
+		general_tier_flag = bitstream.readBits(1);
+		general_profile_idc = bitstream.readBits(5);
+
+		for (let i = 0; i < 32; i++) {
+			general_profile_compatibility_flags = (general_profile_compatibility_flags << 1)
+				| bitstream.readBits(1);
+		}
+
+		for (let i = 0; i < 6; i++) {
+			general_constraint_indicator_flags[i] = bitstream.readBits(8);
+		}
 	}
 
 	const general_level_idc = bitstream.readBits(8);
@@ -1699,6 +1758,48 @@ export const serializeHevcDecoderConfigurationRecord = (record: HevcDecoderConfi
 };
 
 /** Deserializes an HevcDecoderConfigurationRecord from the format specified in Section 8.3.3.1 of ISO 14496-15. */
+
+/**
+ * The NAL unit arrays that end an HEVC configuration record: a completeness bit and a NAL unit type,
+ * then a count and the units themselves.
+ *
+ * `lhvC` ends with exactly these, which is why FFmpeg's demuxer can append a layered record's arrays
+ * onto `hvcC`'s and just raise its `numOfArrays` (libavformat/mov.c, `mov_read_lhvc`).
+ *
+ * @internal
+ */
+export const readHevcNalUnitArrays = (
+	data: Uint8Array,
+	view: DataView,
+	start: number,
+	numOfArrays: number,
+) => {
+	let offset = start;
+	const arrays: { arrayCompleteness: number; nalUnitType: number; nalUnits: Uint8Array[] }[] = [];
+
+	for (let i = 0; i < numOfArrays; i++) {
+		const arrByte = view.getUint8(offset++);
+		const arrayCompleteness = (arrByte >> 7) & 0x01;
+		const nalUnitType = arrByte & 0x3F;
+
+		const numNalus = view.getUint16(offset, false);
+		offset += 2;
+
+		const nalUnits: Uint8Array[] = [];
+		for (let j = 0; j < numNalus; j++) {
+			const nalUnitLength = view.getUint16(offset, false);
+			offset += 2;
+
+			nalUnits.push(data.subarray(offset, offset + nalUnitLength));
+			offset += nalUnitLength;
+		}
+
+		arrays.push({ arrayCompleteness, nalUnitType, nalUnits });
+	}
+
+	return { arrays, offset };
+};
+
 export const deserializeHevcDecoderConfigurationRecord = (data: Uint8Array): HevcDecoderConfigurationRecord | null => {
 	try {
 		const view = toDataView(data);
@@ -1739,31 +1840,7 @@ export const deserializeHevcDecoderConfigurationRecord = (data: Uint8Array): Hev
 		const lengthSizeMinusOne = byte21 & 0x03;
 
 		const numOfArrays = view.getUint8(offset++);
-
-		const arrays: HevcDecoderConfigurationRecord['arrays'] = [];
-		for (let i = 0; i < numOfArrays; i++) {
-			const arrByte = view.getUint8(offset++);
-			const arrayCompleteness = (arrByte >> 7) & 0x01;
-			const nalUnitType = arrByte & 0x3F;
-
-			const numNalus = view.getUint16(offset, false);
-			offset += 2;
-
-			const nalUnits: Uint8Array[] = [];
-			for (let j = 0; j < numNalus; j++) {
-				const nalUnitLength = view.getUint16(offset, false);
-				offset += 2;
-
-				nalUnits.push(data.subarray(offset, offset + nalUnitLength));
-				offset += nalUnitLength;
-			}
-
-			arrays.push({
-				arrayCompleteness,
-				nalUnitType,
-				nalUnits,
-			});
-		}
+		const { arrays } = readHevcNalUnitArrays(data, view, offset, numOfArrays);
 
 		return {
 			configurationVersion,
@@ -2426,11 +2503,9 @@ export const extractProresCodecInfoFromPacket = (packet: Uint8Array): ProresCode
  * a number.
  */
 const AVC_INTRA_CODES = [
-	// AVC-Intra 50: 4:2:0
 	{ chromaFormatIdc: 1, width: 960, height: 720, interlaced: false, slow: 'ai5p', fast: 'ai5q' },
 	{ chromaFormatIdc: 1, width: 1440, height: 1080, interlaced: false, slow: 'ai53', fast: 'ai52' },
 	{ chromaFormatIdc: 1, width: 1440, height: 1080, interlaced: true, slow: 'ai56', fast: 'ai55' },
-	// AVC-Intra 100: 4:2:2
 	{ chromaFormatIdc: 2, width: 1280, height: 720, interlaced: false, slow: 'ai1p', fast: 'ai1q' },
 	{ chromaFormatIdc: 2, width: 1920, height: 1080, interlaced: false, slow: 'ai13', fast: 'ai12' },
 	{ chromaFormatIdc: 2, width: 1920, height: 1080, interlaced: true, slow: 'ai16', fast: 'ai15' },
@@ -2533,13 +2608,11 @@ export const avcIntraSampleEntry = (sps: AvcSpsInfo, frameRate: number | null): 
 		return null;
 	}
 
-	// Nominal rate, so 30000/1001 is a 30 and 60000/1001 a 60
 	const nominal = Math.round(frameRate * 1001 / 1000) === Math.round(frameRate)
 		? Math.round(frameRate)
 		: Math.round(frameRate * 1001 / 1000);
 
 	if (interlaced) {
-		// The interlaced pair is keyed on 50 against 60 rather than on the progressive split
 		return nominal >= 55 ? match.slow : match.fast;
 	}
 
@@ -2629,8 +2702,6 @@ export const extractMpeg2CodecInfoFromPacket = (packet: Uint8Array): Mpeg2CodecI
 		frameRateCode,
 	};
 
-	// The sequence extension follows the sequence header directly when there is one; an MPEG-1 stream
-	// has none, which is the difference that matters here
 	const extensionAt = findMpeg2StartCode(packet, MPEG2_EXTENSION_START_CODE, sequenceHeaderAt + 4);
 	if (extensionAt === -1) {
 		return info;
@@ -2970,13 +3041,15 @@ export const determineVideoPacketType = (
 		};
 
 		case 'png': {
-			// Every frame is a whole image
+			return 'key';
+		};
+
+		case 'dnxhd': {
+			// VC-3 and DNxHR are intra-only by definition: every frame stands alone
 			return 'key';
 		};
 
 		case 'qtrle': {
-			// A QuickTime RLE frame carries no flag saying whether it replaces the frame or updates it, so
-			// only the container knows
 			return null;
 		};
 
@@ -2993,6 +3066,11 @@ export const determineVideoPacketType = (
 			bitstream.skipBits(10);
 
 			return bitstream.readBits(3) === 1 ? 'key' : 'delta';
+		};
+
+		case 'rawvideo': {
+			// Every uncompressed frame stands alone; there is nothing to read to find that out
+			return 'key';
 		};
 
 		default: {

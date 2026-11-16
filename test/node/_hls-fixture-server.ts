@@ -41,6 +41,15 @@ const isTextual = (filePath: string) => filePath.endsWith('.m3u8') || filePath.e
 // more of them on every fetch and never writes #EXT-X-ENDLIST. That is what makes the edge advance, so
 // waiting for it can be tested without a third-party live stream.
 const LIVE_PATH = '/__live__/media.m3u8';
+/**
+ * A live playlist that starts with NO segments and gains its first after a couple of fetches, which
+ * is what a channel looks like between going on air and publishing anything.
+ */
+const LIVE_EMPTY_PATH = '/__live_empty__/media.m3u8';
+/** A finished playlist that lists nothing: it really does have no media, and never will. */
+const ENDED_EMPTY_PATH = '/__ended_empty__/media.m3u8';
+/** Fetches of the empty live playlist before its first segment appears. */
+const LIVE_EMPTY_FETCHES_BEFORE_FIRST = 2;
 const LIVE_SEGMENT_DIR = 'playertest.longtailvideo.com/adaptive/artbeats';
 const LIVE_SEGMENTS = [
 	'fms_sampleFrag1Num0.ts', 'fms_sampleFrag1Num1.ts', 'fms_sampleFrag2Num2.ts', 'fms_sampleFrag3Num3.ts',
@@ -77,6 +86,12 @@ export type HlsFixtureServer = {
 	liveUrl: string;
 	/** How many segments the live playlist has handed out so far. */
 	liveSegmentCount: () => number;
+	/** A live playlist that lists no segments at all until it has been fetched a few times. */
+	liveEmptyUrl: string;
+	/** How many times the empty live playlist has been fetched. */
+	liveEmptyFetchCount: () => number;
+	/** A playlist with an ENDLIST and no segments, which genuinely has no media. */
+	endedEmptyUrl: string;
 };
 
 /** Whether the third-party HLS media these tests serve has been captured. */
@@ -97,9 +112,30 @@ export const startHlsFixtureServer = async (): Promise<HlsFixtureServer> => {
 	const log = process.env['HLS_FIXTURE_LOG'];
 
 	let liveFetches = 0;
+	let liveEmptyFetches = 0;
 
 	const server: Server = createServer((request, response) => {
 		requested.push(request.url!);
+
+		if (request.url === ENDED_EMPTY_PATH) {
+			response.writeHead(200, { 'content-type': 'application/vnd.apple.mpegurl' });
+			response.end([
+				'#EXTM3U',
+				'#EXT-X-VERSION:3',
+				`#EXT-X-TARGETDURATION:${LIVE_SEGMENT_DURATION}`,
+				'#EXT-X-ENDLIST',
+				'',
+			].join('\n'));
+			return;
+		}
+
+		if (request.url === LIVE_EMPTY_PATH) {
+			const count = Math.max(0, liveEmptyFetches - LIVE_EMPTY_FETCHES_BEFORE_FIRST + 1);
+			liveEmptyFetches++;
+			response.writeHead(200, { 'content-type': 'application/vnd.apple.mpegurl' });
+			response.end(liveMediaPlaylist(Math.min(count, LIVE_SEGMENTS.length), new Date(0)));
+			return;
+		}
 
 		if (request.url === LIVE_PATH) {
 			const segmentCount = Math.min(LIVE_INITIAL_SEGMENTS + liveFetches, LIVE_SEGMENTS.length);
@@ -183,6 +219,9 @@ export const startHlsFixtureServer = async (): Promise<HlsFixtureServer> => {
 			return `${origin}/${parsed.host}${parsed.pathname}${parsed.search}`;
 		},
 		liveUrl: `${origin}${LIVE_PATH}`,
+		liveEmptyUrl: `${origin}${LIVE_EMPTY_PATH}`,
+		liveEmptyFetchCount: () => liveEmptyFetches,
+		endedEmptyUrl: `${origin}${ENDED_EMPTY_PATH}`,
 		liveSegmentCount: () => Math.min(LIVE_INITIAL_SEGMENTS + Math.max(liveFetches - 1, 0), LIVE_SEGMENTS.length),
 		close: () => new Promise<void>((resolve, reject) => {
 			server.close(error => error ? reject(error) : resolve());

@@ -63,8 +63,6 @@ export const addPrivatePesPayload = (
 
 	const muxer = output._muxer;
 	if (muxer instanceof SegmentPipelineMuxer) {
-		// A segmented output opens a muxer per segment, so the payload waits in the pipeline until the
-		// segment its time falls in is written
 		muxer.writePrivatePesPayload(payload.pid, payload.time, payload.data);
 		return;
 	}

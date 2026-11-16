@@ -83,7 +83,6 @@ export const segmentIndexOf = async (
 		}
 
 		current = next;
-		// A segment runs at least the target, then to the first sync sample past it
 		if (next.timestamp - starts[starts.length - 1]! >= options.targetDuration) {
 			starts.push(next.timestamp);
 		}
@@ -115,7 +114,6 @@ export const muxSegment = async (
 		input,
 		output,
 		trim: { start: boundary.startTime, end: boundary.endTime },
-		// A segment must not overlap its neighbours; expanding to the enclosing key frames would.
 		copy: { boundaryPolicy: 'shrink' },
 	});
 

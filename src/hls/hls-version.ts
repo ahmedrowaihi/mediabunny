@@ -23,8 +23,9 @@ import { EXTINF_IS_DECIMAL } from './hls-entries';
  * - **8** (variable substitution) and **11** (`EXT-X-DEFINE` with `QUERYPARAM`) — `EXT-X-DEFINE` is
  *   applied while parsing and its values are substituted into the fields, so the tag itself is not
  *   on the AST to be counted.
- * - **12** (any attribute whose name starts with `REQ-`) — an attribute this library does not model
- *   is dropped from the tag it sat on, so it cannot be seen here.
+ * - **12** (any attribute whose name starts with `REQ-`) — only partly. `REQ-VIDEO-LAYOUT` is
+ *   modelled and *is* counted; any other `REQ-` attribute is dropped from the tag it sat on while
+ *   parsing, so it cannot be seen here.
  *
  * If the playlist you are writing uses any of those, take the maximum of this and the version that
  * feature requires.
@@ -52,6 +53,19 @@ export const hlsVersionOf = (playlist: HlsPlaylist): number => {
 				require(13);
 			}
 		}
+		// Any REQ- attribute requires 12 (draft-pantos-hls-rfc8216bis section 7). REQ-VIDEO-LAYOUT is
+		// the one this library models, so it is the one that can be seen here; another REQ- attribute
+		// is still dropped on parse and still invisible, which is what the note above says.
+		for (const variant of playlist.variants) {
+			if (variant.reqVideoLayout !== null) {
+				require(12);
+			}
+		}
+		for (const stream of playlist.iFrameStreams) {
+			if (stream.reqVideoLayout !== null) {
+				require(12);
+			}
+		}
 		for (const key of playlist.sessionKeys) {
 			require(keyVersion(key));
 		}
@@ -63,7 +77,6 @@ export const hlsVersionOf = (playlist: HlsPlaylist): number => {
 	}
 
 	for (const segment of playlist.segments) {
-		// Asks the serializer's own decision rather than guessing what it will write
 		if (EXTINF_IS_DECIMAL) {
 			require(3);
 		}
@@ -71,7 +84,6 @@ export const hlsVersionOf = (playlist: HlsPlaylist): number => {
 			require(4);
 		}
 		if (segment.map !== null) {
-			// MAP alone is 5; MAP in a playlist without I-FRAMES-ONLY is 6
 			require(playlist.iFramesOnly ? 5 : 6);
 		}
 		for (const key of segment.keys) {
@@ -90,8 +102,6 @@ const keyVersion = (key: HlsKey) => {
 	if (key.method === 'SAMPLE-AES') {
 		return 5;
 	}
-	// KEYFORMAT defaults to 'identity' when absent and KEYFORMATVERSIONS to empty, so anything else
-	// means the attribute was actually written.
 	const statesKeyFormat = key.keyFormat !== 'identity' || key.keyFormatVersions.length > 0;
 	if (statesKeyFormat) {
 		return 5;

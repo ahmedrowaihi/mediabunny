@@ -20,6 +20,7 @@
 import { createSocket, type Socket } from 'node:dgram';
 import { assert } from '../../../src/misc';
 import { RTP_HEADER_SIZE, RTP_VERSION } from './rtp';
+import { St2110Clock, type St2110ClockOptions } from './st2110-clock';
 
 /**
  * The samplings ST 2110-20 defines, named as the SDP `sampling` parameter writes them.
@@ -406,6 +407,15 @@ export type St2110SdpOptions = {
 	ttl?: number;
 	/** The PTP grandmaster this stream's clock is locked to, written as `ts-refclk`. */
 	ptpGrandmaster?: string;
+	/**
+	 * The sender's MAC address, written as `ts-refclk:localmac=`, for a stream whose clock is its own
+	 * rather than locked to PTP.
+	 *
+	 * ST 2110-10 §8.2 requires a reference clock to be stated either way, so a stream with neither of
+	 * these says nothing about what its timestamps are against - which leaves a receiver no basis for
+	 * aligning it with anything else.
+	 */
+	localMac?: string;
 };
 
 const isMulticastIpv4 = (address: string) => {
@@ -463,6 +473,8 @@ export const buildSdp = (options: St2110SdpOptions): string => {
 
 	if (options.ptpGrandmaster) {
 		lines.push(`a=ts-refclk:ptp=IEEE1588-2008:${options.ptpGrandmaster}`);
+	} else if (options.localMac) {
+		lines.push(`a=ts-refclk:localmac=${options.localMac}`);
 	}
 
 	return lines.join('\n') + '\n';
@@ -486,7 +498,9 @@ export type St2110VideoSenderOptions = St2110PacketizerOptions & {
 	senderType?: St2110SdpOptions['senderType'];
 	/** Passed through to the SDP. */
 	sessionName?: string;
-};
+	/** The sender's MAC, for the `ts-refclk:localmac=` an unlocked stream declares. */
+	localMac?: string;
+} & St2110ClockOptions;
 
 const sleep = (seconds: number) => new Promise(resolve => setTimeout(resolve, seconds * 1000));
 
@@ -529,12 +543,23 @@ export class St2110VideoSender {
 	private readonly options: St2110VideoSenderOptions;
 	/** @internal */
 	private closed = false;
+	/** @internal */
+	private readonly clock: St2110Clock;
+	/**
+	 * The media clock value the first frame went out at. Read once rather than per frame: the origin
+	 * is the shared clock's, and the spacing is the media clock's, so successive timestamps differ by
+	 * exactly one frame rather than by one frame plus however late the pacer woke up.
+	 *
+	 * @internal
+	 */
+	private timestampBase: number | null = null;
 
 	/** @internal */
 	private constructor(socket: Socket, options: St2110VideoSenderOptions) {
 		this.socket = socket;
 		this.options = options;
 		this.packetizer = new St2110Packetizer(options);
+		this.clock = new St2110Clock(options);
 		this.sdp = buildSdp({
 			format: options.format,
 			address: options.address,
@@ -543,6 +568,8 @@ export class St2110VideoSender {
 			sessionName: options.sessionName,
 			senderType: options.senderType,
 			ttl: options.ttl,
+			ptpGrandmaster: options.ptpGrandmaster,
+			localMac: options.localMac,
 		});
 	}
 
@@ -598,8 +625,10 @@ export class St2110VideoSender {
 		}
 
 		const rate = this.options.format.exactFrameRate;
+		this.timestampBase ??= this.clock.now(90_000) ?? 0;
 		const rtpTimestamp = options.rtpTimestamp
-			?? Math.round(this.framesSent * 90_000 * rate.denominator / rate.numerator);
+			?? (this.timestampBase + Math.round(this.framesSent * 90_000 * rate.denominator / rate.numerator))
+			% 0x1_0000_0000;
 
 		const packets = this.packetizer.packetize(packed, rtpTimestamp, options.fieldIsSecond);
 		const frameSeconds = rate.denominator / rate.numerator;

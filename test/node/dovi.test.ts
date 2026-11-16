@@ -1,6 +1,8 @@
 import { beforeAll, describe, expect, test } from 'vitest';
 
-import { readFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { doviCodecString, doviCompatibleBrand, parseDoviConfigRecord } from '../../src/dovi.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
@@ -11,6 +13,7 @@ import { EncodedPacketSink, VideoSampleSink } from '../../src/media-sink.js';
 import { EncodedVideoPacketSource, VideoSampleSource } from '../../src/media-source.js';
 import { VideoSample } from '../../src/sample.js';
 import { Quality } from '../../src/encode.js';
+import { buildDolbyVisionProfile81Rpu } from '../../src/dovi-rpu.js';
 import { iterateHevcNalUnits } from '../../src/codec-data.js';
 import { registerMediabunnyServer } from '@mediabunny/server';
 import {
@@ -243,6 +246,24 @@ test.each(FIXTURES)('%s states the codec a player can act on', async (name, _fou
 	expect(await input.getMimeType()).toContain(codec!);
 }, 30_000);
 
+const hasFfprobe = (() => {
+	try {
+		execFileSync('ffprobe', ['-version'], { stdio: 'ignore' });
+		return true;
+	} catch {
+		return false;
+	}
+})();
+
+const hasDoviTool = (() => {
+	try {
+		execFileSync('dovi_tool', ['--version'], { stdio: 'ignore' });
+		return true;
+	} catch {
+		return false;
+	}
+})();
+
 describe('Dolby Vision RPUs ride on the frame through a real encode', () => {
 	beforeAll(() => {
 		registerMediabunnyServer();
@@ -295,7 +316,12 @@ describe('Dolby Vision RPUs ride on the frame through a real encode', () => {
 		return { config, perPacket };
 	};
 
-	test('each encoded packet carries its own frame\'s RPU, ahead of the slice', async () => {
+	test('each encoded packet carries its own frame\'s RPU, AFTER the slice', async () => {
+		// This assertion used to read `rpuAt < firstSliceAt`, and shipped the bug it was written to
+		// hold: an RPU ahead of the slices belongs to the PREVIOUS picture, because a parser ends an
+		// access unit at the next picture's first slice. `dovi_tool extract-rpu` discards an RPU found
+		// anywhere else and ffprobe reported the metadata on 2 frames of 50. Dolby's own streams - and
+		// `test/public/dv-p81.mp4`, which is one - put it last: `39/20/62` on a key frame, `1/62` after.
 		const { config, perPacket } = await nalUnitsPerPacket(await encode({ declare: true, rpus: true }));
 
 		expect(config.dolbyVision).toEqual(DECLARED);
@@ -303,14 +329,131 @@ describe('Dolby Vision RPUs ride on the frame through a real encode', () => {
 
 		perPacket.sort((a, b) => a.timestamp - b.timestamp);
 		perPacket.forEach(({ nalUnits }, index) => {
-			const rpuAt = nalUnits.findIndex(nalUnit => (nalUnit[0]! >> 1) === HEVC_DOVI_RPU_NAL_TYPE);
-			const firstSliceAt = nalUnits.findIndex(nalUnit => (nalUnit[0]! >> 1) < 32);
-			expect(rpuAt).toBeGreaterThanOrEqual(0);
-			expect(rpuAt).toBeLessThan(firstSliceAt);
-			expect(nalUnits.filter(nalUnit => (nalUnit[0]! >> 1) === HEVC_DOVI_RPU_NAL_TYPE)).toHaveLength(1);
+			const types = nalUnits.map(nalUnit => (nalUnit[0]! >> 1) & 0x3f);
+			const rpuAt = types.indexOf(HEVC_DOVI_RPU_NAL_TYPE);
+			const lastSliceAt = types.reduce((last, type, at) => type < 32 ? at : last, -1);
+
+			expect(rpuAt, `packet ${index}`).toBeGreaterThan(lastSliceAt);
+			expect(types.filter(type => type === HEVC_DOVI_RPU_NAL_TYPE)).toHaveLength(1);
 			expect(nalUnits[rpuAt]).toEqual(rpuFor(index));
 		});
 	}, 60_000);
+
+	test('a real Dolby Vision file puts it there too, which is where this was settled', async () => {
+		// Not our own output: the fixture is a genuine profile 8.1 stream, and its layout is the only
+		// statement of where an RPU belongs that does not come from this library
+		const bytes = new Uint8Array(readFileSync(path.join(PUBLIC, 'dv-p81.mp4')));
+		using input = new Input({ source: new BufferSource(bytes.buffer), formats: ALL_FORMATS });
+
+		const track = (await input.getPrimaryVideoTrack())!;
+		const config = (await track.getDecoderConfig())!;
+
+		let checked = 0;
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			const types = [...iterateHevcNalUnits(packet.data, config)]
+				.map(at => (packet.data[at.offset]! >> 1) & 0x3f);
+
+			const rpuAt = types.indexOf(HEVC_DOVI_RPU_NAL_TYPE);
+			if (rpuAt === -1) {
+				continue;
+			}
+
+			const lastSliceAt = types.reduce((last, type, at) => type < 32 ? at : last, -1);
+			expect(rpuAt, `types ${types.join('/')}`).toBeGreaterThan(lastSliceAt);
+			checked++;
+		}
+
+		expect(checked, 'the fixture carries RPUs at all').toBeGreaterThan(0);
+	}, 60_000);
+
+	/** The same encode, but with RPUs this library generates, which an external tool can parse. */
+	const encodeWithRealRpus = async () => {
+		const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+		const source = new VideoSampleSource({ codec: 'hevc', quality: new Quality('low') });
+		output.addVideoTrack(source, { dolbyVision: DECLARED });
+		await output.start();
+
+		const pixels = new Uint8Array(320 * 240 * 3 / 2).fill(0x80);
+		for (let i = 0; i < FRAME_COUNT; i++) {
+			using sample = new VideoSample(pixels, {
+				format: 'I420',
+				codedWidth: 320,
+				codedHeight: 240,
+				timestamp: i / 25,
+				duration: 1 / 25,
+				dolbyVisionRpu: buildDolbyVisionProfile81Rpu({
+					sceneCut: i === 0,
+					level1: { minPq: 0, maxPq: 2828, avgPq: 1229 },
+					level6: {
+						maxDisplayMasteringLuminance: 1000,
+						minDisplayMasteringLuminance: 1,
+						maxContentLightLevel: 1000,
+						maxFrameAverageLightLevel: 400,
+					},
+				}),
+			});
+			await source.add(sample);
+		}
+
+		await output.finalize();
+		return new Uint8Array(output.target.buffer!);
+	};
+
+	test('an external reader finds an RPU on EVERY frame, which is the acceptance', async () => {
+		// The checks that would have caught the placement bug, neither of which reads our own output
+		// through our own code: ffprobe counts the frames it finds Dolby Vision metadata on, and
+		// `dovi_tool extract-rpu` refuses an RPU that is not where it expects.
+		if (!hasFfprobe) {
+			return;
+		}
+
+		const dir = mkdtempSync(path.join(tmpdir(), 'mediabunny-dovi-'));
+		const file = path.join(dir, 'rpus.mp4');
+
+		try {
+			// REAL RPUs, not this file's synthetic stubs: ffprobe reports the side data only for an RPU
+			// it can parse, so a placeholder NAL proves nothing about placement
+			writeFileSync(file, await encodeWithRealRpus());
+
+			const frames = execFileSync('ffprobe', [
+				'-v', 'error', '-show_frames', '-show_entries', 'frame=side_data_type',
+				'-of', 'default=nw=1', file,
+			], { encoding: 'utf8' });
+
+			const withRpu = frames.split('\n').filter(line => /Dolby Vision RPU/i.test(line)).length;
+			expect(withRpu, `RPU metadata on all ${FRAME_COUNT} frames`).toBe(FRAME_COUNT);
+
+			if (hasDoviTool) {
+				// dovi_tool reads an elementary stream, not a container
+				const elementary = path.join(dir, 'stream.hevc');
+				execFileSync('ffmpeg', ['-v', 'error', '-y', '-i', file, '-c', 'copy', '-f', 'hevc', elementary]);
+
+				const extracted = path.join(dir, 'out.rpu');
+				const log = execFileSync('sh', [
+					'-c',
+					`dovi_tool extract-rpu -i ${JSON.stringify(elementary)}`
+					+ ` -o ${JSON.stringify(extracted)} 2>&1 || true`,
+				], { encoding: 'utf8' });
+
+				// It warns "Unexpected RPU NALU found for frame N. Discarding." for a misplaced one,
+				// and then has fewer RPUs than frames
+				expect(log, 'dovi_tool discarded nothing').not.toMatch(/Discarding/i);
+
+				const summary = execFileSync('sh', [
+					'-c',
+					`dovi_tool info -i ${JSON.stringify(extracted)} -s 2>&1 || true`,
+				], { encoding: 'utf8' });
+
+				expect(Number(summary.match(/Frames: *(\d+)/)?.[1]), 'one RPU per frame').toBe(FRAME_COUNT);
+
+				// And they are the RPUs we meant: dovi_tool reads the profile and the L6 back
+				expect(summary).toMatch(/Profile: 8/);
+				expect(summary).toMatch(/MaxCLL: 1000 nits, MaxFALL: 400 nits/);
+			}
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	}, 120_000);
 
 	test('a track declaring none is encoded without the box or the NAL units', async () => {
 		const { config, perPacket } = await nalUnitsPerPacket(await encode({ declare: false, rpus: false }));

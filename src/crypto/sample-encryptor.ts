@@ -81,7 +81,6 @@ export class SampleEncryptor {
 		/** Override the video slice-header parser (tests inject a mock). */
 		videoSliceHeaderParser?: VideoSliceHeaderParser;
 	}) {
-		// VP9 defaults to subsample encryption (shaka's `vp9_subsample_encryption`); other codecs ignore it.
 		this.generator = new SubsampleGenerator(options.streamInfo.codec === 'vp9', false);
 		this.generator.initialize(options.scheme, options.streamInfo);
 
@@ -165,8 +164,6 @@ export class SampleEncryptor {
 
 	/** @internal */
 	private createCipher(options: CipherOptions): SampleCipher {
-		// Video and AC-4 use pattern encryption in a pattern scheme; other audio uses whole-block
-		// full-sample encryption. Mirrors shaka's `EncryptionHandler::SetupProtectionPattern`.
 		const usesPattern = options.streamType === 'video' || options.streamInfo.codec === 'ac4';
 		const cryptByteBlock = usesPattern ? (options.cryptByteBlock ?? DEFAULT_CRYPT_BYTE_BLOCK) : 1;
 		const skipByteBlock = usesPattern ? (options.skipByteBlock ?? DEFAULT_SKIP_BYTE_BLOCK) : 0;

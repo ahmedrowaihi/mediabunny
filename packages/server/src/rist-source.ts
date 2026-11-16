@@ -7,9 +7,10 @@
  */
 
 import { ReadableStreamSource } from 'mediabunny';
-import { createSocket, type Socket } from 'node:dgram';
-import { checkUrlAndOptions, positive } from './misc';
-import { parseRtp, RTP_VERSION, seqDistance } from './rtp';
+import { parseUrls, positive, type ResolvedPeer } from './rist-peer';
+import { buildNacks, buildReceiverReport, senderSsrcOf } from './rist-rtcp';
+import { parseRtp, seqDistance } from './rtp';
+import { RistPath, type PathAddress } from './rist-transport';
 
 /**
  * Milliseconds the reorder buffer holds a packet before giving up on the ones missing before it.
@@ -19,15 +20,10 @@ import { parseRtp, RTP_VERSION, seqDistance } from './rtp';
  */
 export const DEFAULT_RIST_BUFFER_MS = 1000;
 
-const RTCP_SR = 200;
-const RTCP_RR = 201;
-const RTCP_SDES = 202;
-const RTCP_APP = 204;
-const RTCP_RTPFB = 205;
-const RTPFB_GENERIC_NACK = 1;
-
-// TR-06-1 names its range NACK with this, in an RTCP APP packet of subtype 0
-const RIST_APP_NAME = 0x52495354; // 'RIST'
+/** TR-06-1 §5.2 caps the gap between compound RTCP packets at 100 ms. */
+const RTCP_INTERVAL_MS = 100;
+/** Sequence numbers asked for in one NACK. TR-06-1 §5.3.1.3 suggests keeping these packets small. */
+const MAX_NACKS_PER_PACKET = 64;
 
 /**
  * Options for {@link RistSource}.
@@ -37,198 +33,58 @@ const RIST_APP_NAME = 0x52495354; // 'RIST'
  */
 export type RistSourceOptions = {
 	/**
-	 * Whether to bind and wait for a sender (`'listener'`, the default) or to announce this receiver to one
-	 * (`'caller'`). A caller binds an ephemeral port pair and sends RTCP to the URL's address until media
-	 * arrives, which is what lets a sender behind NAT learn where to send.
+	 * Whether to bind the URL's ports and wait for a sender (`'listener'`, the default) or to announce
+	 * this receiver to one (`'caller'`). A caller sends RTCP to the URL until media arrives, which is
+	 * what lets a sender behind NAT learn where to send.
 	 */
 	mode?: 'listener' | 'caller';
 	/**
-	 * Milliseconds a packet may wait for the ones before it, which is also how long a lost packet has to be
-	 * retransmitted. Defaults to {@link DEFAULT_RIST_BUFFER_MS}. This is the latency knob MediaConnect
-	 * states as "max latency".
+	 * Which RIST profile to speak. Defaults to `'simple'`, which is what MediaConnect speaks; librist's
+	 * own tools default to main. **Both ends must agree** — a profile disagreement delivers nothing
+	 * rather than failing loudly.
+	 */
+	profile?: 'simple' | 'main';
+	/**
+	 * **Milliseconds** a packet may wait for the ones before it, which is also how long a lost packet
+	 * has to be retransmitted. Defaults to {@link DEFAULT_RIST_BUFFER_MS}. This is the latency knob
+	 * MediaConnect states as "max latency".
 	 */
 	bufferMs?: number;
-	/** Seconds without media before the stream ends. Defaults to 30. */
+	/** **Seconds** without media before the stream ends. Defaults to 30. */
 	readTimeout?: number;
-	/** Milliseconds between NACKs for the same missing packet. Defaults to 20. */
+	/** **Milliseconds** between NACKs for the same missing packet. Defaults to 20. */
 	nackIntervalMs?: number;
+	/** Pre-shared passphrase for main-profile encryption. Must match the sender's. */
+	secret?: string;
+	/** AES key length to use with {@link RistSourceOptions.secret}. Defaults to 256. */
+	aesType?: 128 | 256;
 	/** Maximum bytes to keep for re-reads. Passed through to Mediabunny's `ReadableStreamSource`. */
 	maxCacheSize?: number;
 };
 
-type Resolved = Required<Omit<RistSourceOptions, 'maxCacheSize'>>;
-
-const rtcpHeader = (bytes: Uint8Array, offset: number, count: number, packetType: number, words: number) => {
-	bytes[offset] = (RTP_VERSION << 6) | count;
-	bytes[offset + 1] = packetType;
-	bytes[offset + 2] = words >> 8;
-	bytes[offset + 3] = words & 0xff;
-};
-
-const writeU32 = (bytes: Uint8Array, offset: number, value: number) => {
-	bytes[offset] = (value >>> 24) & 0xff;
-	bytes[offset + 1] = (value >>> 16) & 0xff;
-	bytes[offset + 2] = (value >>> 8) & 0xff;
-	bytes[offset + 3] = value & 0xff;
-};
-
-/** One RFC 4585 generic NACK per missing packet, plus TR-06-1's range NACK, in one compound packet. */
-const buildNacks = (ourSsrc: number, senderSsrc: number, missing: number[]): Uint8Array => {
-	const ranges: { start: number; extra: number }[] = [];
-	for (const seq of missing) {
-		const last = ranges[ranges.length - 1];
-		if (last && seq === ((last.start + last.extra + 1) & 0xffff) && last.extra < 0xffff) {
-			last.extra++;
-		} else {
-			ranges.push({ start: seq, extra: 0 });
-		}
-	}
-
-	// Both lengths are in 32-bit words minus one, as RTCP states them
-	const genericWords = 2 + missing.length;
-	const appWords = 2 + ranges.length;
-	const bytes = new Uint8Array((genericWords + 1) * 4 + (appWords + 1) * 4);
-
-	rtcpHeader(bytes, 0, RTPFB_GENERIC_NACK, RTCP_RTPFB, genericWords);
-	writeU32(bytes, 4, ourSsrc);
-	writeU32(bytes, 8, senderSsrc);
-	missing.forEach((seq, i) => writeU32(bytes, 12 + i * 4, (seq << 16) >>> 0));
-
-	const offset = (genericWords + 1) * 4;
-	rtcpHeader(bytes, offset, 0, RTCP_APP, appWords);
-	writeU32(bytes, offset + 4, ourSsrc);
-	writeU32(bytes, offset + 8, RIST_APP_NAME);
-	ranges.forEach(({ start, extra }, i) => {
-		writeU32(bytes, offset + 12 + i * 4, ((start << 16) | extra) >>> 0);
-	});
-
-	return bytes;
-};
-
-/** An RR with one report block, and the SDES CNAME beside it that TR-06-1 asks a receiver to send. */
-const buildReceiverReport = (
-	ourSsrc: number,
-	senderSsrc: number,
-	state: { highestSeq: number; lost: number; received: number },
-): Uint8Array => {
-	const cname = new TextEncoder().encode('mediabunny');
-	const sdesTextWords = Math.ceil((4 + 2 + cname.length + 1) / 4);
-	const bytes = new Uint8Array(8 * 4 + (sdesTextWords + 1) * 4);
-
-	rtcpHeader(bytes, 0, senderSsrc === 0 ? 0 : 1, RTCP_RR, senderSsrc === 0 ? 1 : 7);
-	writeU32(bytes, 4, ourSsrc);
-	if (senderSsrc !== 0) {
-		writeU32(bytes, 8, senderSsrc);
-		const expected = Math.max(1, state.received + state.lost);
-		bytes[12] = Math.min(255, Math.round((state.lost / expected) * 256));
-		writeU32(bytes, 16, state.lost & 0xffffff);
-		writeU32(bytes, 20, state.highestSeq);
-	}
-
-	const offset = 8 * 4;
-	rtcpHeader(bytes, offset, 1, RTCP_SDES, sdesTextWords + 1);
-	writeU32(bytes, offset + 4, ourSsrc);
-	bytes[offset + 8] = 1; // CNAME
-	bytes[offset + 9] = cname.length;
-	bytes.set(cname, offset + 10);
-
-	return bytes;
-};
-
-/** The sender SSRC of the first SR or SDES in a compound packet, or null. */
-const senderSsrcOf = (bytes: Uint8Array): number | null => {
-	let offset = 0;
-	while (offset + 8 <= bytes.length) {
-		const words = (bytes[offset + 2]! << 8) | bytes[offset + 3]!;
-		const packetType = bytes[offset + 1]!;
-		if (packetType === RTCP_SR || packetType === RTCP_SDES) {
-			return (bytes[offset + 4]! << 24 | bytes[offset + 5]! << 16
-				| bytes[offset + 6]! << 8 | bytes[offset + 7]!) >>> 0;
-		}
-		offset += (words + 1) * 4;
-	}
-	return null;
-};
-
-const parseUrl = (url: string) => {
-	const parsed = new URL(url);
-	const port = Number(parsed.port);
-	if (!Number.isInteger(port) || port <= 0 || port >= 65535) {
-		throw new TypeError(`RistSource: ${JSON.stringify(url)} must state a port below 65535.`);
-	}
-	if (port % 2 !== 0) {
-		throw new TypeError(`RistSource: ${JSON.stringify(url)} must state an even port; RTCP uses the next one.`);
-	}
-	return { host: parsed.hostname || '0.0.0.0', port };
-};
-
-/** Attempts before an ephemeral even/odd pair is given up on; a collision is rare and retried. */
-const PAIR_BIND_ATTEMPTS = 20;
-
-const newSocket = () => createSocket({ type: 'udp4', reuseAddr: true });
-
-const bind = (socket: Socket, bindOptions: { address?: string; port: number }) =>
-	new Promise<void>((resolve, reject) => {
-		socket.once('error', reject);
-		socket.bind(bindOptions, () => resolve());
-	});
-
-const closeIfBound = (socket: Socket) => {
-	try {
-		socket.close();
-	} catch {
-		// Never bound, so there is nothing to close
-	}
+type Resolved = ResolvedPeer & {
+	bufferMs: number;
+	readTimeout: number;
+	nackIntervalMs: number;
 };
 
 /**
- * The media socket and the control socket above it. A listener takes the URL's pair; a caller takes any
- * adjacent pair, since a sender facing one derives its media port as the control port minus one.
- */
-const bindPair = async (
-	mode: Resolved['mode'],
-	host: string,
-	port: number,
-): Promise<[Socket, Socket]> => {
-	if (mode === 'listener') {
-		const pair: [Socket, Socket] = [newSocket(), newSocket()];
-		await bind(pair[0], { address: host, port });
-		await bind(pair[1], { address: host, port: port + 1 });
-		return pair;
-	}
-
-	let lastError: unknown;
-	for (let attempt = 0; attempt < PAIR_BIND_ATTEMPTS; attempt++) {
-		const pair: [Socket, Socket] = [newSocket(), newSocket()];
-		const base = 1024 + Math.floor(Math.random() * 32_000) * 2;
-
-		try {
-			await bind(pair[0], { port: base });
-			await bind(pair[1], { port: base + 1 });
-			return pair;
-		} catch (error) {
-			lastError = error;
-			pair.forEach(closeIfBound);
-		}
-	}
-
-	throw lastError;
-};
-
-/**
- * One RIST stream: the reorder buffer, the NACK bookkeeping and the two sockets. Held as fields rather
- * than in a closure so the timers and handlers all act on the same visible state.
+ * One RIST stream, however many paths carry it.
+ *
+ * The reorder buffer is shared across every path rather than one per path: that is what merging is.
+ * Packets are keyed by RTP sequence number, so a packet replicated down two links is held once and
+ * released once (SMPTE 2022-7), and a stream split across two links is put back in order.
  */
 class RistStreamReader {
 	private readonly ourSsrc = (Math.random() * 0xffffffff) >>> 0;
-	private media: Socket | undefined;
-	private control: Socket | undefined;
+	private readonly cname = new TextEncoder().encode('mediabunny');
+	private readonly paths: RistPath[] = [];
 	private closed = false;
-	private canceled = false;
+	private cancelled = false;
 	private controller: ReadableStreamDefaultController<Uint8Array> | null = null;
 	private silenceTimer: ReturnType<typeof setInterval> | undefined;
 	private releaseTimer: ReturnType<typeof setInterval> | undefined;
-	private keepaliveTimer: ReturnType<typeof setInterval> | undefined;
+	private rtcpTimer: ReturnType<typeof setInterval> | undefined;
 
 	/** Packets waiting for the ones before them, and when each arrived. */
 	private readonly buffered = new Map<number, { payload: Uint8Array; at: number }>();
@@ -237,17 +93,16 @@ class RistStreamReader {
 	private expected: number | null = null;
 	private anchorAt = 0;
 	private senderSsrc = 0;
-	private senderAddress: { address: string; port: number } | null = null;
-	private learnedControl = false;
 	private emittedAny = false;
 	private lastByteAt = 0;
 	private received = 0;
 	private lost = 0;
 	private highestSeq = 0;
+	/** Payloads that arrived on more than one path, which is what replication buys and costs. */
+	duplicates = 0;
 
 	constructor(
-		private readonly host: string,
-		private readonly port: number,
+		private readonly urls: { host: string; port: number }[],
 		private readonly options: Resolved,
 	) {}
 
@@ -255,30 +110,27 @@ class RistStreamReader {
 		if (this.closed) {
 			return;
 		}
-
 		this.closed = true;
 		try {
 			this.controller?.close();
 		} catch {
-			// Already closed or errored; nothing to end
+			// Already closed
 		}
 	}
 
 	private stopEverything() {
 		clearInterval(this.silenceTimer);
 		clearInterval(this.releaseTimer);
-		clearInterval(this.keepaliveTimer);
-		this.media?.close();
-		this.control?.close();
-		this.media = undefined;
-		this.control = undefined;
+		clearInterval(this.rtcpTimer);
+		for (const path of this.paths) {
+			path.close();
+		}
 	}
 
 	private emit(payload: Uint8Array) {
-		if (this.canceled || this.closed) {
+		if (this.cancelled || this.closed) {
 			return;
 		}
-
 		this.emittedAny = true;
 		this.controller?.enqueue(payload);
 	}
@@ -289,8 +141,9 @@ class RistStreamReader {
 			return;
 		}
 
-		// Nothing leaves before the buffer has filled once: until then the lowest sequence seen is not
-		// known to be the lowest there is, and releasing it would discard whatever arrives below it.
+		// Before anything has gone out, the lowest sequence number held is the right place to start, but
+		// only once the paths have had their buffer to deliver: a later path may still carry an earlier
+		// packet, and starting at the first arrival would write it off unseen
 		if (!this.emittedAny) {
 			if (Date.now() < this.anchorAt) {
 				return;
@@ -338,8 +191,12 @@ class RistStreamReader {
 		}
 	}
 
+	/**
+	 * Asks for what is missing. The request goes out on every live path: a packet lost on one may be
+	 * resent down another, and a path whose NACK never arrives cannot be the only one asking.
+	 */
 	private sendNacks() {
-		if (!this.control || !this.senderAddress || this.expected === null || this.buffered.size === 0) {
+		if (this.expected === null || this.buffered.size === 0) {
 			return;
 		}
 
@@ -349,41 +206,44 @@ class RistStreamReader {
 			if (this.buffered.has(seq)) {
 				continue;
 			}
-
 			const asked = this.requested.get(seq) ?? 0;
 			if (now - asked >= this.options.nackIntervalMs) {
 				this.requested.set(seq, now);
 				missing.push(seq);
 			}
-			if (missing.length === 64) {
+			if (missing.length === MAX_NACKS_PER_PACKET) {
 				break;
 			}
 		}
 
-		if (missing.length > 0) {
-			this.control.send(
-				buildNacks(this.ourSsrc, this.senderSsrc, missing),
-				this.senderAddress.port,
-				this.senderAddress.address,
-			);
+		if (missing.length === 0) {
+			return;
+		}
+
+		const nacks = buildNacks(this.ourSsrc, this.senderSsrc, missing);
+		for (const path of this.paths) {
+			if (path.peer) {
+				path.sendControl(nacks);
+			}
 		}
 	}
 
-	private onMedia = (bytes: Buffer, from: { address: string; port: number }) => {
-		const packet = parseRtp(new Uint8Array(bytes));
+	private onMedia = (bytes: Uint8Array, from: PathAddress, path: RistPath) => {
+		const packet = parseRtp(bytes);
 		if (!packet) {
 			return;
 		}
 
+		// A sender's media tells a listener where that sender's control port is, which is the only
+		// address a NACK can go to before any RTCP has arrived
+		path.peer ??= { address: from.address, port: from.port };
+
 		this.lastByteAt = Date.now();
 		this.received++;
-		// TR-06-1 pairs the sender's ports as it does the receiver's, but a sender that sends RTCP states
-		// its control address outright, so that one wins
-		if (!this.learnedControl) {
-			this.senderAddress = { address: from.address, port: from.port + 1 };
-		}
 		if (this.senderSsrc === 0) {
-			this.senderSsrc = packet.ssrc;
+			// TR-06-1 §5.3.2 marks a retransmission with the SSRC's low bit; the other 31 name the flow,
+			// so the flow id is what identifies the stream across originals and retransmissions alike
+			this.senderSsrc = (packet.ssrc & ~1) >>> 0;
 		}
 
 		if (this.expected === null) {
@@ -392,11 +252,9 @@ class RistStreamReader {
 			this.anchorAt = Date.now() + this.options.bufferMs;
 		}
 
-		// Before anything is released the anchor is just the lowest seen, so a stream whose first datagrams
-		// arrive swapped does not lose the ones below it. After that, a lower one is a late retransmission.
 		if (seqDistance(packet.seq, this.expected) < 0) {
 			if (this.emittedAny) {
-				return;
+				return; // Already released past this one; a late copy is not a second packet
 			}
 			this.expected = packet.seq;
 		}
@@ -404,70 +262,63 @@ class RistStreamReader {
 			this.highestSeq = packet.seq;
 		}
 
-		if (!this.buffered.has(packet.seq)) {
-			this.buffered.set(packet.seq, { payload: packet.payload, at: Date.now() });
+		if (this.buffered.has(packet.seq)) {
+			this.duplicates++;
+			return;
 		}
 
+		this.buffered.set(packet.seq, { payload: packet.payload.slice(), at: Date.now() });
 		this.release();
 		this.sendNacks();
 	};
 
-	private onControl = (bytes: Buffer, from: { address: string; port: number }) => {
-		const ssrc = senderSsrcOf(new Uint8Array(bytes));
+	private onControl = (bytes: Uint8Array, from: PathAddress, path: RistPath) => {
+		const ssrc = senderSsrcOf(bytes);
 		if (ssrc !== null && this.senderSsrc === 0) {
 			this.senderSsrc = ssrc;
 		}
-
-		this.senderAddress = { address: from.address, port: from.port };
-		this.learnedControl = true;
-
-		this.control?.send(
-			buildReceiverReport(this.ourSsrc, this.senderSsrc, this.reportCounts()),
-			this.senderAddress.port,
-			this.senderAddress.address,
-		);
+		path.peer = from;
 	};
 
-	private reportCounts() {
-		return { highestSeq: this.highestSeq, lost: this.lost, received: this.received };
-	}
+	private sendReports() {
+		const report = buildReceiverReport(this.ourSsrc, this.senderSsrc, this.cname, {
+			highestSeq: this.highestSeq,
+			lost: this.lost,
+			received: this.received,
+		});
 
-	/** Announces this receiver to the sender until media arrives, which is what a caller mode is for. */
-	private startAnnouncing() {
-		this.senderAddress = { address: this.host, port: this.port + 1 };
-		const announce = () => {
-			if (!this.senderAddress || this.received > 0) {
-				return;
+		for (const path of this.paths) {
+			path.sendKeepalive();
+			if (path.peer) {
+				path.sendControl(report);
 			}
-
-			this.control?.send(
-				buildReceiverReport(this.ourSsrc, 0, this.reportCounts()),
-				this.senderAddress.port,
-				this.senderAddress.address,
-			);
-		};
-
-		announce();
-		this.keepaliveTimer = setInterval(announce, 200);
+		}
 	}
 
 	async start(controller: ReadableStreamDefaultController<Uint8Array>) {
 		this.controller = controller;
 
-		const [media, control] = await bindPair(this.options.mode, this.host, this.port);
-		this.media = media;
-		this.control = control;
-
-		media.on('message', this.onMedia);
-		control.on('message', this.onControl);
-		media.on('error', error => controller.error(error));
-		control.on('error', error => controller.error(error));
-
-		if (this.options.mode === 'caller') {
-			this.startAnnouncing();
+		for (const { host, port } of this.urls) {
+			const path: RistPath = new RistPath({
+				profile: this.options.profile,
+				mode: this.options.mode,
+				host,
+				port,
+				secret: this.options.secret,
+				aesType: this.options.aesType ?? 256,
+				onMedia: (payload, from) => this.onMedia(payload, from, path),
+				onControl: (payload, from) => this.onControl(payload, from, path),
+				onError: error => controller.error(error),
+			});
+			await path.open();
+			this.paths.push(path);
 		}
 
 		this.lastByteAt = Date.now();
+		// A caller announces itself from the first tick; a listener's reports start once a peer is known
+		this.sendReports();
+		this.rtcpTimer = setInterval(() => this.sendReports(), RTCP_INTERVAL_MS);
+
 		this.silenceTimer = setInterval(() => {
 			if (!this.closed && Date.now() - this.lastByteAt >= this.options.readTimeout * 1000) {
 				this.release();
@@ -476,59 +327,74 @@ class RistStreamReader {
 			}
 		}, Math.max(50, Math.min(500, this.options.readTimeout * 250)));
 
-		// A gap's deadline passes without any packet arriving to notice it
-		this.releaseTimer = setInterval(() => this.release(), Math.max(10, Math.round(this.options.bufferMs / 4)));
+		this.releaseTimer = setInterval(
+			() => this.release(),
+			Math.max(10, Math.round(this.options.bufferMs / 4)),
+		);
 	}
 
 	cancel() {
-		this.canceled = true;
+		this.cancelled = true;
 		this.closeOnce();
 		this.stopEverything();
 	}
 }
 
-const openStream = (url: string, options: Resolved): ReadableStream<Uint8Array> => {
-	const { host, port } = parseUrl(url);
-	const reader = new RistStreamReader(host, port, options);
-
-	return new ReadableStream<Uint8Array>({
-		start: controller => reader.start(controller),
-		cancel: () => reader.cancel(),
-	});
-};
-
 /**
- * Reads a RIST Simple Profile stream (VSF TR-06-1) as an MPEG-TS byte stream: RTP on the URL's even port
- * carries the transport stream, RTCP on the next port carries the NACKs that ask for what was lost.
+ * Reads a RIST stream as an MPEG-TS byte stream — Simple Profile (VSF TR-06-1) or Main Profile
+ * (TR-06-2) with its GRE framing and AES encryption. The protocol is spoken directly: there is no
+ * native library and nothing to install.
  *
  * Packets are released in sequence order once their predecessors arrive or `bufferMs` runs out, so a
- * stream with loss beyond recovery continues with a gap rather than stalling.
+ * stream with loss beyond recovery continues with a gap rather than stalling. What is missing is asked
+ * for by NACK until the buffer runs out.
+ *
+ * Several URLs merge several paths into one stream by RTP sequence number: a packet carried down two
+ * links is delivered once, and a stream split across two links is put back in order (TR-06-1 §5.4,
+ * SMPTE 2022-7).
+ *
+ * @example
+ * ```ts
+ * const input = new Input({
+ * 	formats: [new MpegTsInputFormat()],
+ * 	source: new RistSource(['rist://0.0.0.0:9000', 'rist://0.0.0.0:9002'], { mode: 'listener' }),
+ * });
+ * ```
  *
  * @group \@mediabunny/server
  * @public
  */
 export class RistSource extends ReadableStreamSource {
-	constructor(url: string, options: RistSourceOptions = {}) {
-		checkUrlAndOptions(url, options);
-		if (options.mode !== undefined && options.mode !== 'listener' && options.mode !== 'caller') {
-			throw new TypeError('options.mode, when provided, must be \'listener\' or \'caller\'.');
-		}
-		positive(options.bufferMs, 'bufferMs');
-		positive(options.readTimeout, 'readTimeout');
-		positive(options.nackIntervalMs, 'nackIntervalMs');
+	/** @internal */
+	private readonly reader: RistStreamReader;
 
-		const scheme = url.slice(0, url.indexOf(':'));
-		if (scheme !== 'rist') {
-			throw new TypeError(`RistSource: ${JSON.stringify(url)} is not a rist:// URL.`);
-		}
+	constructor(url: string | string[], options: RistSourceOptions = {}) {
+		const { urls, peer } = parseUrls(url, options, 'RistSource');
 
-		const resolved: Resolved = {
-			mode: options.mode ?? 'listener',
-			bufferMs: options.bufferMs ?? DEFAULT_RIST_BUFFER_MS,
-			readTimeout: options.readTimeout ?? 30,
-			nackIntervalMs: options.nackIntervalMs ?? 20,
-		};
+		const reader = new RistStreamReader(urls, {
+			...peer,
+			// A receiver defaults to listening, where a sender defaults to calling
+			mode: (options.mode ?? 'listener'),
+			bufferMs: positive(options.bufferMs, 'bufferMs', DEFAULT_RIST_BUFFER_MS),
+			readTimeout: positive(options.readTimeout, 'readTimeout', 30),
+			nackIntervalMs: positive(options.nackIntervalMs, 'nackIntervalMs', 20),
+		});
 
-		super(openStream(url, resolved), { maxCacheSize: options.maxCacheSize });
+		super(
+			new ReadableStream<Uint8Array>({
+				start: controller => reader.start(controller),
+				cancel: () => reader.cancel(),
+			}),
+			{ maxCacheSize: options.maxCacheSize },
+		);
+		this.reader = reader;
+	}
+
+	/**
+	 * Payloads that arrived on more than one path and were delivered once. On replicated links this is
+	 * the protection working; on links meant to be split it means the sender is not splitting.
+	 */
+	get duplicates(): number {
+		return this.reader.duplicates;
 	}
 }

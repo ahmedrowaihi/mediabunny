@@ -61,10 +61,8 @@ type SeiFraming = {
  */
 export const SEI_FRAMINGS: Record<SeiCodec, SeiFraming> = {
 	avc: {
-		// forbidden_zero_bit = 0, nal_ref_idc = 0 (an SEI is never a reference picture), nal_unit_type = 6.
 		get nalHeader() { return [AvcNalUnitType.SEI]; },
 		isSeiNalUnit: firstByte => extractNalUnitTypeForAvc(firstByte) === AvcNalUnitType.SEI,
-		// AVC VCL NAL unit types are 1..5; the parameter sets, AUD and SEI that may precede them are all above.
 		isVcl: (firstByte) => {
 			const type = extractNalUnitTypeForAvc(firstByte);
 			return type >= AvcNalUnitType.NON_IDR_SLICE && type <= AvcNalUnitType.IDR;
@@ -73,13 +71,11 @@ export const SEI_FRAMINGS: Record<SeiCodec, SeiFraming> = {
 		concatNalUnits: (nalUnits, decoderConfig) => concatAvcNalUnits(nalUnits, decoderConfig),
 	},
 	hevc: {
-		// nuh_layer_id = 0, nuh_temporal_id_plus1 = 1
 		get nalHeader() { return [HevcNalUnitType.PREFIX_SEI_NUT << 1, 1]; },
 		isSeiNalUnit: (firstByte) => {
 			const type = extractNalUnitTypeForHevc(firstByte);
 			return type === HevcNalUnitType.PREFIX_SEI_NUT || type === HevcNalUnitType.SUFFIX_SEI_NUT;
 		},
-		// HEVC VCL NAL unit types are 0..31; everything at or above VPS_NUT precedes them in an access unit.
 		isVcl: firstByte => extractNalUnitTypeForHevc(firstByte) < HevcNalUnitType.VPS_NUT,
 		iterateNalUnits: (packetData, decoderConfig) => iterateHevcNalUnits(packetData, decoderConfig),
 		concatNalUnits: (nalUnits, decoderConfig) => concatHevcNalUnits(nalUnits, decoderConfig),
@@ -165,6 +161,54 @@ export const buildSeiNalUnit = (messages: SeiMessage[], codec: SeiCodec): Uint8A
 };
 
 /**
+ * Rewrites the SEI messages of an access unit, leaving every other NAL unit as it came.
+ *
+ * `transform` is called for each message and returns a replacement, or the message itself to leave it
+ * be. A rewritten SEI NAL unit is rebuilt whole, so its message sizes and escaping come out right. The
+ * return says whether anything changed, because a caller that has to ADD a message needs to know that
+ * nothing took its edit.
+ *
+ * @internal
+ */
+export const rewriteSeiMessages = (
+	packetData: Uint8Array,
+	decoderConfig: VideoDecoderConfig,
+	codec: SeiCodec,
+	transform: (message: SeiMessage) => SeiMessage,
+): { data: Uint8Array; changed: boolean } => {
+	const framing = SEI_FRAMINGS[codec];
+	const nalUnits: Uint8Array[] = [];
+	let changed = false;
+
+	for (const location of framing.iterateNalUnits(packetData, decoderConfig)) {
+		const nalUnit = packetData.subarray(location.offset, location.offset + location.length);
+
+		if (!framing.isSeiNalUnit(nalUnit[0]!)) {
+			nalUnits.push(nalUnit);
+			continue;
+		}
+
+		const messages: SeiMessage[] = [];
+		let nalChanged = false;
+		for (const message of iterateSeiMessages(nalUnit, codec)) {
+			const replacement = transform(message);
+			nalChanged ||= replacement !== message;
+			messages.push(replacement);
+		}
+
+		const rebuilt = nalChanged ? buildSeiNalUnit(messages, codec) : null;
+		nalUnits.push(rebuilt ?? nalUnit);
+		changed ||= nalChanged;
+	}
+
+	if (!changed) {
+		return { data: packetData, changed: false };
+	}
+
+	return { data: framing.concatNalUnits(nalUnits, decoderConfig), changed: true };
+};
+
+/**
  * Splice a NAL unit into one access unit, ahead of its first VCL NAL unit so that it follows any
  * in-band parameter sets — where both an SEI message and a Dolby Vision RPU belong. Every other NAL
  * unit is copied verbatim, in the framing it came in.
@@ -196,6 +240,47 @@ export const spliceNalUnitBeforeVcl = (
 	}
 
 	nalUnits.splice(firstVclIndex, 0, nalUnit);
+
+	return framing.concatNalUnits(nalUnits, decoderConfig);
+};
+
+/**
+ * Splice a NAL unit into one access unit AFTER its last VCL NAL unit, which is where a Dolby Vision
+ * RPU belongs.
+ *
+ * Not interchangeable with {@link spliceNalUnitBeforeVcl}: an RPU placed ahead of the slices is read
+ * as belonging to the PREVIOUS picture, because a parser ends an access unit at the next picture's
+ * first slice and everything before that falls to the one before. Dolby's own streams put it last -
+ * `39/20/62` on a key frame and `1/62` after - and `dovi_tool extract-rpu` discards an RPU it finds
+ * anywhere else, so per-frame metadata lands a frame early and the last frame's is dropped entirely.
+ *
+ * @internal
+ */
+export const spliceNalUnitAfterVcl = (
+	packetData: Uint8Array,
+	decoderConfig: VideoDecoderConfig,
+	codec: SeiCodec,
+	nalUnit: Uint8Array,
+): Uint8Array => {
+	const framing = SEI_FRAMINGS[codec];
+	const nalUnits: Uint8Array[] = [];
+	let lastVclIndex = -1;
+
+	for (const location of framing.iterateNalUnits(packetData, decoderConfig)) {
+		const unit = packetData.subarray(location.offset, location.offset + location.length);
+
+		if (framing.isVcl(unit[0]!)) {
+			lastVclIndex = nalUnits.length;
+		}
+
+		nalUnits.push(unit);
+	}
+
+	if (lastVclIndex === -1) {
+		throw new Error(`Expected a VCL NAL unit in the ${codec.toUpperCase()} access unit, found none.`);
+	}
+
+	nalUnits.splice(lastVclIndex + 1, 0, nalUnit);
 
 	return framing.concatNalUnits(nalUnits, decoderConfig);
 };

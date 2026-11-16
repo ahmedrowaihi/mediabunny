@@ -494,7 +494,6 @@ const walkTfdts = (slice: FileSlice, visit: (view: DataView, contentStart: numbe
 	return false;
 };
 
-// baseMediaDecodeTime sits after the tfdt version (1) + flags (3); it's u32 (v0) or u64 (v1).
 const readBaseMediaDecodeTime = (view: DataView, contentStart: number): number =>
 	view.getUint8(contentStart) === 1 ? Number(view.getBigUint64(contentStart + 4)) : view.getUint32(contentStart + 4);
 
@@ -860,8 +859,6 @@ const defaultSampleDurationOf = (view: DataView, contentStart: number, contentEn
  * @public
  */
 export const getSegmentPresentationTime = (segment: Uint8Array, init: Uint8Array): number => {
-	// `getSegmentDecodeTime` reads the first `traf`'s `tfdt`, so the edit to subtract is the one stated
-	// for the track that `traf` names
 	const trackId = getSegmentTrackIds(segment)[0];
 	if (trackId === undefined) {
 		throw new MalformedInputError('This segment carries no fragment, so it has no presentation time.');
@@ -949,8 +946,6 @@ export const getSegmentCompositionOffset = (segment: Uint8Array, init?: Uint8Arr
 				}
 			});
 			if (defaultDuration === 0 && trackId !== 0) {
-				// A whole file carries its own `moov`; a media segment delivered on its own does not, so the
-				// init has to be handed in rather than found by walking backwards out of the buffer.
 				defaultDuration = trexDefaultSampleDuration(view, segment.byteLength, trackId);
 				if (defaultDuration === 0 && initView) {
 					defaultDuration = trexDefaultSampleDuration(initView, initView.byteLength, trackId);
@@ -999,7 +994,6 @@ export const getSegmentCompositionOffset = (segment: Uint8Array, init?: Uint8Arr
 					}
 
 					if (flags & TRUN_SAMPLE_COMPOSITION_OFFSET) {
-						// Version 1 is signed: such a track presents a sample before it decodes it.
 						const offset = version === 1 ? view.getInt32(cursor) : view.getUint32(cursor);
 						const presented = decodeOffset + offset;
 						if (earliest === null || presented < earliest) {
@@ -1056,7 +1050,6 @@ const shiftSidxPresentationTimes = (
 			continue;
 		}
 
-		// version, flags, reference_ID, timescale, then the presentation time
 		const fieldPos = contentStart + 12;
 		const current = version === 0 ? BigInt(view.getUint32(fieldPos)) : view.getBigUint64(fieldPos);
 		const next = current + delta;
@@ -1098,7 +1091,6 @@ export const rebaseSegmentDecodeTime = (segment: Uint8Array, deltaTicks: number)
 
 	const out = copyOf(segment); // always a distinct, caller-owned buffer
 	if (deltaTicks !== 0) {
-		// One tick delta suits one timescale, and the timescales live in the init, not here
 		const trackIds = new Set(getSegmentTrackIds(out));
 		if (trackIds.size > 1) {
 			throw new InvalidUsageError(
@@ -1259,7 +1251,6 @@ export const renumberFragments = (
 
 		for (const box of childBoxes(out, moof)) {
 			if (box.type === 'mfhd') {
-				// mfhd is a full box: sequence_number is the first field after version/flags.
 				const fieldPos = box.start + box.headerSize + 4;
 				const next = sequenceNumberFor(index++, view.getUint32(fieldPos));
 				if (!Number.isInteger(next) || next < 0 || next > 0xFFFFFFFF) {
@@ -1434,7 +1425,6 @@ export const segmentsOf = (bytes: Uint8Array): IsobmffFileLayout => {
 	const firstMoof = boxes.findIndex(box => box.type === 'moof');
 
 	if (firstMoof === -1) {
-		// No fragments: the whole thing is an initialization segment, if it is anything.
 		return {
 			init: bytes.length > 0 ? { offset: 0, size: bytes.length } : null,
 			segments: [],
@@ -1442,7 +1432,6 @@ export const segmentsOf = (bytes: Uint8Array): IsobmffFileLayout => {
 		};
 	}
 
-	// The first segment opens at the run of prelude boxes immediately before that moof, not at the moof itself.
 	let firstSegmentBox = firstMoof;
 	while (firstSegmentBox > 0 && SEGMENT_PRELUDE.has(boxes[firstSegmentBox - 1]!.type)) {
 		firstSegmentBox--;
@@ -1451,8 +1440,6 @@ export const segmentsOf = (bytes: Uint8Array): IsobmffFileLayout => {
 	const mediaStart = boxes[firstSegmentBox]!.start;
 	const init = mediaStart > 0 ? { offset: 0, size: mediaStart } : null;
 
-	// chunksOf tiles what it is given, so a trailing `mfra` would land in the last chunk; it indexes the
-	// file, not that fragment
 	const lastMdat = boxes.filter(box => box.type === 'mdat').at(-1);
 	const mediaEnd = lastMdat === undefined ? bytes.length : lastMdat.start + lastMdat.size;
 	const trailing = mediaEnd < bytes.length
@@ -1467,7 +1454,6 @@ export const segmentsOf = (bytes: Uint8Array): IsobmffFileLayout => {
 	}
 
 	const segments: IsobmffSegmentInfo[] = [];
-	// Passing the init along gives chunksOf the trex defaults it needs for duration and independence.
 	for (const relative of chunksOf(media, init === null ? undefined : bytes.subarray(0, init.size))) {
 		const opensSegment = stypStarts.size === 0
 			|| [...stypStarts].some(start => start >= relative.offset && start < relative.offset + relative.size);
@@ -1526,7 +1512,6 @@ export const getSegmentTrackIds = (segment: Uint8Array): number[] => {
 
 			for (const box of childBoxes(segment, traf)) {
 				if (box.type === 'tfhd') {
-					// tfhd is a full box: track_ID is the first field after version/flags.
 					trackIds.push(view.getUint32(box.start + box.headerSize + 4));
 				}
 			}
@@ -1660,7 +1645,6 @@ const readTrafTiming = (
 
 	const boxes = [...childBoxes(bytes, traf)];
 
-	// tfhd first: it names the track, whose trex defaults stand in for anything the tfhd and trun omit
 	for (const box of boxes) {
 		if (box.type !== 'tfhd') {
 			continue;
@@ -1689,8 +1673,6 @@ const readTrafTiming = (
 		}
 	}
 
-	// A trex writes 0 where it stated nothing — the format has no absent value for these — and a
-	// zeroed sample_flags decodes as "sync, depends on nothing", which would be a confident wrong answer
 	const fromTrex = trackId === null ? undefined : trexDefaults.get(trackId);
 	if (defaultSampleDuration === null && fromTrex?.duration) {
 		defaultSampleDuration = fromTrex.duration;
@@ -1785,8 +1767,6 @@ export const chunksOf = (segment: Uint8Array, init?: Uint8Array): IsobmffChunkIn
 	let moof: IsobmffBoxInfo | null = null;
 
 	for (const box of iterateIsobmffBoxes(segment)) {
-		// A chunk opens at the first box after the previous one: styp opens a segment, and prft and emsg
-		// describe the media that follows them, so they belong to the chunk ahead, not the one behind
 		start ??= box.start;
 
 		if (box.type === 'moof') {
@@ -1818,7 +1798,6 @@ export const chunksOf = (segment: Uint8Array, init?: Uint8Array): IsobmffChunkIn
 		}
 	}
 
-	// Anything trailing the last mdat joins that chunk, so the chunks always tile the whole segment
 	const last = chunks.length > 0 ? chunks[chunks.length - 1]! : null;
 	if (last !== null && start !== null) {
 		last.size = segment.byteLength - last.offset;
@@ -1920,7 +1899,6 @@ const editMediaTimeOf = (
 				: view.getInt32(pos + 4);
 
 			if (mediaTime < 0) {
-				// An empty edit, whose duration is in the movie timescale
 				emptyDuration += movieTimescaleValue
 					? segmentDuration * timescale / movieTimescaleValue
 					: 0;
@@ -1975,7 +1953,6 @@ export const getInitSegmentTracks = (init: Uint8Array): IsobmffTrackInfo[] => {
 						if (mdiaChild.type === 'mdhd') {
 							timescale = readFullBoxU32AfterTimes(init, view, mdiaChild);
 						} else if (mdiaChild.type === 'hdlr') {
-							// hdlr: version/flags, pre_defined, then the four-character handler_type.
 							const at = mdiaChild.start + mdiaChild.headerSize + 8;
 							handler = String.fromCharCode(init[at]!, init[at + 1]!, init[at + 2]!, init[at + 3]!);
 						} else if (mdiaChild.type === 'minf') {
@@ -1989,7 +1966,6 @@ export const getInitSegmentTracks = (init: Uint8Array): IsobmffTrackInfo[] => {
 										continue;
 									}
 
-									// stsd: version/flags and entry_count, then the sample entries themselves.
 									const entries = iterateIsobmffBoxes(
 										init,
 										stblChild.start + stblChild.headerSize + 8,

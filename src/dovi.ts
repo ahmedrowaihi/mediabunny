@@ -207,6 +207,14 @@ export const validateDoviConfig = (config: DoviConfig, prefix: string): void => 
 export const HEVC_DOVI_RPU_NAL_TYPE = 62;
 
 /**
+ * The octet an RPU payload opens with, before its header. It is not part of the header's syntax and
+ * is not covered by the RPU's own checksum.
+ *
+ * @internal
+ */
+export const DOLBY_VISION_RPU_NAL_PREFIX = 0x19;
+
+/**
  * The RPU as a complete HEVC NAL unit, from bytes that may or may not already carry the two-byte NAL
  * header: libavcodec's `AV_FRAME_DATA_DOVI_RPU_BUFFER` and a NAL read straight out of an access unit
  * differ on that, so the header is detected rather than assumed.

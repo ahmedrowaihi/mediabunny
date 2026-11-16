@@ -6,13 +6,15 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-// The RTP wire format, shared by the RIST receiver and the rtp:// network source. Reading only: the
-// RTCP that RIST writes is built in rist-source.ts, where its NACK state lives.
-
 /** @internal */
 export const RTP_VERSION = 2;
 /** @internal */
 export const RTP_HEADER_SIZE = 12;
+/** MP2T, the payload type RFC 3551 assigns an MPEG-TS stream. @internal */
+export const RTP_PAYLOAD_TYPE_MP2T = 33;
+
+const TS_PACKET_SIZE = 188;
+const TS_SYNC_BYTE = 0x47;
 
 /** Signed 16-bit distance, so a comparison still holds across the 65535 to 0 wrap. @internal */
 export const seqDistance = (a: number, b: number) => (((a - b) & 0xffff) ^ 0x8000) - 0x8000;
@@ -49,6 +51,42 @@ export const parseRtp = (bytes: Uint8Array): RtpPacket | null => {
 		ssrc: (bytes[8]! << 24 | bytes[9]! << 16 | bytes[10]! << 8 | bytes[11]!) >>> 0,
 		payload: bytes.subarray(start, end),
 	};
+};
+
+/**
+ * The PCR of the last MPEG-TS packet in `payload` that carries one, in 90 kHz ticks.
+ *
+ * The program clock reference is what states a transport stream's own rate, so it is what a sender
+ * paces to (RFC 2250). It rides the adaptation field, which only some packets have, so a null here
+ * means this datagram said nothing about time — not that the stream has no rate.
+ *
+ * @internal
+ */
+export const pcrOf = (payload: Uint8Array): number | null => {
+	let found: number | null = null;
+
+	for (let at = 0; at + TS_PACKET_SIZE <= payload.byteLength; at += TS_PACKET_SIZE) {
+		if (payload[at] !== TS_SYNC_BYTE) {
+			return found;
+		}
+		const control = (payload[at + 3]! >> 4) & 0x3;
+		if (control !== 2 && control !== 3) {
+			continue;
+		}
+		const fieldLength = payload[at + 4]!;
+		if (fieldLength < 7 || !(payload[at + 5]! & 0x10)) {
+			continue; // No PCR_flag, so no program_clock_reference_base to read
+		}
+
+		// 33-bit base at 90 kHz, then 6 reserved bits and a 9-bit 27 MHz extension this does not need
+		found = payload[at + 6]! * 2 ** 25
+			+ payload[at + 7]! * 2 ** 17
+			+ payload[at + 8]! * 2 ** 9
+			+ payload[at + 9]! * 2
+			+ ((payload[at + 10]! >> 7) & 0x1);
+	}
+
+	return found;
 };
 
 /**
@@ -103,7 +141,6 @@ export class RtpDepacketizer {
 
 		this.expected ??= packet.seq;
 
-		// Behind the stream: either a duplicate, or a straggler from a gap already written off
 		if (seqDistance(packet.seq, this.expected) < 0 || this.buffered.has(packet.seq)) {
 			return [];
 		}
@@ -124,7 +161,6 @@ export class RtpDepacketizer {
 				return ready;
 			}
 
-			// Give up on the missing one and resume at the lowest sequence number actually held
 			let lowest: number | null = null;
 			for (const seq of this.buffered.keys()) {
 				if (lowest === null || seqDistance(seq, lowest) < 0) {

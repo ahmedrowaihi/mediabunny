@@ -155,12 +155,10 @@ export const getCodecs = (mediaInfo: MediaInfo): string => {
 		let codec = mediaInfo.videoInfo.codec ?? '';
 		if (mediaInfo.containerType === 'webm') {
 			const fourcc = codec.slice(0, 4);
-			// Only `vp08` → `vp8`, as shaka's `use_legacy_vp9_codec_string` default leaves `vp09` alone
 			if (fourcc === 'vp08') {
 				codec = 'vp8';
 			}
 		}
-		// A multiplexed Representation lists every codec it carries, video first.
 		return mediaInfo.audioInfo ? `${codec},${mediaInfo.audioInfo.codec ?? ''}` : codec;
 	}
 
@@ -246,8 +244,6 @@ export const getAdaptationSetKey = (mediaInfo: MediaInfo, ignoreCodec: boolean):
 	let key = '';
 
 	if (isMultiplexed(mediaInfo)) {
-		// A multiplexed Representation must not share an AdaptationSet with a video-only one: a
-		// player switching between them inside the set would lose the audio track mid-stream.
 		key += `video+audio:${getBaseCodec({ ...mediaInfo, videoInfo: undefined })}:`;
 	} else if (mediaInfo.videoInfo) {
 		key += 'video:';
@@ -255,8 +251,6 @@ export const getAdaptationSetKey = (mediaInfo: MediaInfo, ignoreCodec: boolean):
 		key += 'audio:';
 	} else if (mediaInfo.textInfo) {
 		key += `${textTypeName(mediaInfo.textInfo.type ?? 'unknown')}:`;
-		// A forced narrative track must not share an AdaptationSet with an ordinary subtitle of its language;
-		// appended only when set, so an ordinary track's key still matches shaka's
 		if (mediaInfo.textInfo.forced) {
 			key += 'forced:';
 		}
@@ -276,8 +270,6 @@ export const getAdaptationSetKey = (mediaInfo: MediaInfo, ignoreCodec: boolean):
 
 		const baseCodec = getBaseCodec(mediaInfo);
 		if (baseCodec.startsWith('dvh')) {
-			// Dolby Vision (dvh1 / dvhe) is always PQ regardless of any
-			// transfer_characteristics value reported in SPS VUI.
 			key += `:${TRANSFER_FUNCTION_PQ}`;
 		} else if (mediaInfo.videoInfo?.transferCharacteristics !== undefined) {
 			key += `:${mediaInfo.videoInfo.transferCharacteristics}`;
@@ -287,8 +279,6 @@ export const getAdaptationSetKey = (mediaInfo: MediaInfo, ignoreCodec: boolean):
 	key += ':';
 	key += getLanguage(mediaInfo);
 
-	// Trick-play streams of the same source belong to the same AdaptationSet
-	// regardless of their playback rate.
 	if (mediaInfo.videoInfo?.playbackRate !== undefined) {
 		key += ':trick_play';
 	}
@@ -346,8 +336,6 @@ export const floatToXmlString = (number: number): string => {
  * @public
  */
 export const secondsToXmlDuration = (seconds: number): string => {
-	// The sign belongs to the whole duration, not the seconds component: xs:duration is
-	// `-PT5S`, never `PT-5S`, and a parser reading the latter rejects it.
 	return seconds < 0 ? `-PT${floatToXmlString(-seconds)}S` : `PT${floatToXmlString(seconds)}S`;
 };
 
@@ -453,7 +441,6 @@ export const updateContentProtectionPsshHelper = (
 		for (let i = 0; i < protection.subelements.length; i++) {
 			const subelement = protection.subelements[i]!;
 			if (subelement.name === PSSH_ELEMENT_NAME) {
-				// Removed rather than updated, as shaka does, since some players cannot take an updated PSSH
 				protection.subelements.splice(i, 1);
 				return;
 			}
@@ -463,7 +450,6 @@ export const updateContentProtectionPsshHelper = (
 		return;
 	}
 
-	// No ContentProtection for this DRM yet — append an empty descriptor.
 	const newProtection: ContentProtectionElement = {
 		value: '',
 		schemeIdUri: drmUuidSchemeIdUriForm,
@@ -575,7 +561,6 @@ export const parsePsshBoxData = (pssh: Uint8Array): Uint8Array | null => {
 	}
 	const view = new DataView(pssh.buffer, pssh.byteOffset, pssh.byteLength);
 	let offset = 0;
-	// Box header
 	const size = view.getUint32(offset, false);
 	offset += 4;
 	const boxType = view.getUint32(offset, false);
@@ -709,7 +694,6 @@ export const addContentProtectionElements = (
 		}
 
 		if (entry.uuid === DRM_UUIDS.FAIRPLAY) {
-			// shaka skips FairPlay since it does not support DASH signaling.
 			continue;
 		}
 

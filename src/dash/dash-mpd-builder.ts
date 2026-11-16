@@ -318,7 +318,6 @@ export class MpdBuilder {
 		let outputPeriodDuration = false;
 		if (this.mpdOptions.mpdType === 'static') {
 			this.updatePeriodDurationAndPresentationTimestamp();
-			// Redundant for a single period, where it equals MPD@mediaPresentationDuration
 			outputPeriodDuration = this.periods.length > 1;
 		}
 
@@ -428,7 +427,6 @@ export class MpdBuilder {
 
 	/** @internal */
 	private getStaticMpdDuration(): number {
-		// `Math.fround` mirrors shaka accumulating period durations in a C++ float32
 		let total = 0;
 		for (const period of this.periods) {
 			total = Math.fround(total + period.durationSeconds());

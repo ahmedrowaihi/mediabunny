@@ -6,7 +6,6 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-// Type-only, so it is erased at build time and forms no runtime cycle with the parser.
 import { parseIsoDateTimeAsUtc } from '../iso-date';
 import { MalformedInputError, UnsupportedMediaError } from '../errors';
 import {
@@ -29,6 +28,11 @@ export const DASH_NS = {
 	scte214: 'urn:scte:dash:scte214-extensions',
 	scte35: 'urn:scte:scte35:2014:xml+bin',
 	dashif: 'https://dashif.org/',
+	// ETSI TS 103 285. Not `urn:dvb:dash:dash-extensions:2014`, which is what this said and which no
+	// DVB receiver resolves: every real manifest declaring the DVB extensions - the BBC R&D test
+	// streams, the DASH-IF conformance corpus - uses this exact string, with no `dash:` segment and
+	// with the `-1` part number.
+	dvb: 'urn:dvb:dash-extensions:2014-1',
 	xsi: 'http://www.w3.org/2001/XMLSchema-instance',
 } as const;
 
@@ -89,15 +93,11 @@ export const parseISODuration = (value: string | null | undefined): number | nul
 	if (!value) {
 		return null;
 	}
-	// xs:duration allows a fraction on the smallest stated component only, which in an MPD is always
-	// the seconds; `PT1.5M` is not a legal duration and must not be read as 90 s.
 	const int = '(\\d+)';
 	const dec = '(\\d+(?:\\.\\d+)?)';
 	const re = new RegExp(`^(-?)P(?:${int}D)?(?:T(?:${int}H)?(?:${int}M)?(?:${dec}S)?)?$`);
 	const match = re.exec(value.trim());
 	if (!match) {
-		// Years and months are legal xs:duration with no fixed length, so they cannot become a timeline;
-		// thrown rather than null, which would read as an absent attribute
 		throw new MalformedInputError(`Not a duration this library can read: ${JSON.stringify(value)}.`);
 	}
 	const [, sign, daysStr, hoursStr, minutesStr, secondsStr] = match;
@@ -134,7 +134,6 @@ export const parseISODateTime = (value: string | null | undefined): number | nul
 		return time;
 	}
 
-	// Doubles hold ~0.00024 ms near present-day epochs, so microseconds survive and nanoseconds would not.
 	const extraDigits = fraction[1]!.slice(3, 6);
 	return time + Number(extraDigits) / 10 ** extraDigits.length;
 };
@@ -251,7 +250,6 @@ export type SegmentTemplateValues = {
 };
 
 const formatIdentifier = (value: string | number, formatTag: string): string => {
-	// Shaped like '%01d', '%05d', '%d' or '%u'; DASH treats the two conversions alike.
 	const match = /^%0?(\d*)[du]$/.exec(formatTag);
 	if (!match) {
 		throw new UnsupportedMediaError(`Unsupported format tag in segment template: "${formatTag}"`);

@@ -451,12 +451,21 @@ export const mpdPeriod = (options: {
 	subsets?: MpdPeriod['subsets'];
 	/** `<GroupLabel>` children. */
 	groupLabels?: MpdPeriod['groupLabels'];
+	/** Period-level `<SupplementalProperty>` descriptors. */
+	supplementalProperties?: MpdPeriod['supplementalProperties'];
+	/** Period-level `<EssentialProperty>` descriptors. */
+	essentialProperties?: MpdPeriod['essentialProperties'];
+	/** Period-level `<ContentProtection>` descriptors, which a set's `@ref` can point at. */
+	contentProtections?: MpdPeriod['contentProtections'];
 	/** `<Preselection>` children. */
 	preselections?: MpdPeriod['preselections'];
 	/** `<EmptyAdaptationSet>` children. */
 	emptyAdaptationSets?: MpdPeriod['emptyAdaptationSets'];
 }): MpdPeriod => ({
 	id: options.id ?? null,
+	supplementalProperties: options.supplementalProperties ?? [],
+	essentialProperties: options.essentialProperties ?? [],
+	contentProtections: options.contentProtections ?? [],
 	start: options.start ?? null,
 	duration: options.duration ?? null,
 	adaptationSets: options.adaptationSets,
@@ -527,10 +536,11 @@ export const mpd = (options: {
 	 * edge to starve. Omitted when absent.
 	 */
 	suggestedPresentationDelay?: number;
+	/** MPD-level `<ContentProtection>` descriptors, which a Period's or set's `@ref` can point at. */
+	contentProtections?: Mpd['contentProtections'];
 }): Mpd => ({
 	type: options.type,
-	// The on-demand profile permits SegmentBase addressing only, so stating it over a presentation
-	// addressed by SegmentTemplate or SegmentList describes something the MPD is not.
+	contentProtections: options.contentProtections ?? [],
 	profiles: options.profiles ?? [
 		options.type === 'static' && usesOnlySegmentBase(options.periods)
 			? 'urn:mpeg:dash:profile:isoff-on-demand:2011'

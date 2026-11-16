@@ -1,7 +1,8 @@
 import { expect, test } from 'vitest';
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
-import { CustomSource, FilePathSource, Source } from '../../src/source.js';
+import { CustomSource, FilePathSource, Source, UrlSource } from '../../src/source.js';
+import { Logging } from '../../src/logging.js';
 import { Reader } from '../../src/reader.js';
 import { InputDisposedError } from '../../src/input.js';
 
@@ -152,4 +153,54 @@ test('a source smaller than the first read chunk reads whole, and out-of-range r
 	expect(await source.readRange(200, 400)).toBe(null);
 
 	ref.free();
+});
+
+// A read that quietly retries for a minute is usually worth telling the developer about, so the
+// logging is on by default. Against an origin expected to flap it is a minute of noise per outage,
+// which is what `quietRetries` is for.
+test('quietRetries silences the per-failure log without changing the retrying', async () => {
+	const run = async (quietRetries: boolean) => {
+		const logged: string[] = [];
+		const stopListening = Logging.on('error', args => void logged.push(args.map(String).join(' ')));
+
+		let attempts = 0;
+		const fetchFn = (async () => {
+			attempts++;
+			if (attempts < 3) {
+				throw new Error('origin is down');
+			}
+			return new Response(new Uint8Array([1, 2, 3, 4]), {
+				status: 200,
+				headers: { 'content-length': '4', 'accept-ranges': 'bytes' },
+			});
+		}) as unknown as typeof fetch;
+
+		try {
+			const source = new UrlSource('https://example.invalid/a.bin', {
+				fetchFn,
+				getRetryDelay: () => 0,
+				quietRetries,
+			});
+			const bytes = await source.readRange(0, 4);
+			return { logged, attempts, bytes };
+		} finally {
+			stopListening();
+		}
+	};
+
+	const loud = await run(false);
+	const quiet = await run(true);
+
+	// Same work either way: it retried the same number of times and got the same bytes
+	expect(quiet.attempts).toBe(loud.attempts);
+	expect(loud.attempts).toBeGreaterThan(1);
+	expect(Array.from(quiet.bytes!)).toEqual(Array.from(loud.bytes!));
+
+	// Only the logging differs
+	expect(loud.logged.some(line => line.includes('Retrying failed fetch'))).toBe(true);
+	expect(quiet.logged.some(line => line.includes('Retrying failed fetch'))).toBe(false);
+
+	expect(() => new UrlSource('https://example.invalid/a.bin', {
+		quietRetries: 'yes' as unknown as boolean,
+	})).toThrow(TypeError);
 });

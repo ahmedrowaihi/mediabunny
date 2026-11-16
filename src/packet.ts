@@ -34,6 +34,18 @@ export type EncodedPacketSideData = {
 	 * `alpha` field contains no bytes.
 	 */
 	alphaByteLength?: number;
+	/**
+	 * Where this packet's own {@link EncodedPacket.timestamp} sits on the timeline its **payload** is
+	 * stated against, in seconds, for a payload that carries times of its own.
+	 *
+	 * Only present where the two differ. A self-timed payload - an IMSC document, which states each
+	 * cue's time inside itself - is normally read whole and placed by its packet's timestamp. A
+	 * composition that cuts such a payload breaks that: the packet is placed where the **cut** begins
+	 * while the times inside it still belong to the **source**, and a reader parsing the payload has
+	 * nothing to relate the two by. This states it: add a time read out of the payload to
+	 * `timestamp - sourceTimestamp` to put it on the same timeline as the packet.
+	 */
+	sourceTimestamp?: number;
 };
 
 /**
@@ -298,8 +310,6 @@ export class EncodedPacket {
 			throw new TypeError('options.sideData, when provided, must be an object.');
 		}
 
-		// Re-timing a packet moves when it is decoded by the same amount: the gap between the two is
-		// the reorder delay, and a muxer that must write both reads it from here.
 		const timestamp = options?.timestamp ?? this.timestamp;
 		const decodeTimestamp = options?.decodeTimestamp
 			?? (this.statesDecodeTimestamp ? this.decodeTimestamp + (timestamp - this.timestamp) : undefined);

@@ -2658,6 +2658,40 @@ corpusDescribe('pssh boxes in the fragments', () => {
 		});
 	}
 
+	// A player joining mid-stream never sees the init's moov, so DASH-IF IOP v5 Part 6 wants the header
+	// in band too. Opt-in, and applied on both paths so they still produce identical bytes.
+	test('inBandPssh puts the boxes in every moof, and is off by default', () => {
+		const { original } = load();
+		const { init, segment } = splitInitAndSegment(original);
+		const base = { key: AUDIO_KEY, kid: AUDIO_KID, iv: IV, pssh: [WIDEVINE[0]!] };
+
+		const off = encryptCmafSegment(encryptCmafInit(init, base), segment, { ...base, ivState: new Map() });
+		for (const moof of moofsOf(off)) {
+			expect(psshIn(moof)).toHaveLength(0);
+		}
+
+		const opts = { ...base, inBandPssh: true };
+		const on = encryptCmafSegment(encryptCmafInit(init, opts), segment, { ...opts, ivState: new Map() });
+		const moofs = moofsOf(on);
+		expect(moofs.length).toBeGreaterThan(0);
+		for (const moof of moofs) {
+			const written = psshIn(moof).map(box => bytesToHexString(serializeBoxes([box])));
+			expect(written).toEqual([bytesToHexString(WIDEVINE[0]!)]);
+		}
+	});
+
+	test('inBandPssh keeps the whole-file and split paths byte-identical', () => {
+		const { original } = load();
+		const { init, media } = splitInitAndMedia(original);
+		const opts = { key: AUDIO_KEY, kid: AUDIO_KID, iv: IV, pssh: [WIDEVINE[0]!], inBandPssh: true };
+
+		const split = concat(
+			encryptCmafInit(init, opts),
+			encryptCmafSegment(init, media, { ...opts, ivState: new Map() }),
+		);
+		expect([...split]).toEqual([...encryptCmaf(original, opts)]);
+	});
+
 	test('a fragment that rotates mid-way carries both periods\' boxes', () => {
 		const { original, videoId } = load();
 		const encrypted = encryptCmaf(original, {

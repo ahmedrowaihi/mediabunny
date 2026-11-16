@@ -122,17 +122,33 @@ export { NetworkSource } from './network-source';
 export type { NetworkSourceOptions } from './network-source';
 export { RtmpSource } from './rtmp-source';
 export type { RtmpSourceOptions } from './rtmp-source';
+export { SrtBondedTarget, type SrtBondedTargetOptions, type SrtLinkState } from './srt-bonded-target';
+export { SrtBondedSource, type SrtBondedSourceOptions, type SrtCallerInfo } from './srt-bonded-source';
+export { type SrtMemberState } from './libsrt';
 export { DEFAULT_RIST_BUFFER_MS, RistSource } from './rist-source';
 export { RistTarget } from './rist-target';
 export type { RistTargetOptions } from './rist-target';
 export { RtmpTarget } from './rtmp-target';
 export type { RtmpTargetOptions } from './rtmp-target';
+export type { AmfValue } from './amf';
 export { MxfTarget } from './mxf-target';
 export type { MxfTargetOptions } from './mxf-target';
 export { SrtTarget } from './srt-target';
 export type { SrtTargetOptions } from './srt-target';
 export { buildSdp, frameSizeOf, lineSizeOf, PGROUPS, St2110Packetizer, St2110VideoSender } from './st2110';
+export { DEFAULT_TAI_OFFSET_SECONDS, rtpTimestampAt } from './st2110-clock';
+export type { St2110ClockOptions } from './st2110-clock';
 export { buildAncSdp, St2110AncPacketizer, St2110AncSender } from './st2110-anc';
+export {
+	packPgroups,
+	parseSt2110Packet,
+	parseSt2110Sdp,
+	samplesInPgroups,
+	St2110Depacketizer,
+	St2110Source,
+	unpackPgroups,
+} from './st2110-receive';
+export type { St2110Frame, St2110Packet, St2110Srd } from './st2110-receive';
 export type {
 	St2110AncData,
 	St2110AncField,

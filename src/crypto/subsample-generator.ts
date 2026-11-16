@@ -200,7 +200,6 @@ export class SubsampleGenerator {
 	private minProtectedDataSize = 0;
 	/** @internal */
 	private headerParser: VideoSliceHeaderParser | null = null;
-	// VP9/AV1 carry reference state across frames, so one stateful parser is reused for the whole track.
 	/** @internal */
 	private vp9Parser: Vp9FrameParser | null = null;
 	/** @internal */
@@ -263,7 +262,6 @@ export class SubsampleGenerator {
 				break;
 			}
 			case 'vp9': {
-				// VP9 is subsample-encrypted only when requested; otherwise full-sample (no subsamples).
 				if (this.vp9SubsampleEncryption) {
 					this.generateFromVp9Frame(frame, subsamples);
 				}
@@ -281,7 +279,6 @@ export class SubsampleGenerator {
 					organizer.addSubsample(clearBytes, frame.length - clearBytes);
 					organizer.finalize();
 				}
-				// Otherwise: full sample encrypted, no subsamples.
 				break;
 			}
 		}
@@ -313,7 +310,6 @@ export class SubsampleGenerator {
 			} else if (nalu.isVideoSlice && naluTotalSize >= this.minProtectedDataSize) {
 				clearBytes = this.leadingClearBytesSize;
 				if (clearBytes === 0) {
-					// Keep the NAL header + slice header clear; encrypt the slice data.
 					const sliceHeaderSize = this.headerParser!.getHeaderSize(nalu);
 					if (sliceHeaderSize < 0) {
 						throw new MalformedInputError('Failed to read slice header.');
@@ -321,7 +317,6 @@ export class SubsampleGenerator {
 					clearBytes = nalu.headerSize + sliceHeaderSize;
 				}
 			} else {
-				// Non-video-slice or too-small NAL: fully clear.
 				clearBytes = naluTotalSize;
 			}
 			organizer.addSubsample(this.naluLengthSize + clearBytes, naluTotalSize - clearBytes);
@@ -362,7 +357,6 @@ export class SubsampleGenerator {
 			organizer.addSubsample(uncompressedHeaderSize, frameSize - uncompressedHeaderSize);
 			totalSize += frameSize;
 		}
-		// A superframe carries a trailing index (clear) after the last frame.
 		if (vpxFrames.length > 1) {
 			organizer.addSubsample(frame.length - totalSize, 0);
 		}
@@ -372,7 +366,6 @@ export class SubsampleGenerator {
 	/** @internal */
 	private generateFromAc4Frame(frame: Uint8Array, subsamples: SubsampleEntry[]): void {
 		const organizer = new SubsampleOrganizer(this.alignProtectedData, subsamples);
-		// A failed TOC parse leaves toc_size 0 → the whole frame is encrypted (shaka's fallback).
 		const tocSizeBits = parseAc4TocSizeBits(frame) ?? 0;
 		// shaka rounds the TOC bit count up to the next multiple of 8 and treats it as clear bytes.
 		const clearBytes = Math.min(frame.length, Math.floor((tocSizeBits + 7) / 8) * 8);

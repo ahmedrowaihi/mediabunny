@@ -480,7 +480,6 @@ export class OggMuxer extends Muxer {
 			let trackWithMinTimestamp: OggTrackData | null = null;
 			let minTimestamp = Infinity;
 
-			// Asked at most once per pass, and only once a track is found starved: this runs per packet.
 			let quietSkippable: boolean | null = null;
 
 			for (const trackData of this.trackDatas) {
@@ -498,7 +497,6 @@ export class OggMuxer extends Muxer {
 						break outer;
 					}
 
-					// Its queued packet may still turn out not to be the last one, so leave it queued
 					continue;
 				}
 

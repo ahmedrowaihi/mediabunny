@@ -6,6 +6,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
+import { AncillaryFrame } from './ancillary';
 import { Input } from './input';
 import { InputTrackBacking } from './input-track';
 import { PsshBox, SidxBox } from './isobmff/isobmff-misc';
@@ -48,6 +49,14 @@ export abstract class Demuxer {
 	 * formats and for clear isobmff files.
 	 */
 	async getPsshBoxes(): Promise<PsshBox[]> {
+		return [];
+	}
+
+	/**
+	 * Ancillary data essence (SMPTE ST 436M), which an MXF broadcast master carries beside its picture and
+	 * sound. There is no track type for it, so its frames are read whole rather than through a sink.
+	 */
+	async getAncillaryFrames(): Promise<AncillaryFrame[]> {
 		return [];
 	}
 

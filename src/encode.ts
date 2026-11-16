@@ -30,6 +30,8 @@ import {
 import { customAudioEncoders, customVideoEncoders } from './custom-coder';
 import { type HdrStaticMetadata } from './hdr-metadata';
 import {
+	MaybePromise,
+	Rotation,
 	assert,
 	clamp,
 	getChromiumVersion,
@@ -37,8 +39,7 @@ import {
 	isNumber,
 	isRecordStringString,
 	lerp,
-	MaybePromise,
-	Rotation,
+	type WideVideoColorSpaceInit,
 } from './misc';
 import { EncodedPacket } from './packet';
 import { AudioSample, CropRectangle, validateCropRectangle, VideoSample, VideoSampleResource } from './sample';
@@ -96,8 +97,6 @@ export type VideoEncodingConfig = {
 	/** Called right before a sample is passed to the encoder. */
 	onEncodedSample?: (sample: VideoSample) => unknown;
 
-	// A config alone cannot say whether these were demanded or inherited, and only what was inherited may
-	// be dropped where the samples reaching the encoder do not back it
 	/** @internal */
 	_bitDepthIsInherited?: boolean;
 	/** @internal */
@@ -200,6 +199,95 @@ export type VideoEncoderControls = {
 		/** Where the first pass writes its statistics and the second reads them; the caller's file to keep. */
 		statsPath: string;
 	};
+	/**
+	 * The VC-3 class or DNxHR profile to encode, for `dnxhd` tracks. Any other codec refuses it.
+	 *
+	 * **VC-3 classes** (`'145'`, `'220'`, `'220x'`) are resolution- and rate-locked: each is a fixed
+	 * **frame size** at 1920x1080, which is what a VC-3 deliverable means — 606,208 octets a frame for
+	 * 145 and 917,504 for both 220s, whatever the frame rate. The bitrate follows from the class and
+	 * the rate (145 at 29.97 is the same frame size as 120 at 25), so it is derived rather than asked
+	 * for. `'220x'` is the 10-bit one.
+	 *
+	 * **DNxHR profiles** (`'lb'`, `'sq'`, `'hq'`, `'hqx'`, `'444'`) take any resolution. `'hqx'` and
+	 * `'444'` are 10-bit; `'444'` is the only 4:4:4 one.
+	 *
+	 * An interlaced VC-3 encode needs {@link VideoEncoderControls.interlaced} set as well, since the
+	 * encoder picks an interlaced class from the frames themselves. One combination does not exist at
+	 * all: **`'220x'` progressive at 29.97**, which DNxHD defines no identifier for — interlaced at that
+	 * rate is fine. It is refused by name rather than failing inside the encoder.
+	 */
+	dnxProfile?: '145' | '220' | '220x' | 'lb' | 'sq' | 'hq' | 'hqx' | '444';
+	/**
+	 * Encodes to the D-10 (IMX) constraints at the given rate in Mbit/s, for delivery as MXF D-10 —
+	 * SMPTE 356M. MPEG-2 only; any other codec refuses it.
+	 *
+	 * D-10 is not a bitrate so much as a **frame size**: every coded frame must be exactly
+	 * `rate / fps / 8` octets, padded to fill. An MXF D-10 mapping indexes the essence by that fixed
+	 * unit, so a frame of any other size is refused by the container, which says only that the frame
+	 * size does not match the index unit size — hence a preset rather than nine options for the caller
+	 * to get right.
+	 *
+	 * It sets the rate top and bottom with a 2,000,000-bit VBV filled at the start, which is what makes
+	 * every frame come out at that exact size; intra-only coding; 4:2:2 at 10-bit DC precision;
+	 * non-linear quantisation; intra VLC; and the quantiser range D-10 states. Those last five are
+	 * bitstream constraints rather than size ones, measured separately.
+	 *
+	 * Pair it with `MxfTarget`'s `mapping: 'd10'`.
+	 */
+	d10?: 30 | 40 | 50;
+	/**
+	 * Writes the HRD (hypothetical reference decoder) parameters into the bitstream, so a receiver can
+	 * check the stream against the buffer model it was encoded to. `'cbr'` additionally has the encoder
+	 * pad with filler data so the arrival rate really is constant, which is what a broadcast multiplex
+	 * with a fixed slot expects; `'vbr'` states the model without the padding.
+	 *
+	 * Needs a bitrate cap: the model it signals IS the cap, so state
+	 * {@link QualityCapOptions.maxBitrate} (and optionally
+	 * {@link QualityCapOptions.bufferSize}) on the {@link Quality}. x264 refuses the mode without one.
+	 *
+	 * Without this, a capped encode bounds its own rate but the stream **says nothing about it**: the
+	 * SPS carries no `hrd_parameters`, so nothing downstream can verify conformance or know what buffer
+	 * to allocate. Note the rate is stated with a mantissa and an exponent, so it is quantised - 1.5
+	 * Mbit/s comes back as 1,499,968 bit/s.
+	 *
+	 * **HEVC signals, but does not take the mode.** x265 has only an on/off switch, and derives the
+	 * `cbr_flag` from the rate control rather than from anything stated here, so `'cbr'` and `'vbr'`
+	 * both turn its signalling on and the flag follows the cap. Encoders other than x264 and x265 refuse
+	 * it.
+	 */
+	nalHrd?: 'cbr' | 'vbr';
+	/**
+	 * Declares `pic_struct_present_flag` in the AVC stream's SPS, which is what makes a `pic_timing` SEI
+	 * message readable - and a timecode in an AVC bitstream IS a `pic_timing` message.
+	 *
+	 * Set automatically for a track that states `metadata.timecode`, so there is usually no reason to
+	 * state it. x264 does not write the flag on its own, not even alongside
+	 * {@link VideoEncoderControls.nalHrd}, and without it a timecode written into a transport stream
+	 * could not be read back. HEVC needs none of this: its timecode rides a `time_code` SEI message
+	 * that stands on its own.
+	 */
+	picStruct?: boolean;
+	/**
+	 * Encodes the video as interlaced fields rather than progressive frames, stating which field of each
+	 * pair comes first: `'tff'` for top, `'bff'` for bottom. Left unset, encoding is progressive, which
+	 * is what it has always been.
+	 *
+	 * The field order is the caller's to state and cannot be guessed from the samples: a frame carries two
+	 * interleaved fields with nothing in the pixels to say which was captured first, and getting it wrong
+	 * makes motion stutter back and forth every frame.
+	 *
+	 * **AVC** codes this as x264's interlaced mode, which is MBAFF - macroblock-adaptive field coding -
+	 * rather than PAFF. The stream declares it by `frame_mbs_only_flag` 0 in the SPS and a `pic_timing`
+	 * SEI on every picture whose `pic_struct` names the field order, which is also what makes such a
+	 * stream able to carry a timecode: see {@link VideoTrackMetadata.timecode}.
+	 *
+	 * **HEVC** is accepted but x265 calls its own interlaced support experimental and says so on stderr
+	 * for every encode. The resulting stream reads back as `tb` rather than `tt`, so prefer AVC where the
+	 * output has to interoperate.
+	 *
+	 * Encoders other than x264 and x265 refuse it.
+	 */
+	interlaced?: 'tff' | 'bff';
 	/**
 	 * Options passed straight to the codec context, by the name FFmpeg gives them. The escape hatch for
 	 * anything the fields above do not cover.
@@ -357,6 +445,32 @@ export const validateVideoEncodingConfig = (config: VideoEncodingConfig) => {
 		) {
 			throw new TypeError(
 				'config.encoderControls.maxBFrames, when provided, must be a non-negative integer.',
+			);
+		}
+		if (
+			controls.dnxProfile !== undefined
+			&& !['145', '220', '220x', 'lb', 'sq', 'hq', 'hqx', '444'].includes(controls.dnxProfile)
+		) {
+			throw new TypeError(
+				'config.encoderControls.dnxProfile, when provided, must be a VC-3 class (\'145\', \'220\','
+				+ ' \'220x\') or a DNxHR profile (\'lb\', \'sq\', \'hq\', \'hqx\', \'444\').',
+			);
+		}
+		if (controls.d10 !== undefined && ![30, 40, 50].includes(controls.d10)) {
+			throw new TypeError(
+				'config.encoderControls.d10, when provided, must be 30, 40 or 50 (Mbit/s); SMPTE 356M'
+				+ ' defines no other rate.',
+			);
+		}
+		if (controls.nalHrd !== undefined && !['cbr', 'vbr'].includes(controls.nalHrd)) {
+			throw new TypeError('config.encoderControls.nalHrd, when provided, must be \'cbr\' or \'vbr\'.');
+		}
+		if (controls.picStruct !== undefined && typeof controls.picStruct !== 'boolean') {
+			throw new TypeError('config.encoderControls.picStruct, when provided, must be a boolean.');
+		}
+		if (controls.interlaced !== undefined && !['tff', 'bff'].includes(controls.interlaced)) {
+			throw new TypeError(
+				'config.encoderControls.interlaced, when provided, must be \'tff\' or \'bff\'.',
 			);
 		}
 		if (controls.closedGop !== undefined && typeof controls.closedGop !== 'boolean') {
@@ -528,7 +642,7 @@ export type VideoEncodingAdditionalOptions = {
 	 * The first sample reaching the encoder is checked against this field and a contradiction is rejected, so that
 	 * the output cannot claim a color space its samples don't have.
 	 */
-	colorSpace?: VideoColorSpaceInit;
+	colorSpace?: WideVideoColorSpaceInit;
 	/**
 	 * The HDR10 static metadata (mastering display colour volume and content light level) to signal on the output
 	 * track, written to the container next to the color signalling. It describes how the content was graded, not how
@@ -594,8 +708,6 @@ export const validateVideoEncodingAdditionalOptions = (
 	if (options.hdrStaticMetadata !== undefined) {
 		validateHdrStaticMetadata(options.hdrStaticMetadata, 'hdrStaticMetadata');
 	}
-	// An inherited color is not a claim the caller made, so a depth that cannot carry it drops the transfer
-	// at encode time rather than failing here.
 	if (!options._colorSpaceIsInherited) {
 		validateBitDepthCarriesTransfer(options.bitDepth, options.colorSpace, '');
 	}
@@ -642,9 +754,14 @@ export type VideoRateControl = {
 	bitrate: number;
 	bitrateMode: 'constant' | 'variable' | 'quantizer';
 	cap: { maxBitrate: number; bufferSize: number } | null;
+	/**
+	 * The buffer size the caller stated, whichever route the encode takes. `cap` carries it for a capped
+	 * quantizer; this carries it for a bitrate-based encode, where it is what gives a constant rate a
+	 * buffer model to be constant against.
+	 */
+	bufferSize: number | undefined;
 };
 
-// WebCodecs configs can't carry a cap, so custom encoders receive it in these fields
 export type QualityCappedVideoEncoderConfig = VideoEncoderConfig & {
 	_maxBitrate?: number;
 	_bufferSize?: number;
@@ -721,10 +838,17 @@ export const buildVideoEncoderConfigs = (options: {
 	}
 
 	if (rateControl.bitrateMode !== 'quantizer') {
-		candidates.push({
-			config: buildConfig(rateControl.bitrate, rateControl.bitrateMode, rateControl.bitrate),
-			quantizer: null,
-		});
+		const config: QualityCappedVideoEncoderConfig
+			= buildConfig(rateControl.bitrate, rateControl.bitrateMode, rateControl.bitrate);
+
+		// A bitrate-based encode can want a buffer model too: it is what makes a constant rate really
+		// constant, and what `encoderControls.nalHrd` has to state. Carried only when the caller asked
+		// for one, so an encode that did not state a buffer size comes out exactly as before.
+		if (rateControl.bufferSize !== undefined) {
+			config._bufferSize = rateControl.bufferSize;
+		}
+
+		candidates.push({ config, quantizer: null });
 	}
 
 	assert(candidates.length > 0);
@@ -990,7 +1114,14 @@ export type QualityOptions = (QualitativeQualityOptions | QuantitativeQualityOpt
 export type QualityCapOptions = {
 	/** The peak bitrate in bits per second. */
 	maxBitrate?: number;
-	/** The rate-control (VBV) buffer size in bits; defaults to twice `maxBitrate`. Requires `maxBitrate`. */
+	/**
+	 * The rate-control (VBV) buffer size in bits; defaults to twice `maxBitrate` where a cap is used.
+	 * Requires `maxBitrate` or `bitrate`.
+	 *
+	 * With `bitrate` and `bitrateMode: 'constant'` this is what makes the rate constant over a window
+	 * rather than per frame, and it is the buffer {@link VideoEncoderControls.nalHrd} writes into the
+	 * bitstream.
+	 */
 	bufferSize?: number;
 };
 
@@ -1083,8 +1214,11 @@ export class Quality {
 			}
 		}
 		if (options.bufferSize !== undefined) {
-			if (options.maxBitrate === undefined) {
-				throw new TypeError('options.bufferSize requires options.maxBitrate.');
+			// A buffer size needs a rate to be a buffer OF - either the cap of a capped quantizer, or the
+			// target of a bitrate-based encode, where it is what lets a constant rate even out over a
+			// window rather than per frame.
+			if (options.maxBitrate === undefined && this._bitrate === undefined) {
+				throw new TypeError('options.bufferSize requires options.maxBitrate or options.bitrate.');
 			}
 			if (!Number.isInteger(options.bufferSize) || options.bufferSize <= 0) {
 				throw new TypeError('options.bufferSize, when provided, must be a positive integer.');
@@ -1204,7 +1338,6 @@ export class Quality {
 
 			bitrate = computeVideoBitrate(codec, width, height, qualityToBitrateFactor(quality));
 			if (this._maxBitrate !== undefined) {
-				// A derived bitrate is also the fallback where the cap can't be enforced, so it must respect the cap
 				bitrate = Math.min(bitrate, this._maxBitrate);
 			}
 		}
@@ -1213,7 +1346,7 @@ export class Quality {
 			? { maxBitrate: this._maxBitrate, bufferSize: this._bufferSize ?? 2 * this._maxBitrate }
 			: null;
 
-		return { quantizer, bitrate, bitrateMode, cap };
+		return { quantizer, bitrate, bitrateMode, cap, bufferSize: this._bufferSize };
 	}
 
 	/** @internal */
@@ -1309,11 +1442,10 @@ export const VIDEO_CODEC_QUANTIZER_SUPPORT: Partial<Record<VideoCodec, {
 }>> = {
 	avc: { min: 0, max: 51, worst: 41, best: 16 },
 	hevc: { min: 0, max: 51, worst: 41, best: 16 },
-	// Chromium moved VP9's quantizer to 0-255 in v145 (mediabunny#566); libvpx kept 0-63 and refuses to
-	// open above it, and this fork drives libvpx directly, so an unknown environment gets the narrow scale
-	vp9: (getChromiumVersion() ?? 0) >= 145
-		? { min: 0, max: 255, worst: 208, best: 80 }
-		: { min: 0, max: 63, worst: 52, best: 20 },
+	// Chromium used the 0-63 scale before v145, see https://github.com/Vanilagy/mediabunny/issues/566
+	vp9: (getChromiumVersion() ?? Infinity) < 145
+		? { min: 0, max: 63, worst: 52, best: 20 }
+		: { min: 0, max: 255, worst: 208, best: 80 },
 	av1: { min: 0, max: 255, worst: 208, best: 80 },
 };
 
@@ -1338,11 +1470,17 @@ const computeVideoBitrate = (codec: VideoCodec, width: number, height: number, f
 		vp8: 1.2, // Slightly less efficient than AVC
 		prores: 220_000_000 / referenceBitrate, // Apple ProRes white paper claims 220 Mbps for 1080p 422 HQ @30Hz
 		mpeg2: 2.5, // Roughly 2.5x the bitrate of AVC for comparable quality
+		// A VC-3 class IS a bitrate, so this only ever estimates a track being copied: 220 Mbps is the
+		// 1080p 8-bit class, which is the common deliverable
+		dnxhd: 220_000_000 / referenceBitrate,
 		// Neither has an encoder here, so these are only ever a size estimate for a track being copied.
 		// 8-bit RGBA at 1080p30 is 1.99 Gbps uncompressed; QuickTime RLE barely moves that on camera
 		// content, and PNG's filters and deflate take roughly half.
 		qtrle: 1_990_000_000 / referenceBitrate,
 		png: 995_000_000 / referenceBitrate,
+		// Uncompressed, so the "bitrate" is arithmetic rather than an estimate: 1080p30 4:2:0 8-bit is
+		// 1.5 octets a pixel, which is 747 Mbps
+		rawvideo: 747_000_000 / referenceBitrate,
 	};
 
 	const codecAdjustedBitrate = baseBitrate * codecEfficiencyFactors[codec];

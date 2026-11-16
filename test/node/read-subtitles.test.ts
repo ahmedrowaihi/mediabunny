@@ -170,7 +170,7 @@ test('An ffmpeg-written TTML track is read with the cues ffmpeg put in it', asyn
 	]);
 });
 
-test('The TTML reader refuses documents whose timing it cannot reproduce', () => {
+test('The TTML reader reads every time expression it can, and refuses what it cannot', () => {
 	const document = (paragraph: string, attributes = '') =>
 		`<tt xmlns="http://www.w3.org/ns/ttml" ttp:timeBase="media"${attributes}>`
 		+ `<body><div>${paragraph}</div></body></tt>`;
@@ -178,9 +178,15 @@ test('The TTML reader refuses documents whose timing it cannot reproduce', () =>
 	expect(parseTtmlDocument(document('<p begin="00:00:01.000" end="00:00:02.000">Hi</p>')))
 		.toEqual([{ timestamp: 1, duration: 1, text: 'Hi', identifier: undefined }]);
 
-	expect(() => parseTtmlDocument(document('<p begin="00:00:01:12" end="00:00:02.000">Hi</p>')))
-		.toThrow(/time expression/);
-	expect(() => parseTtmlDocument(document('<p begin="10t" end="20t">Hi</p>')))
+	// Frame-based and tick-based expressions are read now, against the rates the document states or
+	// TTML's defaults - a real IMSC conformance document uses every form there is, so refusing them
+	// refused the document. See mxf-timed-text.test.ts.
+	expect(parseTtmlDocument(document('<p begin="00:00:01:12" end="00:00:02.000">Hi</p>'))[0]!.timestamp)
+		.toBeCloseTo(1 + 12 / 30, 6); // The default frame rate, since this document states none
+	expect(parseTtmlDocument(document('<p begin="10t" end="20t">Hi</p>'))[0]!.timestamp)
+		.toBeCloseTo(10, 6); // And the default tick rate of 1, since it states no frame rate either
+
+	expect(() => parseTtmlDocument(document('<p begin="nonsense" end="00:00:02.000">Hi</p>')))
 		.toThrow(/time expression/);
 	expect(() => parseTtmlDocument(document('<p end="00:00:02.000">Hi</p>')))
 		.toThrow(/no begin attribute/);

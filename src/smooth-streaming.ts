@@ -26,7 +26,6 @@ import { iterateIsobmffBoxes, shiftBaseDataOffsets } from './isobmff/isobmff-mis
 
 const UUID_TYPE = [0x75, 0x75, 0x69, 0x64]; // 'uuid'
 
-// MS-SSTR 2.2.4.4 and 2.2.4.5 state these as the extended types of the two boxes.
 const TFXD_UUID = [
 	0x6d, 0x1d, 0x9b, 0x05, 0x42, 0xd5, 0x44, 0xe6, 0x80, 0xe2, 0x14, 0x1d, 0xaf, 0xf7, 0x57, 0xb2,
 ];
@@ -129,7 +128,6 @@ const shiftSaioOffsets = (traf: MutableBox, added: number): void => {
 		}
 
 		const version = data[0];
-		// version/flags(4) + optional aux_info_type(4) + aux_info_type_parameter(4), then entry_count
 		let position = 4 + ((boxFlags(data) & 0x1) ? 8 : 0);
 		const entryCount = readU32(data, position);
 		position += 4;
@@ -153,7 +151,6 @@ const shiftSaioOffsets = (traf: MutableBox, added: number): void => {
 const growSidxReferencedSizeAt = (bytes: Uint8Array, sidxStart: number, fragmentIndex: number, added: number) => {
 	const content = sidxStart + 8;
 	const version = bytes[content]!;
-	// version/flags(4) + reference_ID(4) + timescale(4) + earliest/first (8 or 16) + reserved(2)
 	const position = content + 4 + 4 + 4 + (version === 0 ? 8 : 16) + 2;
 	const referenceCount = (bytes[position]! << 8) | bytes[position + 1]!;
 	if (fragmentIndex >= referenceCount) {

@@ -583,6 +583,34 @@ sd.m3u8
 			expect(text).toContain('charset=UTF-16');
 		});
 
+		test('one drm() call does not call the same content cenc in DASH and cbcs in HLS', () => {
+			// `drm()` used its `scheme` for the DASH mp4protection descriptor and dropped it on the
+			// way to the HLS keys, so a cenc stream's playlist said SAMPLE-AES - which 4.4.4.4
+			// defines as the cbcs scheme - while its own MPD said cenc. A player trusting the
+			// playlist decrypts in the wrong mode.
+			const cenc = {
+				...options,
+				scheme: 'cenc' as const,
+				// FairPlay is cbcs only and is refused under cenc, so this ladder is the two systems
+				// that do support it
+				systems: options.systems.filter(system => system.uuid !== FAIRPLAY_SYSTEM_ID),
+				fairplayKeyUri: undefined,
+			};
+
+			const mpd = serializeManifest(drm(cenc)(
+				dashManifest([set({ representations: [rep('v', 'avc1.640028')] })]),
+			));
+			const playlist = serializeManifest(drm(cenc)(parseManifest(HLS_MEDIA)));
+
+			expect(mpd).toContain('value="cenc"');
+			expect(playlist).toContain('METHOD=SAMPLE-AES-CTR');
+			expect(playlist).not.toMatch(/METHOD=SAMPLE-AES[^-]/);
+
+			// And cbcs still says what it always said
+			expect(serializeManifest(drm(options)(parseManifest(HLS_MEDIA))))
+				.toMatch(/METHOD=SAMPLE-AES[^-]/);
+		});
+
 		test('HLS master: unchanged (keys live in media playlists)', () => {
 			const master = parseManifest(HLS_MASTER);
 			expect(drm(options)(master)).toBe(master);

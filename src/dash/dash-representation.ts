@@ -162,8 +162,6 @@ export class Representation {
 		this.idValue = representationId;
 		this.mpdOptions = mpdOptions;
 		this.stateChangeListener = stateChangeListener;
-		// Mirrors shaka: $Time is legitimate but not a template, so disable
-		// approximate timeline when $Time$ is in use.
 		const segmentTemplate = mediaInfo.segmentTemplate ?? '';
 		this.allowApproximateSegmentTimeline = !segmentTemplate.includes('$Time')
 			&& mpdOptions.mpdParams.allowApproximateSegmentTimeline;
@@ -209,7 +207,6 @@ export class Representation {
 			return false;
 		}
 
-		// Video with audio is a multiplexed Representation; see `isMultiplexed` for the deviation.
 		if (this.mediaInfo.textInfo && (this.mediaInfo.videoInfo || this.mediaInfo.audioInfo)) {
 			return false;
 		}
@@ -276,12 +273,9 @@ export class Representation {
 	 */
 	addNewSegment(startTime: number, duration: number, size: number, segmentNumber: number): void {
 		if (startTime === 0 && duration === 0) {
-			// Shaka logs a warning and ignores; we silently ignore.
 			return;
 		}
 
-		// The duration is added after the window slides, so the oldest segment stays reachable for the whole
-		// depth even while the player sits anywhere in the newest one
 		this.slideWindow();
 
 		if (this.stateChangeListener) {
@@ -320,14 +314,11 @@ export class Representation {
 	 * Mirrors shaka's `SetSampleDuration`.
 	 */
 	setSampleDuration(frameDuration: number): void {
-		// Sample duration is used to generate approximate SegmentTimeline.
-		// Text is required to have exactly the same segment duration.
 		if (this.mediaInfo.audioInfo !== undefined || this.mediaInfo.videoInfo !== undefined) {
 			this.frameDuration = frameDuration;
 		}
 
 		if (this.mediaInfo.videoInfo !== undefined) {
-			// Mutate the underlying mediaInfo so subsequent getXml() reflects.
 			this.mediaInfo = {
 				...this.mediaInfo,
 				videoInfo: { ...this.mediaInfo.videoInfo, frameDuration },
@@ -540,9 +531,6 @@ export class Representation {
 				}
 				return;
 			}
-
-			// Gaps and overlaps are tolerated — shaka logs a warning then
-			// proceeds. We do the same silently.
 		}
 		this.segmentInfos.push({
 			startTime,
@@ -564,7 +552,6 @@ export class Representation {
 		if (!this.allowApproximateSegmentTimeline) {
 			return time1 === time2;
 		}
-		// Mirrors shaka's threshold: min(frameDuration, 0.05 * timescale).
 		const ERROR_THRESHOLD_SECONDS = 0.05;
 		const refTimeScale = this.mediaInfo.referenceTimeScale ?? 1;
 		const errorThreshold = Math.min(
@@ -580,8 +567,6 @@ export class Representation {
 			return duration;
 		}
 		const refTimeScale = this.mediaInfo.referenceTimeScale ?? 1;
-		// Shaka assigns the double product to an int64, truncating toward zero;
-		// mirror that so e.g. 0.01 * 1000 = 10.000000000000002 emits d="10".
 		const scaledTargetDuration = Math.trunc(this.mpdOptions.mpdParams.targetSegmentDuration * refTimeScale);
 		return this.approximatelyEqual(scaledTargetDuration, duration)
 			? scaledTargetDuration
@@ -608,7 +593,6 @@ export class Representation {
 			return;
 		}
 
-		// Pops repeats until a segment is consumed or removing more would dip below the buffer depth
 		while (this.segmentInfos.length > 0) {
 			const seg = this.segmentInfos[0]!;
 			let consumed = false;
@@ -647,7 +631,6 @@ export class Representation {
 			startNumber,
 			this.mediaInfo.bandwidth ?? this.bandwidthEstimator.max(),
 		));
-		// No file I/O here, unlike shaka: callers drain via getSegmentsToBeRemoved()
 		while (this.segmentsToBeRemoved.length
 			> this.mpdOptions.mpdParams.preservedSegmentsOutsideLiveWindow) {
 			this.segmentsToBeRemoved.shift();

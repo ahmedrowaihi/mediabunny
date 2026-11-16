@@ -31,7 +31,7 @@ export const wakePendingAccept = async (url: string) => {
 	try {
 		await peer.open2(target.toString(), AVIO_FLAG_WRITE);
 	} catch {
-		// The accept may have already failed or been satisfied; either way there is nothing to wake.
+		// Unreachable peer is the normal case here
 	}
 
 	await peer.closep().catch(() => {});
@@ -113,7 +113,6 @@ let logRedactionInstalled = false;
  * @internal
  */
 export const installSecretRedactingLog = (): void => {
-	// One process-wide slot: a callback left behind by an exited worker aborts the process
 	if (logRedactionInstalled || !isMainThread) {
 		return;
 	}
@@ -136,14 +135,10 @@ export const throwFailedOpen = async (
 	ret: number,
 	encrypted: boolean,
 ): Promise<never> => {
-	// Without this the native handle is left for the GC to finalize whenever it likes, and these failures
-	// come in bursts because a caller retries
 	await context.closep().catch(() => {});
 
 	throw new Error(
 		`${label}: could not open ${redactUrl(url)} (AVERROR ${ret}).`
-		// SRT reports a refused connection, an unreachable host and a rejected passphrase with the same
-		// AVERROR - measured -5 or -60 for all of them - so the passphrase is named rather than diagnosed
 		+ (encrypted
 			? ' SRT does not distinguish a rejected passphrase from any other refusal, so check that both'
 			+ ' ends agree on the passphrase and key length.'
@@ -198,6 +193,8 @@ export const CODEC_TO_CODEC_ID: Partial<Record<MediaCodec, NodeAv.AVCodecID>> = 
 	vp9: NodeAv.AV_CODEC_ID_VP9,
 	av1: NodeAv.AV_CODEC_ID_AV1,
 	prores: NodeAv.AV_CODEC_ID_PRORES,
+	dnxhd: NodeAv.AV_CODEC_ID_DNXHD,
+	rawvideo: NodeAv.AV_CODEC_ID_RAWVIDEO,
 	qtrle: NodeAv.AV_CODEC_ID_QTRLE,
 	png: NodeAv.AV_CODEC_ID_PNG,
 
@@ -493,3 +490,54 @@ export const getTrueHdChannelLayout = (numChannels: number): NodeAv.ChannelLayou
 };
 
 export const DEFAULT_MAX_QUEUE_BYTES = 2 * 1024 * 1024;
+
+/**
+ * The pixel format each Y4M colour space names.
+ *
+ * Uncompressed frames carry nothing that says what they are, so this is the whole decoder config: get
+ * it wrong and the planes are read at the wrong stride, which is a sheared picture rather than an
+ * error. The three 4:2:0 tags differ only in chroma siting, which is not a layout, so they share one
+ * format.
+ *
+ * @internal
+ */
+export const Y4M_TAG_TO_PIXEL_FORMAT: Record<string, NodeAv.AVPixelFormat> = {
+	'420jpeg': NodeAv.AV_PIX_FMT_YUV420P,
+	'420mpeg2': NodeAv.AV_PIX_FMT_YUV420P,
+	'420paldv': NodeAv.AV_PIX_FMT_YUV420P,
+	'420': NodeAv.AV_PIX_FMT_YUV420P,
+	'411': NodeAv.AV_PIX_FMT_YUV411P,
+	'422': NodeAv.AV_PIX_FMT_YUV422P,
+	'444': NodeAv.AV_PIX_FMT_YUV444P,
+	'mono': NodeAv.AV_PIX_FMT_GRAY8,
+	'420p10': NodeAv.AV_PIX_FMT_YUV420P10LE,
+	'422p10': NodeAv.AV_PIX_FMT_YUV422P10LE,
+	'444p10': NodeAv.AV_PIX_FMT_YUV444P10LE,
+	'420p12': NodeAv.AV_PIX_FMT_YUV420P12LE,
+	'422p12': NodeAv.AV_PIX_FMT_YUV422P12LE,
+	'444p12': NodeAv.AV_PIX_FMT_YUV444P12LE,
+	'420p16': NodeAv.AV_PIX_FMT_YUV420P16LE,
+	'422p16': NodeAv.AV_PIX_FMT_YUV422P16LE,
+	'444p16': NodeAv.AV_PIX_FMT_YUV444P16LE,
+};
+
+/** The Y4M colour space a pixel format is written as, which is the inverse of the above. */
+export const pixelFormatToY4mTag = (format: NodeAv.AVPixelFormat): string | null => {
+	// `420jpeg` wins the three-way tie: it is what ffmpeg writes and what every reader accepts
+	const preferred: Record<number, string> = {
+		[NodeAv.AV_PIX_FMT_YUV420P]: '420jpeg',
+		[NodeAv.AV_PIX_FMT_GRAY8]: 'mono',
+	};
+
+	if (preferred[format as number] !== undefined) {
+		return preferred[format as number]!;
+	}
+
+	for (const [tag, mapped] of Object.entries(Y4M_TAG_TO_PIXEL_FORMAT)) {
+		if (mapped === format) {
+			return tag;
+		}
+	}
+
+	return null;
+};

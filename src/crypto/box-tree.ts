@@ -23,11 +23,9 @@ export type MutableBox = {
 	children?: MutableBox[];
 };
 
-// Pure container boxes whose payload is entirely child boxes.
 const CONTAINERS = new Set([
 	'moov', 'trak', 'mdia', 'minf', 'stbl', 'moof', 'traf', 'mvex', 'edts', 'mfra', 'sinf', 'schi', 'udta',
 ]);
-// Sample-entry containers: a fixed-size prefix followed by child boxes.
 const SAMPLE_ENTRY_PREFIX: Record<string, number> = {
 	avc1: 78, avc3: 78, hvc1: 78, hev1: 78, encv: 78,
 	mp4a: 28, enca: 28,
@@ -284,7 +282,6 @@ export const parseBoxes = (bytes: Uint8Array, start: number, end: number): Mutab
 		if (CONTAINERS.has(type)) {
 			boxes.push({ type, children: parseBoxes(bytes, contentStart, contentEnd) });
 		} else if (type === 'stsd') {
-			// FullBox(4) + entry_count(4), then sample entries as children.
 			boxes.push({
 				type,
 				data: copyOf(bytes, contentStart, contentStart + 8),

@@ -29,6 +29,7 @@ import {
 	isThenable,
 	textDecoder,
 	toArray,
+	hexStringToBytes,
 } from '../misc';
 import { readAllLines, readBytes, Reader } from '../reader';
 import { CustomPathedSource, PathedSource, ReadableStreamSource, SourceRef, SourceRequest } from '../source';
@@ -38,6 +39,7 @@ import {
 	canIgnoreLine,
 	HlsPlaylistVariables,
 	TAG_BYTERANGE,
+	TAG_DATERANGE,
 	TAG_DEFINE,
 	TAG_DISCONTINUITY,
 	TAG_DISCONTINUITY_SEQUENCE,
@@ -55,6 +57,7 @@ import {
 import { HlsInputFormat, type InputFormatOptions } from '../input-format';
 import { parsePsshBoxContents, psshBoxesAreEqual, type PsshBox } from '../isobmff/isobmff-misc';
 import { parseIsoDateTimeAsUtc } from '../iso-date';
+import { SCTE35_BINARY_SCHEME } from '../mpeg-ts/scte35';
 import {
 	createTimestampWrapInfo,
 	normalizeWrappedTimestamp,
@@ -93,6 +96,13 @@ export type HlsSegmentLocation = {
 
 // Way more than any real duration, but small enough to keep all timestamp (and derived sequence number) math finite
 const MAX_DURATION = 1e9; // In seconds
+
+/**
+ * The three `#EXT-X-DATERANGE` attributes that carry a `splice_info_section` as a hexadecimal-sequence
+ * (RFC 8216bis 4.4.5.1). A playlist signals a splice this way where the stream itself carries no cue
+ * stream, which is how this library's own HLS output signals one.
+ */
+const SCTE35_DATERANGE_ATTRIBUTES = ['SCTE35-CMD', 'SCTE35-OUT', 'SCTE35-IN'];
 
 export class HlsSegmentedInput extends SegmentedInput {
 	rootPath: string;
@@ -135,6 +145,9 @@ export class HlsSegmentedInput extends SegmentedInput {
 			}
 		})();
 	}
+
+	/** Date ranges parsed before the playlist had a segment to date them against. */
+	pendingDateRangeEvents: { timestamp: number; data: Uint8Array }[] = [];
 
 	getRemainingWaitTimeMs() {
 		const elapsed = performance.now() - this.lastSegmentUpdateTime;
@@ -204,6 +217,7 @@ export class HlsSegmentedInput extends SegmentedInput {
 		let nextByteRange: { offset: number; length: number } | null = null;
 		let lastProgramDateTimeSeconds: number | null = null;
 		let iFramesOnly = false;
+		const dateRangeEvents: { timestamp: number; data: Uint8Array }[] = [];
 
 		// Used for repeated parses where our job it is to only add the new segments
 		let prevLastSegment = last(this.segments) ?? null;
@@ -544,8 +558,6 @@ export class HlsSegmentedInput extends SegmentedInput {
 				}
 
 				const dateTime = line.slice(TAG_PROGRAM_DATE_TIME.length);
-				// Not `Date.parse`: it reads a zoneless time as local, so the same playlist got one timeline
-				// here and another through `parseHlsPlaylist`, which has always treated it as UTC.
 				const dateTimeMs = parseIsoDateTimeAsUtc(dateTime);
 
 				if (!Number.isFinite(dateTimeMs)) {
@@ -578,12 +590,41 @@ export class HlsSegmentedInput extends SegmentedInput {
 				if (offsetTimestampsByDateTime) {
 					accumulatedTime = dateTimeSeconds; // Snap the accumulated time into Unix space
 				}
+			} else if (line.startsWith(TAG_DATERANGE)) {
+				const attributes = new AttributeList(line.slice(TAG_DATERANGE.length), variables);
+				const id = attributes.get('ID');
+				if (id === null) {
+					continue; // A range with no ID cannot be told from the next copy of itself
+				}
+
+				// A date range is written where it applies, so the position the tag was reached at places
+				// it; START-DATE places it more precisely where the playlist dates its segments at all.
+				let timestamp = accumulatedTime;
+				const startDateMs = parseIsoDateTimeAsUtc(attributes.get('START-DATE') ?? '');
+				if (Number.isFinite(startDateMs) && accumulatedUnixTime !== null) {
+					timestamp = accumulatedTime + (startDateMs / 1000 - accumulatedUnixTime);
+				}
+
+				for (const name of SCTE35_DATERANGE_ATTRIBUTES) {
+					const hex = attributes.get(name);
+					if (hex === null) {
+						continue;
+					}
+
+					let section: Uint8Array;
+					try {
+						section = hexStringToBytes(hex.replace(/^0[xX]/, ''));
+					} catch {
+						continue; // Not a hexadecimal-sequence, whatever the attribute is named
+					}
+
+					dateRangeEvents.push({ timestamp, data: section });
+				}
 			} else if (line === TAG_DISCONTINUITY) {
 				currentFirstSegment = null;
 				// Counted even for known segments since the discontinuity number is absolute, derived from the
 				// playlist's discontinuity sequence
 				nextDiscontinuityNumber++;
-				// An #EXT-X-MAP lasts until the next one; an implicit I-frame init ends here
 				if (currentInitSegment && this.implicitInitSegments.has(currentInitSegment)) {
 					currentInitSegment = null;
 				}
@@ -629,14 +670,50 @@ export class HlsSegmentedInput extends SegmentedInput {
 		if (!headerRead) {
 			throw new MalformedInputError('Invalid M3U8 file; no #EXTM3U header.');
 		}
+
+		this.pendingDateRangeEvents.push(...dateRangeEvents);
+
+		// Only once there are segments. Dating these needs the first segment's offset, and asking for
+		// that while the playlist holds none re-enters this very update and waits on itself.
+		if (this.pendingDateRangeEvents.length > 0 && this.segments.length > 0) {
+			const pending = this.pendingDateRangeEvents;
+			this.pendingDateRangeEvents = [];
+			const offset = await this.getFirstSegmentTimestampOffset();
+
+			for (const event of pending) {
+				this.announceInbandEvent({
+					timestamp: event.timestamp + offset,
+					scheme: SCTE35_BINARY_SCHEME,
+					data: event.data,
+				});
+			}
+		}
 	}
 
-	async getFirstSegment() {
-		if (this.segments.length === 0 && !this.streamHasEnded) {
-			await this.runUpdateSegments();
-		}
+	async getFirstSegment(options: SegmentRetrievalOptions = {}) {
+		// Waits for the first segment the same way reading past the live edge waits for the next one.
+		// A single reload was not enough: a channel that has published its playlist but not yet its
+		// first segment answered null, which a consumer cannot tell apart from "this playlist has no
+		// video" - and the right answer, for a stream that has not ended, is "not yet".
+		let isLazy = !!options.skipLiveWait && this.getRemainingWaitTimeMs() > 0;
 
-		return this.segments[0] ?? null;
+		while (true) {
+			if (this.segments.length > 0) {
+				return this.segments[0]!;
+			}
+
+			// A playlist with an ENDLIST and no segments really does have nothing, so this is where the
+			// loop has to stop rather than wait for an edge that will never move
+			if (this.streamHasEnded || isLazy) {
+				return this.segments[0] ?? null;
+			}
+
+			await this.runUpdateSegments();
+
+			if (options.skipLiveWait) {
+				isLazy = true;
+			}
+		}
 	}
 
 	async getSegmentAt(timestamp: number, options: SegmentRetrievalOptions) {
@@ -822,7 +899,11 @@ export class HlsSegmentedInput extends SegmentedInput {
 							ciphertextRef.free();
 						});
 
-						ref = new ReadableStreamSource(stream).ref();
+						// Decrypting produces a new source, and it is as much part of this HLS read as the
+						// ciphertext it came from
+						const plaintext = new ReadableStreamSource(stream);
+						plaintext._usedForHls = true;
+						ref = plaintext.ref();
 					} else {
 						assert(false);
 					}
@@ -851,6 +932,8 @@ export class HlsSegmentedInput extends SegmentedInput {
 				);
 			}
 		};
+
+		this.forwardInbandEvents(hlsSegment, input);
 
 		this.inputCache.push({
 			segment: hlsSegment,

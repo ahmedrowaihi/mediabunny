@@ -68,6 +68,12 @@ export type HlsVideoInfo = {
 	pixelWidth?: number;
 	/** Sample aspect ratio denominator. */
 	pixelHeight?: number;
+	/**
+	 * `'interlaced'` for a field-coded stream. HLS has no attribute that states this, so it is carried
+	 * only to warn: Apple's authoring specification requires interlaced content to be deinterlaced
+	 * before encoding.
+	 */
+	scanType?: 'progressive' | 'interlaced' | 'unknown';
 	/** Frame duration in track timescale. */
 	frameDuration?: number;
 	/** Supplemental codec for Dolby Vision dual-track signaling. */

@@ -59,15 +59,17 @@ import {
 	type VideoDecoderConfigWithHdr,
 	withHdr10PlusObu,
 } from './hdr-metadata';
+import { type Afd, buildAfdSeiMessage, parsePacketAfd } from './afd';
+import { carriesScte20Captions, spliceScte20UserData } from './scte20';
 import {
 	buildClosedCaptionSeiMessage,
 	carriesClosedCaptions,
 	type ClosedCaptionBytePair,
 	validateClosedCaptionBytePairs,
 } from './closed-captions';
-import { buildSeiNalUnit, spliceNalUnitBeforeVcl } from './sei';
+import { buildSeiNalUnit, spliceNalUnitAfterVcl, spliceNalUnitBeforeVcl } from './sei';
 import { Muxer } from './muxer';
-import { SubtitleParser, type SubtitleCue, type SubtitleMetadata } from './subtitles';
+import { SubtitleParser, TTML_PROFILES, type SubtitleCue, type SubtitleMetadata, type TtmlProfile } from './subtitles';
 import { toAlaw, toUlaw } from './pcm';
 import {
 	CustomVideoEncoder,
@@ -189,8 +191,6 @@ export abstract class MediaSource {
 			await connectedTrack.output._muxer.onTrackClose(connectedTrack);
 		})();
 
-		// Marked observed now, since nothing awaits it until `finalize()`/`cancel()`; the stored promise
-		// still rejects for that awaiter
 		this._closingPromise.catch(() => {});
 	}
 
@@ -225,7 +225,6 @@ export abstract class VideoSource extends MediaSource {
 
 const COLOR_SPACE_FIELDS = ['primaries', 'transfer', 'matrix', 'fullRange'] as const;
 
-// Null when the sample keeps its pixels in a format we can't name, which says nothing about their depth
 const bitDepthOfPixelFormat = (format: VideoSamplePixelFormat | null): VideoBitDepth | null => {
 	if (format === null) {
 		return null;
@@ -240,8 +239,6 @@ const bitDepthOfPixelFormat = (format: VideoSamplePixelFormat | null): VideoBitD
 	return 8;
 };
 
-// Distinct from a plain Error so an encoder-support probe can tell a configuration conflict, which re-rendering
-// cannot fix, from a format the encoder simply refuses.
 /** @internal */
 export class DeclaredColorSpaceMismatchError extends Error {}
 
@@ -260,8 +257,22 @@ const spliceClosedCaptions = (
 	packet: EncodedPacket,
 	bytePairs: readonly ClosedCaptionBytePair[],
 	decoderConfig: VideoDecoderConfig | undefined,
-	codec: 'avc' | 'hevc',
+	codec: 'avc' | 'hevc' | 'mpeg2',
 ): EncodedPacket => {
+	if (codec === 'mpeg2') {
+		// MPEG-2 has no SEI, so captions go in the picture's own user data as SCTE-20. No decoder config
+		// is needed: an MPEG-2 elementary stream is start-code framed and nothing else.
+		if (carriesScte20Captions(packet.data)) {
+			throw new Error(
+				'Closed captions were provided, but this MPEG-2 picture already carries SCTE-20 caption'
+				+ ' user data. Writing a second element would leave the picture with two disagreeing'
+				+ ' caption sets.',
+			);
+		}
+
+		return withData(packet, spliceScte20UserData(packet.data, bytePairs));
+	}
+
 	if (!decoderConfig) {
 		throw new Error(
 			'Closed captions were provided before any decoder config. Nothing states whether the packets are'
@@ -283,6 +294,41 @@ const spliceClosedCaptions = (
 };
 
 /** The same packet with one NAL unit spliced in ahead of its first VCL one. */
+/**
+ * The same packet with an SEI message stating the track's active format description, or the packet as it
+ * came where it already states one.
+ *
+ * Written on every frame rather than on key frames alone: a receiver that joins mid-GOP has to learn the
+ * picture's shape too, and ST 2016-1 signalling is per frame.
+ *
+ * @internal
+ */
+const spliceAfd = (
+	packet: EncodedPacket,
+	afd: Afd,
+	decoderConfig: VideoDecoderConfig | undefined,
+	codec: 'avc' | 'hevc',
+): EncodedPacket => {
+	if (!decoderConfig) {
+		throw new Error(
+			'metadata.activeFormatDescription was declared but no decoder config has been provided yet.'
+			+ ' Nothing states whether the packets are length-prefixed or Annex B, so the AFD SEI cannot be'
+			+ ' framed. Provide metadata.decoderConfig, or a decoder config with the first packet.',
+		);
+	}
+
+	// Someone else's already-signalled stream keeps its own value: two AFD messages in one access unit
+	// would state two shapes for one picture
+	if (parsePacketAfd(packet.data, decoderConfig, codec) !== null) {
+		return packet;
+	}
+
+	const seiNalUnit = buildSeiNalUnit([buildAfdSeiMessage(afd)], codec);
+	assert(seiNalUnit);
+
+	return withNalUnitSpliced(packet, decoderConfig, codec, seiNalUnit);
+};
+
 /** The same packet carrying different bytes, which is every rewrite of a bitstream before muxing. */
 const withData = (packet: EncodedPacket, data: Uint8Array): EncodedPacket => new EncodedPacket(
 	data,
@@ -292,8 +338,6 @@ const withData = (packet: EncodedPacket, data: Uint8Array): EncodedPacket => new
 	packet.sequenceNumber,
 	undefined,
 	packet.sideData,
-	// Passing it on unconditionally would make a source that states no decode timeline look like one
-	// that does, and the PTS it defaults to is not a decode order a muxer can write
 	packet.statesDecodeTimestamp ? packet.decodeTimestamp : undefined,
 );
 
@@ -371,6 +415,17 @@ export class EncodedVideoPacketSource extends VideoSource {
 			this.carriesDeclaredCaptions = this.packetStatesCaptions(packet);
 		}
 
+		const afd = this._connectedTrack!.metadata.activeFormatDescription;
+		if (afd !== undefined) {
+			assert(this._codec === 'avc' || this._codec === 'hevc'); // Checked when the track was added
+			packetToAdd = spliceAfd(
+				packetToAdd,
+				afd,
+				this.lastDecoderConfig ?? this._connectedTrack!.metadata.decoderConfig,
+				this._codec,
+			);
+		}
+
 		return this._connectedTrack!.output._muxer.addEncodedVideoPacket(this._connectedTrack!, packetToAdd, meta);
 	}
 
@@ -381,6 +436,10 @@ export class EncodedVideoPacketSource extends VideoSource {
 	 * @internal
 	 */
 	private packetStatesCaptions(packet: EncodedPacket): boolean {
+		if (this._codec === 'mpeg2') {
+			return carriesScte20Captions(packet.data);
+		}
+
 		const decoderConfig = this.lastDecoderConfig ?? this._connectedTrack!.metadata.decoderConfig;
 		if (!decoderConfig || (this._codec !== 'avc' && this._codec !== 'hevc')) {
 			return false;
@@ -400,8 +459,8 @@ export class EncodedVideoPacketSource extends VideoSource {
 		}
 
 		validateClosedCaptionBytePairs(bytePairs, 'meta.closedCaptions');
-		// `addVideoTrack` refuses a `closedCaptions` declaration on any other codec.
-		assert(this._codec === 'avc' || this._codec === 'hevc');
+		// Checked when the track was added; mpeg2 carries them as SCTE-20 user data instead of an SEI
+		assert(this._codec === 'avc' || this._codec === 'hevc' || this._codec === 'mpeg2');
 
 		const result = spliceClosedCaptions(
 			packet,
@@ -427,7 +486,6 @@ export class EncodedVideoPacketSource extends VideoSource {
 	}
 }
 
-// A frame the encoder dropped never claims its entry, so the map needs a bound
 const MAX_PENDING_SIDE_DATA_FRAMES = 128;
 
 /** What a frame carried in the video bitstream, held until the packet it was encoded into arrives. */
@@ -447,6 +505,7 @@ class VideoEncoderWrapper {
 	private muxer: Muxer | null = null;
 	private lastMultipleOfKeyFrameInterval: number | null = null;
 	private emittedEncoderPackets = 0;
+	private chunkTimestampsAreShiftedByDuration = false; // See detectAvcChunkTimestampShift
 
 	// Tracks the input dimensions of the first frame
 	private codedWidth: number | null = null;
@@ -503,8 +562,6 @@ class VideoEncoderWrapper {
 	private lastMuxerPromise: Promise<void> = Promise.resolve();
 	private closed = false;
 
-	// Set once samples are re-rendered on their way to the encoder, which may or may not have kept their depth and
-	// color. Only the re-rendered sample itself says which.
 	private rerenderedSamples = false;
 
 	constructor(private source: VideoSource, private encodingConfig: VideoEncodingConfig) {}
@@ -516,7 +573,6 @@ class VideoEncoderWrapper {
 		}
 
 		try {
-			// Checked before the hook runs, so a dead encoder is not handed the caller's frame
 			this.checkForEncoderError();
 			this.source._ensureValidAdd();
 
@@ -529,11 +585,9 @@ class VideoEncoderWrapper {
 
 			try {
 				for (const sample of preProcessed) {
-					// A hook that handed back the sample it was given must not have it closed twice
 					await this.transformAndEncode(sample, sample !== videoSample, encodeOptions);
 				}
 			} finally {
-				// close() is idempotent, so the ones already handed over are unaffected
 				for (const sample of preProcessed) {
 					if (sample !== videoSample) {
 						sample.close();
@@ -733,7 +787,6 @@ class VideoEncoderWrapper {
 					mappedSamples.push(new VideoSample(x as CanvasImageSource, {
 						timestamp: videoSample.timestamp,
 						duration: videoSample.duration,
-						// Built here rather than by the hook, so it carries what the hook was handed
 						closedCaptions: videoSample.closedCaptions,
 					}));
 				}
@@ -980,7 +1033,6 @@ class VideoEncoderWrapper {
 				await encode(sample);
 			}
 		} finally {
-			// close() is idempotent, so the ones the encode step already closed are unaffected
 			for (const sample of held) {
 				sample.close();
 			}
@@ -998,7 +1050,6 @@ class VideoEncoderWrapper {
 			using sample = this.frameRateLastSample.clone();
 			sample.setTimestamp(this.frameRateLastTimestamp! + i / frameRate);
 			sample.setDuration(1 / frameRate);
-			// The picture repeats; the caption commands must not, or the decoder replays them
 			sample.setClosedCaptions(null);
 			await this.processAndEncode(sample, encodeOptions);
 		}
@@ -1035,8 +1086,6 @@ class VideoEncoderWrapper {
 			}
 		}
 
-		// A transfer the encoder dropped because the output depth cannot carry it was a decision, not a gap, so
-		// filling it back in from the declaration would stamp the label the encoder just refused to write.
 		const outputBitDepth = extractVideoBitDepth(meta.decoderConfig);
 		const declaredTransfer = outputBitDepth !== null
 			&& outputBitDepth < 10
@@ -1057,13 +1106,14 @@ class VideoEncoderWrapper {
 							fullRange: colorSpace.fullRange ?? encoded?.fullRange,
 						}
 					: encoded,
-				// Static metadata describes how a PQ or HLG grade was mastered, so it may only be written onto an
-				// output that still states that grade's transfer function - never outliving the signal it describes.
 				hdrStaticMetadata: outputCarriesHdrSignal(transfer, outputBitDepth)
 					? this.encodingConfig.hdrStaticMetadata
 					: undefined,
 			},
-		};
+			// Cast because `EncodedVideoChunkMetadata` is WebCodecs' own type and its colorSpace cannot
+			// name DCI-P3, while this value is read only by this library's muxers on its way to a
+			// container. Narrowing it here would drop the primaries the caller asked for.
+		} as EncodedVideoChunkMetadata;
 	}
 
 	// A 10-bit-capable source profile may carry 8-bit samples, so an inherited depth must match the samples
@@ -1079,7 +1129,6 @@ class VideoEncoderWrapper {
 		}
 	}
 
-	// A re-render may keep the input's color or flatten it to sRGB; only the rendered sample knows which
 	private dropUnbackedInheritedColor(videoSample: VideoSample) {
 		const config = this.encodingConfig;
 
@@ -1130,9 +1179,14 @@ class VideoEncoderWrapper {
 				height: videoSample.codedHeight,
 				squarePixelWidth: videoSample.squarePixelWidth,
 				squarePixelHeight: videoSample.squarePixelHeight,
-				// x265, SVT-AV1 and libvpx pace bitrate by the declared rate, not by timestamps
 				framerate: this.source._connectedTrack?.metadata.frameRate
 					?? (videoSample.duration > 0 ? 1 / videoSample.duration : undefined),
+				// A timecode in an AVC bitstream is a `pic_timing` SEI message, which is only readable
+				// where the SPS declares the flag; x264 does not write it on its own
+				encoderControls: this.source._connectedTrack?.metadata.timecode !== undefined
+					&& this.encodingConfig.codec === 'avc'
+					? { picStruct: true, ...this.encodingConfig.encoderControls }
+					: this.encodingConfig.encoderControls,
 			});
 
 			// Try the candidate configs in order of preference until we find one that is supported
@@ -1158,7 +1212,6 @@ class VideoEncoderWrapper {
 					// WebCodecs states no profile, preset or GOP structure, so it would encode without them
 					|| (candidateConfig as QualityCappedVideoEncoderConfig)._encoderControls
 				) {
-					// WebCodecs has no capped quantizer mode, and would encode without the cap
 					continue;
 				}
 
@@ -1256,6 +1309,10 @@ class VideoEncoderWrapper {
 				await this.customEncoder.init();
 			} else {
 				this.encoderConfig = encoderConfig;
+				if (this.encodingConfig.codec === 'avc' && isFirefox()) {
+					this.chunkTimestampsAreShiftedByDuration = await detectAvcChunkTimestampShift();
+				}
+
 				this.createWebCodecsEncoders();
 			}
 
@@ -1468,10 +1525,17 @@ class VideoEncoderWrapper {
 			}
 		}
 
+		let microsecondTimestamp = colorChunk.timestamp;
+		if (this.chunkTimestampsAreShiftedByDuration) {
+			// The encoder added the frame's duration to its timestamp, so undo that
+			microsecondTimestamp -= colorChunk.duration ?? 0;
+			packet = packet.clone({ timestamp: microsecondTimestamp / 1e6 });
+		}
+
 		// See if there's a relevant timing entry to refine the packet's timing data
 		const preciseTimingIndex = binarySearchLessOrEqual(
 			this.preciseTimings,
-			colorChunk.timestamp,
+			microsecondTimestamp,
 			x => x.microsecondTimestamp,
 		);
 		const entry = preciseTimingIndex !== -1
@@ -1491,7 +1555,7 @@ class VideoEncoderWrapper {
 		}
 
 		// Define the packet
-		if ((entry && entry.microsecondTimestamp === colorChunk.timestamp) || actualType !== null) {
+		if ((entry && entry.microsecondTimestamp === microsecondTimestamp) || actualType !== null) {
 			packet = packet.clone({
 				timestamp: entry?.timestampIsValid ? entry.timestamp : undefined,
 				duration: entry?.durationIsValid ? entry.duration : undefined,
@@ -1529,8 +1593,6 @@ class VideoEncoderWrapper {
 			return;
 		}
 
-		// An RPU with no configuration record describes nothing, and a rung that altered the picture would be
-		// stating the source's over a different image
 		if (!this.source._connectedTrack!.metadata.dolbyVision) {
 			return;
 		}
@@ -1556,7 +1618,6 @@ class VideoEncoderWrapper {
 			return;
 		}
 
-		// Dropped rather than fatal: an ABR ladder hands the same sample to every rung
 		if (this.encodingConfig.codec !== 'hevc' && this.encodingConfig.codec !== 'av1') {
 			if (!this.warnedAboutUncarriableHdr10Plus) {
 				this.warnedAboutUncarriableHdr10Plus = true;
@@ -1578,14 +1639,13 @@ class VideoEncoderWrapper {
 		}
 
 		const codec = this.encodingConfig.codec;
-		if (codec !== 'avc' && codec !== 'hevc') {
-			// A sample may state captions whatever it is encoded as, and an ABR ladder hands the same one to
-			// every rung, so a codec with nowhere to put them drops them rather than failing the encode
+		if (codec !== 'avc' && codec !== 'hevc' && codec !== 'mpeg2') {
 			if (!this.warnedAboutUncarriableCaptions) {
 				this.warnedAboutUncarriableCaptions = true;
 				Logging._warn(
 					`Dropping the closed captions stated by the samples: '${codec}' cannot carry closed captions,`
-					+ ' which ride in an AVC or HEVC bitstream as ATSC A/53 SEI messages.',
+					+ ' which ride in an AVC or HEVC bitstream as ATSC A/53 SEI messages and in an MPEG-2'
+					+ ' picture as SCTE-20 user data.',
 				);
 			}
 
@@ -1599,8 +1659,6 @@ class VideoEncoderWrapper {
 		if (meta?.decoderConfig) {
 			this.lastDecoderConfig = meta.decoderConfig;
 
-			// The encoder states no Dolby Vision of its own, so the track's declaration is what reaches the
-			// sample entry
 			const decoderConfig: VideoDecoderConfigWithHdr = meta.decoderConfig;
 			decoderConfig.dolbyVision ??= this.source._connectedTrack!.metadata.dolbyVision;
 		}
@@ -1612,11 +1670,12 @@ class VideoEncoderWrapper {
 
 		const bytePairs = sideData?.closedCaptions;
 		if (!bytePairs && !this.captionProbeDone && this.source._connectedTrack!.metadata.closedCaptions) {
-			// A custom encoder may write the SEI itself, and A/53 states captions on the first access unit
 			this.captionProbeDone = true;
 
 			const codec = this.encodingConfig.codec;
-			if ((codec === 'avc' || codec === 'hevc') && this.lastDecoderConfig) {
+			if (codec === 'mpeg2') {
+				this.carriesDeclaredCaptions = carriesScte20Captions(packet.data);
+			} else if ((codec === 'avc' || codec === 'hevc') && this.lastDecoderConfig) {
 				this.carriesDeclaredCaptions = carriesClosedCaptions(packet.data, this.lastDecoderConfig, codec);
 			}
 		}
@@ -1627,9 +1686,9 @@ class VideoEncoderWrapper {
 
 		if (bytePairs || sideData?.dolbyVisionRpu || (sideData?.hdr10Plus && this.encodingConfig.codec !== 'av1')) {
 			const codec = this.encodingConfig.codec;
-			// Neither is remembered for any other codec: `addVideoTrack` refuses a `closedCaptions`
-			// declaration on one, and `rememberRpuFor` drops the RPUs
-			assert(codec === 'avc' || codec === 'hevc');
+			// `rememberCaptionsFor` keeps captions for MPEG-2 too, where they go in the picture's user data
+			// as SCTE-20; the RPU and HDR10+ paths are dropped for anything but AVC and HEVC
+			assert(codec === 'avc' || codec === 'hevc' || codec === 'mpeg2');
 
 			if (bytePairs) {
 				packet = spliceClosedCaptions(packet, bytePairs, this.lastDecoderConfig, codec);
@@ -1637,13 +1696,16 @@ class VideoEncoderWrapper {
 			}
 
 			if (sideData?.dolbyVisionRpu) {
+				assert(codec !== 'mpeg2');
 				assert(this.lastDecoderConfig);
-				packet = withNalUnitSpliced(
-					packet,
+				// AFTER the slices, unlike every SEI message here: an RPU ahead of them is read as the
+				// previous picture's, so the metadata lands a frame early
+				packet = withData(packet, spliceNalUnitAfterVcl(
+					packet.data,
 					this.lastDecoderConfig,
 					codec,
 					sideData.dolbyVisionRpu,
-				);
+				));
 			}
 
 			if (sideData?.hdr10Plus && codec === 'hevc') {
@@ -1654,6 +1716,15 @@ class VideoEncoderWrapper {
 					packet = withNalUnitSpliced(packet, this.lastDecoderConfig, codec, seiNalUnit);
 				}
 			}
+		}
+
+		// The active format description is per frame, and an encoder states none of its own, so every encoded
+		// packet gets the track's. `addVideoTrack` has already refused a codec with no message to carry one.
+		const afd = this.source._connectedTrack!.metadata.activeFormatDescription;
+		if (afd !== undefined) {
+			const codec = this.encodingConfig.codec;
+			assert(codec === 'avc' || codec === 'hevc');
+			packet = spliceAfd(packet, afd, this.lastDecoderConfig, codec);
 		}
 
 		maybeEnsureIsKeyPacket(this.source._connectedTrack!, packet);
@@ -1702,9 +1773,6 @@ class VideoEncoderWrapper {
 			if (!forceClose) {
 				this.checkForEncoderError();
 
-				// Each hook is drained where its own output enters the pipeline, so held frames are transformed,
-				// frame rate corrected and padded past exactly as the frames handed to the hook were. Outside the
-				// mutex below, because the hook feeds back through the add path that takes it.
 				await this.runFlushHook(
 					this.encodingConfig.transform?.preProcessFlush,
 					sample => this.transformAndEncode(sample, true),
@@ -1733,8 +1801,6 @@ class VideoEncoderWrapper {
 
 			if (!forceClose) {
 				if (this.customEncoder) {
-					// Awaited and routed as the encode call is: a buffering encoder emits every packet here,
-					// so a throw out of this is the only report the caller would get
 					await this.customEncoderCallSerializer.call(() => this.customEncoder!.flush())
 						.catch((error: unknown) => this.setError(error));
 				} else if (this.encoder && !this.encodersReclaimed) {
@@ -1806,6 +1872,52 @@ class VideoEncoderWrapper {
 		}
 	}
 }
+
+let avcChunkTimestampShiftPromise: Promise<boolean> | null = null;
+
+// Detects https://bugzilla.mozilla.org/show_bug.cgi?id=2082890 so we can work around it
+const detectAvcChunkTimestampShift = () => {
+	return avcChunkTimestampShiftPromise ??= (async () => {
+		let chunkTimestamp: number | null = null;
+		const encoder = new VideoEncoder({
+			output: (chunk) => {
+				chunkTimestamp ??= chunk.timestamp;
+			},
+			error: () => {},
+		});
+
+		try {
+			encoder.configure({
+				codec: 'avc1.64001f',
+				width: 1280,
+				height: 720,
+			});
+
+			const frame = new VideoFrame(new Uint8Array(1280 * 720 * 1.5), {
+				format: 'I420',
+				codedWidth: 1280,
+				codedHeight: 720,
+				timestamp: 0,
+				duration: 500,
+			});
+			encoder.encode(frame, { keyFrame: true });
+			frame.close();
+
+			await encoder.flush();
+		} catch {
+			// Firefox encoders can be flaky and error _sometimes_, so let's just try again next time
+			avcChunkTimestampShiftPromise = null;
+
+			return false;
+		} finally {
+			if (encoder.state !== 'closed') {
+				encoder.close();
+			}
+		}
+
+		return chunkTimestamp === 500;
+	})();
+};
 
 let splitterWorkerUrl: string | null = null;
 
@@ -2162,7 +2274,6 @@ export class CanvasSource extends VideoSource {
 			throw new TypeError('duration must be a non-negative number.');
 		}
 		if (closedCaptions !== undefined) {
-			// Validated here so the message names the argument the caller passed, not the sample's init
 			validateClosedCaptionBytePairs(closedCaptions, 'closedCaptions');
 		}
 
@@ -2716,8 +2827,6 @@ class AudioEncoderWrapper {
 				return; // Canceled while waiting
 			}
 
-			// What the encoder receives must stay constant, which is not the same as what the source
-			// supplies: a transform pinning either value exists to absorb a source that changes.
 			const expectedNumberOfChannels = this.encodingConfig.transform?.numberOfChannels
 				?? audioSample.numberOfChannels;
 			const expectedSampleRate = this.encodingConfig.transform?.sampleRate ?? audioSample.sampleRate;
@@ -3336,8 +3445,6 @@ class AudioEncoderWrapper {
 
 			if (!forceClose) {
 				if (this.customEncoder) {
-					// Awaited and routed as the encode call is: a buffering encoder emits every packet here,
-					// so a throw out of this is the only report the caller would get
 					await this.customEncoderCallSerializer.call(() => this.customEncoder!.flush())
 						.catch((error: unknown) => this.setError(error));
 				} else if (this.encoder) {
@@ -4137,6 +4244,14 @@ export abstract class SubtitleSource extends MediaSource {
 	declare _connectedTrack: OutputSubtitleTrack | null;
 	/** @internal */
 	override readonly _codec: SubtitleCodec;
+	/**
+	 * Which TTML profile the muxer writes for this source. Declared on the base rather than reached for
+	 * with an `instanceof` in the muxer, which would have to import this module and close an import
+	 * cycle through `./subtitles`.
+	 *
+	 * @internal
+	 */
+	_ttmlProfile: TtmlProfile = 'imsc1';
 
 	/** Internal constructor. */
 	constructor(codec: SubtitleCodec) {
@@ -4149,6 +4264,24 @@ export abstract class SubtitleSource extends MediaSource {
 		this._codec = codec;
 	}
 }
+
+/**
+ * Options for {@link SubtitleCueSource}.
+ *
+ * @group Media sources
+ * @public
+ */
+export type SubtitleCueSourceOptions = {
+	/**
+	 * Which TTML profile to write, for the `'ttml'` codec. Defaults to `'imsc1'`.
+	 *
+	 * `'ebu-tt-d'` writes EBU-TT-D (EBU Tech 3380), the distribution profile European broadcasters ask
+	 * for. The document is the same shape either way — Tech 3380's required attributes are already
+	 * satisfied by the IMSC1 output — so this adds the conformance signal of §2.9 and the styling that
+	 * presents subtitles in a box: a background colour, `ebutts:linePadding` and an explicit line height.
+	 */
+	ttmlProfile?: TtmlProfile;
+};
 
 /**
  * This source can be used to add subtitles from a subtitle text file.
@@ -4240,6 +4373,27 @@ export class TextSubtitleSource extends SubtitleSource {
  * @public
  */
 export class SubtitleCueSource extends SubtitleSource {
+	constructor(codec: SubtitleCodec, options: SubtitleCueSourceOptions = {}) {
+		super(codec);
+
+		if (typeof options !== 'object' || !options) {
+			throw new TypeError('options must be an object.');
+		}
+		if (options.ttmlProfile !== undefined && !TTML_PROFILES.includes(options.ttmlProfile)) {
+			throw new TypeError(
+				`options.ttmlProfile, when provided, must be one of ${TTML_PROFILES.join(', ')}.`,
+			);
+		}
+		// Refused rather than ignored: a caller who asked for EBU-TT-D and got WebVTT has no way to tell
+		if (options.ttmlProfile !== undefined && codec !== 'ttml') {
+			throw new TypeError(
+				`options.ttmlProfile only applies to the 'ttml' codec, not '${codec}'.`,
+			);
+		}
+
+		this._ttmlProfile = options.ttmlProfile ?? 'imsc1';
+	}
+
 	/**
 	 * Adds a cue to the output track.
 	 *

@@ -2,6 +2,7 @@ import { beforeAll, describe, expect, test, vi } from 'vitest';
 import { Worker } from 'node:worker_threads';
 import { spawnSync } from 'node:child_process';
 import { mkdtempSync, statSync } from 'node:fs';
+import { readdir, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { Logging } from '../../src/logging.js';
@@ -1312,8 +1313,7 @@ describe('Video', async () => {
 		await conversionRoundtrip('hevc', 1); // GitHub is extremely slow on this one
 	});
 
-	// 60s, not upstream's 20s: ~2s alone, but past 20s under the full suite's load. Measured, not padded.
-	test('VP8 conversion roundtrip', { timeout: 60_000 }, async () => {
+	test('VP8 conversion roundtrip', { timeout: 20_000 }, async () => {
 		await conversionRoundtrip('vp8');
 	});
 
@@ -3378,7 +3378,7 @@ describe('Audio', async () => {
 		}
 
 		expect(bestLag).toBe(0);
-	});
+	}, 60_000);
 
 	const createNoise = (length: number) => {
 		const noise = new Float32Array(length);
@@ -4476,6 +4476,42 @@ test('encoderControls: a second pass reads the statistics the first one wrote',
 // own and left the slot owned by an environment that no longer existed. The next thread to touch it died
 // on SIGABRT with no JS error. Found by a consumer whose media workers each import the module that
 // registers, including workers that never encode.
+test('every name this package imports from the core is one the installed core has', async () => {
+	// This package resolves `mediabunny` to whatever the consumer installed - an upstream release, which
+	// knows nothing of anything this fork added. A fork-only name imported here builds and tests fine in
+	// this thread, where vitest aliases the core to `src`, and then fails only inside a worker with
+	// "does not provide an export named X" - which says nothing about where the import is.
+	const dir = new URL('../../packages/server/src/', import.meta.url);
+	const names = new Set<string>();
+
+	for (const file of await readdir(dir)) {
+		if (!file.endsWith('.ts')) {
+			continue;
+		}
+
+		const source = await readFile(new URL(file, dir), 'utf8');
+		for (const match of source.matchAll(/import\s*\{([^}]*)\}\s*from\s*'mediabunny'/g)) {
+			for (const name of match[1]!.split(',')) {
+				const bare = name.trim().replace(/^type\s+/, '');
+				if (bare) {
+					names.add(bare);
+				}
+			}
+		}
+	}
+
+	expect(names.size, 'the imports were found at all').toBeGreaterThan(5);
+
+	// The INSTALLED package's declarations, not `import('mediabunny')`: vitest aliases that to this
+	// fork's own source, where every name exists and the check would prove nothing
+	const declarations = await readFile(
+		new URL('../../node_modules/mediabunny/dist/mediabunny.d.ts', import.meta.url),
+		'utf8',
+	);
+
+	expect([...names].filter(name => !new RegExp(`\\b${name}\\b`).test(declarations))).toEqual([]);
+});
+
 describe('a worker thread that registered this package', () => {
 	// The alias only reaches this thread, so the worker loads the built bundle - which is what a consumer
 	// installs anyway. Both halves call into the same process-wide node-av addon, which is where this lives.

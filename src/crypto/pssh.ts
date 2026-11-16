@@ -115,7 +115,6 @@ export const buildCommonPssh = (kids: Uint8Array[]): Uint8Array =>
 
 const PLAYREADY_NS = 'http://schemas.microsoft.com/DRM/2007/03/PlayReadyHeader';
 
-// shaka's ConvertGuidEndianness: the KID's first three GUID groups are little-endian, 8-15 as-is.
 const playReadyGuid = (kid: Uint8Array): Uint8Array => Uint8Array.from([
 	kid[3]!, kid[2]!, kid[1]!, kid[0]!,
 	kid[5]!, kid[4]!,
@@ -174,7 +173,6 @@ export const buildPlayReadyObject = (
 			+ `</DATA></WRMHEADER>`;
 	}
 
-	// PlayReady Header Object: [total size u32 LE][record count u16 LE] + record[type u16 LE][length u16 LE][utf16].
 	const record = utf16le(wrmHeader);
 	const totalSize = 6 + 4 + record.length;
 	return Uint8Array.from([

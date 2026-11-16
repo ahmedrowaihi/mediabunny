@@ -12,6 +12,7 @@
 // packetizer did. Everything here is read off the wire bytes.
 
 import { execFileSync, spawn } from 'node:child_process';
+import { createSocket } from 'node:dgram';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -24,6 +25,7 @@ import {
 	PGROUPS,
 	St2110Packetizer,
 	St2110VideoSender,
+	type St2110Sampling,
 	type St2110VideoFormat,
 } from '../../packages/server/src/st2110.js';
 import {
@@ -31,6 +33,19 @@ import {
 	buildAncSdp,
 	St2110AncPacketizer,
 } from '../../packages/server/src/st2110-anc.js';
+import {
+	packPgroups,
+	parseSt2110Packet,
+	parseSt2110Sdp,
+	samplesInPgroups,
+	St2110Depacketizer,
+	St2110Source,
+	unpackPgroups,
+} from '../../packages/server/src/st2110-receive.js';
+import {
+	DEFAULT_TAI_OFFSET_SECONDS,
+	rtpTimestampAt,
+} from '../../packages/server/src/st2110-clock.js';
 import {
 	audioPayloadSize,
 	buildAudioSdp,
@@ -896,3 +911,481 @@ test('a channel order that does not match the stream is refused, not written', (
 		channelOrder: ['ST'],
 	})).toThrow(/accounts for 2 channels and the stream carries 8/);
 });
+
+// ---------------------------------------------------------------------------------------------
+// Receiving: RFC 4175 packets back into frames, and packed pgroups back into samples.
+//
+// The load-bearing test is the round trip through the *packetizer*, because that is the piece already
+// checked against ffmpeg - a depacketizer written against the same misreading as a hand-written
+// fixture would agree with it perfectly.
+
+const RECEIVE_FORMAT: St2110VideoFormat = {
+	sampling: 'YCbCr-4:2:2',
+	depth: 10,
+	width: 64,
+	height: 8,
+	exactFrameRate: { numerator: 25, denominator: 1 },
+	interlaced: false,
+};
+
+const framePixels = (format: St2110VideoFormat, seed: number) => {
+	const data = new Uint8Array(frameSizeOf(format));
+	for (let i = 0; i < data.length; i++) {
+		data[i] = (i * 37 + seed * 11) & 0xff;
+	}
+	return data;
+};
+
+test('a frame survives the packetizer and comes back out of the depacketizer', () => {
+	const packetizer = new St2110Packetizer({ format: RECEIVE_FORMAT, ssrc: 9, mtu: 400 });
+	const depacketizer = new St2110Depacketizer({ format: RECEIVE_FORMAT });
+	const original = framePixels(RECEIVE_FORMAT, 1);
+
+	const packets = packetizer.packetize(original, 1000);
+	expect(packets.length).toBeGreaterThan(1);
+
+	const frames: ReturnType<St2110Depacketizer['receive']>[] = [];
+	for (const packet of packets) {
+		const finished = depacketizer.receive(packet);
+		if (finished) {
+			frames.push(finished);
+		}
+	}
+	// Nothing came out yet: a frame ends when the NEXT one starts, or on a flush
+	expect(frames).toHaveLength(0);
+
+	const frame = depacketizer.flush()!;
+	expect(frame.complete).toBe(true);
+	expect(frame.markerSeen).toBe(true);
+	expect(frame.timestamp).toBe(1000);
+	expect(Buffer.from(frame.data).equals(Buffer.from(original))).toBe(true);
+});
+
+test('a frame ends because the next one starts, not because the marker arrived', () => {
+	// The marker rides on exactly the packet whose loss a receiver most needs to survive, so it
+	// cannot be what ends a frame
+	const packetizer = new St2110Packetizer({ format: RECEIVE_FORMAT, ssrc: 9, mtu: 400 });
+	const depacketizer = new St2110Depacketizer({ format: RECEIVE_FORMAT });
+
+	const first = framePixels(RECEIVE_FORMAT, 1);
+	const second = framePixels(RECEIVE_FORMAT, 2);
+	const firstPackets = packetizer.packetize(first, 1000);
+	const secondPackets = packetizer.packetize(second, 4600);
+
+	// Drop the marker-bearing last packet of the first frame
+	for (const packet of firstPackets.slice(0, -1)) {
+		expect(depacketizer.receive(packet)).toBe(null);
+	}
+
+	// The first packet of the next frame is what ends it
+	const finished = depacketizer.receive(secondPackets[0]!)!;
+	expect(finished).not.toBe(null);
+	expect(finished.timestamp).toBe(1000);
+	expect(finished.markerSeen).toBe(false);
+	expect(finished.complete).toBe(false);
+	// Everything that did arrive is in the right place, so the loss is a hole rather than a shift
+	const dropped = firstPackets[firstPackets.length - 1]!;
+	expect(finished.octetsReceived).toBeLessThan(frameSizeOf(RECEIVE_FORMAT));
+	expect(dropped.length).toBeGreaterThan(0);
+	const intact = finished.data.subarray(0, finished.octetsReceived);
+	expect(Buffer.from(intact).equals(Buffer.from(first.subarray(0, finished.octetsReceived)))).toBe(true);
+});
+
+test('a datagram that is not RFC 4175 is ignored rather than thrown on', () => {
+	const depacketizer = new St2110Depacketizer({ format: RECEIVE_FORMAT });
+	// A receiver that dies on a malformed datagram is a receiver anyone on the network can stop
+	expect(depacketizer.receive(new Uint8Array(4))).toBe(null);
+	expect(depacketizer.receive(new Uint8Array(40))).toBe(null); // version 0
+	expect(parseSt2110Packet(new Uint8Array([0x80, 0x60, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1]))).toBe(null);
+	expect(depacketizer.pending).toBe(null);
+});
+
+test('samples are unpacked from the bits they occupy, not the octets they touch', () => {
+	// 4:2:2 at ten bits puts four samples in five octets, so the second starts at bit 10 and the
+	// third at bit 20. Reading those at byte offsets gives a picture that looks almost right.
+	const samples = Uint16Array.from([1023, 0, 512, 341]);
+	const packed = packPgroups(samples, 'YCbCr-4:2:2', 10);
+
+	expect(packed).toHaveLength(5);
+	expect(Array.from(unpackPgroups(packed, 'YCbCr-4:2:2', 10))).toEqual([1023, 0, 512, 341]);
+	// Worked out bit by bit: 1111111111 0000000000 1000000000 0101010101 laid end to end, so the
+	// third octet is the last four bits of the second sample followed by the first four of the third
+	expect(Array.from(packed)).toEqual([0xff, 0xc0, 0x08, 0x01, 0x55]);
+});
+
+test('packing and unpacking are inverses at every depth and sampling', () => {
+	for (const sampling of Object.keys(PGROUPS) as St2110Sampling[]) {
+		for (const depth of [8, 10, 12, 16] as const) {
+			const perGroup = samplesInPgroups(sampling, depth, 1);
+			const max = (1 << depth) - 1;
+			const samples = Uint16Array.from(
+				{ length: perGroup * 4 },
+				(unused, index) => (index * 97 + depth * 13) % (max + 1),
+			);
+
+			const packed = packPgroups(samples, sampling, depth);
+			expect(packed.length, `${sampling} ${depth}`).toBe(PGROUPS[sampling][depth].octets * 4);
+			expect(Array.from(unpackPgroups(packed, sampling, depth)), `${sampling} ${depth}`)
+				.toEqual(Array.from(samples));
+		}
+	}
+});
+
+test('a partial pgroup is refused, since it would shift every sample after it', () => {
+	expect(() => packPgroups(Uint16Array.from([1, 2, 3]), 'YCbCr-4:2:2', 10))
+		.toThrow(/not a whole number of .* pgroups/);
+	expect(() => packPgroups(Uint16Array.from([1024, 0, 0, 0]), 'YCbCr-4:2:2', 10))
+		.toThrow(/outside \[0, 1023\]/);
+});
+
+test('the SDP a sender writes is the SDP a receiver reads', () => {
+	// The round trip that matters: what buildSdp publishes has to be enough to interpret the stream
+	const sdp = buildSdp({
+		format: RECEIVE_FORMAT,
+		address: '239.1.2.3',
+		port: 20000,
+	});
+
+	expect(parseSt2110Sdp(sdp)).toEqual(RECEIVE_FORMAT);
+
+	const interlaced: St2110VideoFormat = { ...RECEIVE_FORMAT, interlaced: true, height: 8 };
+	expect(parseSt2110Sdp(buildSdp({ format: interlaced, address: '239.1.2.3', port: 20000 })).interlaced)
+		.toBe(true);
+
+	// A fractional rate is written N/D and a whole one may be written either way
+	const fractional = { ...RECEIVE_FORMAT, exactFrameRate: { numerator: 30000, denominator: 1001 } };
+	expect(parseSt2110Sdp(buildSdp({ format: fractional, address: '239.1.2.3', port: 20000 })).exactFrameRate)
+		.toEqual({ numerator: 30000, denominator: 1001 });
+	expect(parseSt2110Sdp(sdp.replace('exactframerate=25/1', 'exactframerate=25')).exactFrameRate)
+		.toEqual({ numerator: 25, denominator: 1 });
+});
+
+test('an SDP missing what ST 2110-20 requires is refused, not defaulted', () => {
+	// A default here is a silently wrong picture, which is worse than no picture
+	const sdp = buildSdp({ format: RECEIVE_FORMAT, address: '239.1.2.3', port: 20000 });
+
+	for (const [parameter, pattern] of [
+		['depth=10; ', /states no depth/],
+		['width=64; ', /states no width/],
+		['height=8; ', /states no height/],
+		['sampling=YCbCr-4:2:2; ', /states no sampling/],
+	] as const) {
+		expect(() => parseSt2110Sdp(sdp.replace(parameter, '')), parameter).toThrow(pattern);
+	}
+
+	expect(() => parseSt2110Sdp('v=0\r\nm=video 20000 RTP/AVP 96\r\n')).toThrow(/no a=fmtp/);
+	expect(() => parseSt2110Sdp(sdp.replace('depth=10', 'depth=9'))).toThrow(/not 8, 10, 12 or 16/);
+});
+
+test('a source reads frames off a datagram stream', async () => {
+	const packetizer = new St2110Packetizer({ format: RECEIVE_FORMAT, ssrc: 9, mtu: 400 });
+	const frames = [1, 2, 3].map(seed => framePixels(RECEIVE_FORMAT, seed));
+	const datagrams = frames.flatMap((frame, index) => packetizer.packetize(frame, 1000 + index * 3600));
+
+	const source = new St2110Source({
+		sdp: buildSdp({ format: RECEIVE_FORMAT, address: '239.1.2.3', port: 20000 }),
+		datagrams: new ReadableStream<Uint8Array>({
+			start(controller) {
+				for (const datagram of datagrams) {
+					controller.enqueue(datagram);
+				}
+				// Two datagrams that are not packets at all, which a real socket will deliver
+				controller.enqueue(new Uint8Array(3));
+				controller.close();
+			},
+		}),
+	});
+
+	expect(source.format).toEqual(RECEIVE_FORMAT);
+
+	const received: Uint8Array[] = [];
+	for await (const frame of source.frames()) {
+		expect(frame.complete).toBe(true);
+		received.push(frame.data);
+	}
+
+	// Every frame, including the last - which has no successor to end it, so the stream ending is what does
+	expect(received).toHaveLength(3);
+	for (const [index, frame] of received.entries()) {
+		expect(Buffer.from(frame).equals(Buffer.from(frames[index]!)), `frame ${index}`).toBe(true);
+	}
+	expect(source.rejectedDatagrams).toBe(1);
+});
+
+test('a frame can carry its marker and still be short, so completeness is counted', () => {
+	// Dropping a packet from the MIDDLE leaves the marker intact. Reading completeness off the marker
+	// would call this frame whole while a band of it is missing.
+	const packetizer = new St2110Packetizer({ format: RECEIVE_FORMAT, ssrc: 9, mtu: 400 });
+	const depacketizer = new St2110Depacketizer({ format: RECEIVE_FORMAT });
+	const packets = packetizer.packetize(framePixels(RECEIVE_FORMAT, 5), 1000);
+	expect(packets.length).toBeGreaterThan(2);
+
+	for (const [index, packet] of packets.entries()) {
+		if (index !== 1) {
+			depacketizer.receive(packet);
+		}
+	}
+
+	const frame = depacketizer.flush()!;
+	expect(frame.markerSeen).toBe(true);
+	expect(frame.complete).toBe(false);
+	expect(frame.octetsReceived).toBeLessThan(frameSizeOf(RECEIVE_FORMAT));
+});
+
+test('an interlaced frame keeps its two fields apart', () => {
+	// The line number shares its 16-bit word with the field bit, so reading the word whole puts every
+	// second-field line 32768 lines down the raster - which lands outside the frame and is dropped.
+	// A progressive stream never sets that bit, so nothing else here would notice.
+	const interlaced: St2110VideoFormat = { ...RECEIVE_FORMAT, interlaced: true };
+	const packetizer = new St2110Packetizer({ format: interlaced, ssrc: 9, mtu: 400 });
+	const depacketizer = new St2110Depacketizer({ format: interlaced });
+
+	const field = framePixels(interlaced, 7);
+	// One field per timestamp, which is what interlaced ST 2110-20 carries
+	const second = packetizer.packetize(field, 4600, true);
+
+	for (const packet of second) {
+		depacketizer.receive(packet);
+	}
+	const frame = depacketizer.flush()!;
+
+	expect(frame.complete).toBe(true);
+	expect(Buffer.from(frame.data).equals(Buffer.from(field))).toBe(true);
+	// And the field bit really was set on the wire, or this proves nothing
+	expect(parseSt2110Packet(second[0]!)!.runs[0]!.srd.secondField).toBe(true);
+});
+
+test('a stream with no PTP still states a reference clock', () => {
+	// ST 2110-10 section 8.2 requires one either way. A stream stating neither says nothing about
+	// what its timestamps are against, which leaves a receiver no basis for aligning it with anything.
+	const localMac = '00-1b-21-ff-fe-21-e1-b0';
+
+	const video = buildSdp({ format: RECEIVE_FORMAT, address: '239.1.2.3', port: 20000, localMac });
+	expect(video).toContain(`a=ts-refclk:localmac=${localMac}`);
+
+	const audio = buildAudioSdp({
+		format: AUDIO_48K_STEREO_24,
+		address: '239.1.2.3',
+		port: 5004,
+		localMac,
+	});
+	expect(audio).toContain(`a=ts-refclk:localmac=${localMac}`);
+
+	const anc = buildAncSdp({ address: '239.1.2.3', port: 20000, localMac });
+	expect(anc).toContain(`a=ts-refclk:localmac=${localMac}`);
+
+	// PTP wins where both are stated: a stream locked to a grandmaster is not its own clock
+	const both = buildSdp({
+		format: RECEIVE_FORMAT,
+		address: '239.1.2.3',
+		port: 20000,
+		localMac,
+		ptpGrandmaster: '08-00-11-FF-FE-21-E1-B0:0',
+	});
+	expect(both).toContain('a=ts-refclk:ptp=IEEE1588-2008:08-00-11-FF-FE-21-E1-B0:0');
+	expect(both).not.toContain('localmac');
+});
+
+// An ST 2110 RTP timestamp is not a counter. It is a sample of one reference clock shared by every
+// sender on the network, which is what lets a receiver line up video, audio and ancillary that arrived
+// from three different machines. A sender whose timestamps start at zero produces a stream that plays
+// on its own and combines with nothing - and nothing about it looks wrong in isolation.
+
+test('a media clock counts from the PTP epoch in TAI, not from UTC', () => {
+	// 37 seconds between the two as of 2017-01-01, which is the whole difference between a stream that
+	// lines up with the rest of the network and one that is 37 s out while looking internally perfect
+	const utc = 1_700_000_000;
+	expect(rtpTimestampAt(utc, 90_000) - rtpTimestampAt(utc, 90_000, 0))
+		.toBe(DEFAULT_TAI_OFFSET_SECONDS * 90_000);
+
+	// And the offset is applied forwards: TAI is ahead of UTC
+	expect(rtpTimestampAt(utc, 1, 0)).toBe(utc % 0x1_0000_0000);
+	expect(rtpTimestampAt(utc, 1)).toBe((utc + DEFAULT_TAI_OFFSET_SECONDS) % 0x1_0000_0000);
+});
+
+test('a media clock wraps at 2^32 rather than losing its high bits', () => {
+	// 90 kHz passes 2^32 every 13 hours or so, so this is the common case rather than an edge one
+	const wrapAt = 0x1_0000_0000 / 90_000; // TAI seconds at which the counter wraps
+	const before = rtpTimestampAt(wrapAt - DEFAULT_TAI_OFFSET_SECONDS - 1, 90_000);
+	const after = rtpTimestampAt(wrapAt - DEFAULT_TAI_OFFSET_SECONDS + 1, 90_000);
+
+	// Just below the wrap: one second of ticks short of 2^32
+	expect(before).toBeGreaterThan(0x1_0000_0000 - 90_000 * 2);
+	expect(after).toBeLessThan(90_000 * 2);
+	// Never negative, and always inside the field
+	for (const seconds of [0, 1, 1e6, 1e9, 4e9, 1e10]) {
+		const value = rtpTimestampAt(seconds, 90_000);
+		expect(value).toBeGreaterThanOrEqual(0);
+		expect(value).toBeLessThan(0x1_0000_0000);
+	}
+});
+
+test('an unlocked sender times from its own start, and a locked one from the shared clock', async () => {
+	const format: St2110VideoFormat = {
+		width: 64,
+		height: 8,
+		sampling: 'YCbCr-4:2:2',
+		depth: 10,
+		exactFrameRate: { numerator: 25, denominator: 1 },
+	};
+	const frame = testFrame(frameSizeOf(format));
+
+	const timestampsOf = async (clock: { ptpGrandmaster?: string }) => {
+		// A real receiver rather than a patched socket: what is measured is what went on the wire
+		const socket = createSocket({ type: 'udp4', reuseAddr: true });
+		const seen: number[] = [];
+		socket.on('message', message => void seen.push(parse(new Uint8Array(message)).timestamp));
+		await new Promise<void>(resolve => socket.bind(0, '127.0.0.1', resolve));
+		const port = (socket.address() as { port: number }).port;
+
+		const sender = await St2110VideoSender.open({
+			format,
+			ssrc: 0x1234,
+			address: '127.0.0.1',
+			port,
+			...clock,
+		});
+
+		await sender.send(frame);
+		await sender.send(frame);
+		await sender.close();
+		await new Promise<void>(resolve => void setTimeout(resolve, 100)); // Let the last datagrams land
+		socket.close();
+
+		expect(seen.length).toBeGreaterThan(1);
+		return seen;
+	};
+
+	const free = await timestampsOf({});
+	// Nothing stated, so the stream begins at zero - which is all an unlocked sender can honestly do
+	expect(free[0]).toBe(0);
+
+	const locked = await timestampsOf({ ptpGrandmaster: '39-A7-94-FF-FE-07-CB-D0:0' });
+	const now = rtpTimestampAt(Date.now() / 1000, 90_000);
+	// Within a second of the shared clock, rather than at zero
+	expect(locked[0]).not.toBe(0);
+	expect(Math.abs(locked[0]! - now)).toBeLessThan(90_000);
+
+	// And in both cases the spacing is the media clock's, exactly one frame, rather than however late
+	// the pacer happened to wake up
+	for (const seen of [free, locked]) {
+		const first = seen[0]!;
+		const nextFrame = seen.find(value => value !== first);
+		expect(nextFrame).toBeDefined();
+		expect(nextFrame! - first).toBe(90_000 / 25);
+	}
+}, 120_000);
+
+// packPgroups and unpackPgroups ran a bit at a time: depth iterations per sample, which for one
+// 1080p 4:2:2 10-bit frame is 41 million of them. Measured at 66.5 ms against a 40 ms frame interval
+// at 25 fps, so a 1080p sender fell behind before packetizing or pacing had done anything at all.
+
+/** The old implementation, kept here as the oracle: whatever the fast path does must match it. */
+const packBitAtATime = (samples: Uint16Array, sampling: St2110Sampling, depth: number) => {
+	const out = new Uint8Array(Math.ceil(samples.length * depth / 8));
+	let bit = 0;
+	for (const value of samples) {
+		for (let taken = depth - 1; taken >= 0; taken--) {
+			if ((value >> taken) & 1) {
+				out[bit >> 3] = out[bit >> 3]! | (0x80 >> (bit & 7));
+			}
+			bit++;
+		}
+	}
+	void sampling;
+	return out;
+};
+
+const unpackBitAtATime = (data: Uint8Array, count: number, depth: number) => {
+	const out = new Uint16Array(count);
+	let bit = 0;
+	for (let index = 0; index < count; index++) {
+		let value = 0;
+		for (let taken = 0; taken < depth; taken++) {
+			value = (value << 1) | ((data[bit >> 3]! >> (7 - (bit & 7))) & 1);
+			bit++;
+		}
+		out[index] = value;
+	}
+	return out;
+};
+
+test('packing is byte-identical to a bit at a time, for every sampling and depth there is', () => {
+	// Not a spot check: every entry of the table, so a sampling whose pgroup the accumulator happens
+	// to divide evenly cannot stand in for one it does not
+	let combinations = 0;
+
+	for (const [sampling, depths] of Object.entries(PGROUPS)) {
+		for (const depth of Object.keys(depths).map(Number)) {
+			const pgroup = PGROUPS[sampling as St2110Sampling][depth as 8 | 10 | 12 | 16];
+			const perGroup = sampling === 'YCbCr-4:2:2'
+				? pgroup.pixels * 2
+				: sampling === 'YCbCr-4:2:0'
+					? pgroup.pixels * 3 / 2
+					: pgroup.pixels * 3;
+
+			// Several pgroups, with values that exercise every bit of the depth
+			const count = perGroup * 7;
+			const samples = new Uint16Array(count);
+			const max = (1 << depth) - 1;
+			for (let i = 0; i < count; i++) {
+				samples[i] = (i * 2654435761) % (max + 1);
+			}
+
+			const fast = packPgroups(samples, sampling as St2110Sampling, depth as 8 | 10 | 12 | 16);
+			const reference = packBitAtATime(samples, sampling as St2110Sampling, depth);
+			expect(bytesToHexString(fast), `${sampling} ${depth}-bit`).toBe(bytesToHexString(reference));
+
+			const back = unpackPgroups(fast, sampling as St2110Sampling, depth as 8 | 10 | 12 | 16);
+			expect([...back], `${sampling} ${depth}-bit round trip`).toEqual([...samples]);
+			expect([...back], `${sampling} ${depth}-bit against the old unpack`)
+				.toEqual([...unpackBitAtATime(fast, count, depth)]);
+
+			combinations++;
+		}
+	}
+
+	expect(combinations).toBeGreaterThan(5);
+});
+
+test('a 1080p frame costs a fraction of what a bit at a time does', async () => {
+	// Measured as a RATIO against the old implementation running in this same process, because an
+	// absolute millisecond figure that holds on a quiet machine fails on a loaded one.
+	//
+	// The THRESHOLD is the part that needed calibrating, and a ratio does not make it machine-
+	// independent: 12x on a quiet laptop, 3.1x on a CI runner, where the fast path slows down more
+	// than the reference does - the reference is bound by sheer loop count, which scales uniformly,
+	// while the fast path is closer to memory-bound. So the bound is set to catch a RETURN TO PER-BIT
+	// WORK, which scores about 1.3x, rather than to police the speedup. A threshold of 4 calibrated
+	// from this laptop failed CI at 3.1 and published nothing.
+	//
+	// What this therefore does NOT catch is a fall back to the generic accumulator - about 3x the
+	// per-bit loop, and still inside a frame interval. The byte-identical test above is what guards
+	// correctness; this one only guards the order of magnitude.
+	const samples = new Uint16Array(1920 * 1080 * 2);
+	for (let i = 0; i < samples.length; i++) {
+		samples[i] = i & 0x3ff;
+	}
+
+	const time = (run: () => void) => {
+		run(); // Once to let the compiler settle, which otherwise lands entirely on whichever runs first
+		const started = performance.now();
+		run();
+		return performance.now() - started;
+	};
+
+	let packed!: Uint8Array;
+	const fastPack = time(() => void (packed = packPgroups(samples, 'YCbCr-4:2:2', 10)));
+	const slowPack = time(() => void packBitAtATime(samples, 'YCbCr-4:2:2', 10));
+	const fastUnpack = time(() => void unpackPgroups(packed, 'YCbCr-4:2:2', 10));
+	const slowUnpack = time(() => void unpackBitAtATime(packed, samples.length, 10));
+
+	expect(
+		slowPack / fastPack,
+		`pack ${fastPack.toFixed(1)} ms against ${slowPack.toFixed(1)} ms a bit at a time`,
+	).toBeGreaterThan(2);
+	expect(
+		slowUnpack / fastUnpack,
+		`unpack ${fastUnpack.toFixed(1)} ms against ${slowUnpack.toFixed(1)} ms a bit at a time`,
+	).toBeGreaterThan(2);
+}, 300_000);

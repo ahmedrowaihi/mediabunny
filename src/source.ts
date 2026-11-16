@@ -123,8 +123,6 @@ export abstract class Source extends EventEmitter<SourceEvents> {
 
 		if (typeof FinalizationRegistry !== 'undefined') {
 			this._refFinalizationRegistry = new FinalizationRegistry((source) => {
-				// HLS and DASH evict cached segment inputs without disposing them, by design, and an evicted one may
-				// still be being read — so the warning would be noise for those refs
 				if (!source._usedForHls && !source._usedForDash) {
 					Logging._warn(
 						'A SourceRef was garbage-collected without being freed. Hold on to the ref and call .free()'
@@ -240,7 +238,13 @@ export abstract class Source extends EventEmitter<SourceEvents> {
 			throw new TypeError('length, when provided, must be a non-negative integer.');
 		}
 
-		return new RangedSource(this, offset, length);
+		const sliced = new RangedSource(this, offset, length);
+		// A slice of an HLS or DASH source is still one. Without this it is a brand new Source with the
+		// flags clear, so dropping its ref warns about a leak that the format deliberately allows -
+		// which is how a byte-range segment or an AES-128 one ends up logging on every fetch.
+		sliced._usedForHls = this._usedForHls;
+		sliced._usedForDash = this._usedForDash;
+		return sliced;
 	}
 
 	/**
@@ -822,6 +826,14 @@ export type UrlSourceOptions = {
 	 * make a read unbounded.
 	 */
 	getRetryDelay?: (previousAttempts: number, error: unknown, url: string | URL | Request) => number | null;
+	/**
+	 * Stops a retried fetch from logging each failure. Off by default, because a read that is quietly
+	 * retrying for a minute is usually something the developer wants told about.
+	 *
+	 * Worth turning on for a live reader against an origin that is expected to flap, where the retry is
+	 * routine and the log is a minute of noise per outage rather than information.
+	 */
+	quietRetries?: boolean;
 
 	/**
 	 * How long, in seconds, a single request may go unanswered before it is abandoned and retried.
@@ -889,6 +901,8 @@ export class UrlSource extends PathedSource {
 	_url: string | URL | Request;
 	/** @internal */
 	_getRetryDelay: (previousAttempts: number, error: unknown, url: string | URL | Request) => number | null;
+	/** @internal */
+	_quietRetries: boolean;
 	/** Seconds a request may keep failing before the read is given up on; null retries while alive. */
 	_retryTimeout: number | null;
 	/** Seconds a single request may go unanswered before being abandoned; null waits indefinitely. */
@@ -942,6 +956,9 @@ export class UrlSource extends PathedSource {
 		}
 		if (options.requestInit !== undefined && (!options.requestInit || typeof options.requestInit !== 'object')) {
 			throw new TypeError('options.requestInit, when provided, must be an object.');
+		}
+		if (options.quietRetries !== undefined && typeof options.quietRetries !== 'boolean') {
+			throw new TypeError('options.quietRetries, when provided, must be a boolean.');
 		}
 		if (options.getRetryDelay !== undefined && typeof options.getRetryDelay !== 'function') {
 			throw new TypeError('options.getRetryDelay, when provided, must be a function.');
@@ -999,6 +1016,7 @@ export class UrlSource extends PathedSource {
 		this._url = url;
 		this._options = options;
 		this._getRetryDelay = options.getRetryDelay ?? DEFAULT_RETRY_DELAY;
+		this._quietRetries = options.quietRetries ?? false;
 		this._retryTimeout = options.retryTimeout === undefined ? DEFAULT_RETRY_TIMEOUT : options.retryTimeout;
 		this._requestTimeout = options.requestTimeout === undefined
 			? DEFAULT_REQUEST_TIMEOUT
@@ -1159,6 +1177,7 @@ export class UrlSource extends PathedSource {
 				this._getRetryDelay,
 				() => abortController.signal.aborted,
 				this._retryTimeout,
+				this._quietRetries,
 			);
 
 			// Servers clamp a range's end to the resource, so a 416 means the start lies past the end of the resource.
@@ -1414,6 +1433,7 @@ export class UrlSource extends PathedSource {
 							this._getRetryDelay,
 							() => this._disposed,
 							this._retryTimeout,
+							this._quietRetries,
 						);
 
 						if (!newResponse.ok) {
@@ -2288,7 +2308,6 @@ export class ReadableStreamSource extends Source {
 			return;
 		}
 
-		// Set before the waiting reads are answered, so a read issued in response to one of them sees the end
 		this._endIndex = this._currentIndex;
 
 		for (const pendingSlice of this._pendingSlices) {
@@ -2296,7 +2315,6 @@ export class ReadableStreamSource extends Source {
 		}
 		this._pendingSlices.length = 0;
 
-		// Wakes the read parked in `_pull`, which then takes its own end-of-stream path
 		void this._reader?.cancel().catch(() => {});
 	}
 
@@ -2380,8 +2398,6 @@ const PREFETCH_PROFILES = {
 				end = Math.max(end, worker.startPos + extent);
 			}
 
-			// A read ending just before the region means the file is being walked backwards, so the start grows
-			// the same way rather than paying a request per padding step
 			if (end <= worker.startPos && end > worker.startPos - paddingStart) {
 				const size = worker.targetPos - worker.startPos;
 				const extent = Math.min(2 ** Math.ceil(Math.log2(size + 1)), maxExtensionAmount);

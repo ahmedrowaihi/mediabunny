@@ -230,7 +230,6 @@ class Av1Parser {
 		colorConfig: newColorConfig(),
 	};
 
-	// Frame-header state carried across OBUs of a temporal unit.
 	private seenFrameHeader = false;
 	private applyGrain = false;
 	private showExistingFrame = 0;
@@ -375,8 +374,6 @@ class Av1Parser {
 		return (value << 1) - m + extraBit;
 	}
 
-	// --- OBU framing ---
-
 	private parseOpenBitstreamUnit(tiles: Av1Tile[]): void {
 		const { obuType, obuHasSizeField, temporalId, spatialId } = this.parseObuHeader();
 		const obuSize = obuHasSizeField ? this.readLeb128() : Math.floor(this.bitstream.getBitsLeft() / 8);
@@ -452,8 +449,6 @@ class Av1Parser {
 			}
 		}
 	}
-
-	// --- sequence header (5.5) ---
 
 	private parseSequenceHeaderObu(): void {
 		const seq = this.seq;
@@ -652,8 +647,6 @@ class Av1Parser {
 		const n = this.seq.bufferDelayLengthMinus1 + 1;
 		this.skip(n + n + 1);
 	}
-
-	// --- frame header (5.9) ---
 
 	private parseFrameHeaderObu(temporalId: number, spatialId: number): void {
 		if (this.seenFrameHeader) {
@@ -1272,7 +1265,6 @@ class Av1Parser {
 		if (frameIsIntra) {
 			return;
 		}
-		// ref runs LAST_FRAME(1)..ALTREF_FRAME(7); count is what matters, not the value.
 		for (let ref = 1; ref <= ALTREF_FRAME; ref++) {
 			let type = 0; // IDENTITY
 			if (this.rb(1)) { // is_global
@@ -1400,8 +1392,6 @@ class Av1Parser {
 	private skipTemporalPointInfo(): void {
 		this.skip(this.seq.framePresentationTimeLengthMinus1 + 1);
 	}
-
-	// --- frame / tile group (5.10, 5.11) ---
 
 	private parseFrameObu(size: number, temporalId: number, spatialId: number, tiles: Av1Tile[]): void {
 		const startBitPos = this.pos;

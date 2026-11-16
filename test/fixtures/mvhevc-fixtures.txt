@@ -1,0 +1,7 @@
+# The MV-HEVC media test/node/mvhevc.test.ts reads. Fetch them with `npm run capture-mvhevc-fixtures`;
+# the files themselves are not committed, being third-party media.
+#
+# multiview.mov is an Apple spatial video: `lhvC`, a full `vexu` and the `hfov` beside it.
+# pico-mv-hevc.mp4 is a second writer's `lhvC`, which keeps one file's quirks from reading as the format.
+https://fate-suite.ffmpeg.org/hevc/multiview.mov
+https://fate-suite.ffmpeg.org/hevc/pico-mv-hevc.mp4

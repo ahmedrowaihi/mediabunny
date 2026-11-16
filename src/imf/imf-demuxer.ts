@@ -24,8 +24,10 @@ import { Demuxer } from '../demuxer';
 import { Input } from '../input';
 import {
 	InputAudioTrack,
+	InputTrack,
 	InputTrackBacking,
 	InputVideoTrack,
+	type DecodedSubtitleCue,
 } from '../input-track';
 import { TransformationMatrix } from '../misc';
 import { MediaCodec } from '../codec';
@@ -175,8 +177,8 @@ export class ImfDemuxer extends Demuxer {
 		let number = 1;
 
 		for (const track of composition.tracks) {
-			if (track.kind !== 'image' && track.kind !== 'audio') {
-				continue; // markers and subtitles are not media tracks here
+			if (track.kind !== 'image' && track.kind !== 'audio' && track.kind !== 'subtitles') {
+				continue; // a marker sequence carries no essence, so it is not a track
 			}
 
 			const placed: PlacedResource[] = [];
@@ -262,6 +264,15 @@ export class ImfTrackBacking implements InputTrackBacking {
 		this.inputFor = inputFor;
 	}
 
+	/**
+	 * The resolved track of each cut. `decodeCues` is synchronous and has to reach the underlying
+	 * track, which only an await can produce - but nothing yields a packet without resolving its cut
+	 * first, so by the time a packet exists this holds its track.
+	 *
+	 * @internal
+	 */
+	private readonly trackCache = new WeakMap<PlacedResource, InputTrack>();
+
 	/** The underlying track of one resource's file, matched by type. */
 	async trackOf(placed: PlacedResource) {
 		assert(placed.resource.trackFileId !== null);
@@ -275,6 +286,8 @@ export class ImfTrackBacking implements InputTrackBacking {
 				+ ' composition says it does.',
 			);
 		}
+
+		this.trackCache.set(placed, match);
 		return match;
 	}
 
@@ -335,20 +348,51 @@ export class ImfTrackBacking implements InputTrackBacking {
 
 	/** Moves a packet from a resource's file timeline onto the composition's. */
 	private shift(packet: EncodedPacket, placed: PlacedResource, cycle: number) {
-		const timestamp = placed.start
-			+ cycle * placed.fileDuration
-			+ (packet.timestamp - placed.fileStart);
+		const cycleStart = placed.start + cycle * placed.fileDuration;
+		// Clamped to the cut: clip-wrapped essence begins at file time 0 whatever the entry point is,
+		// so the arithmetic alone puts it before the composition - and for a second repeat, before the
+		// first repeat's end, which makes the packets run backwards and leaves `locate` unable to tell
+		// which cut one came from.
+		const timestamp = Math.max(
+			cycleStart,
+			cycleStart + (packet.timestamp - placed.fileStart),
+		);
 
-		// A packet may run past the cut; the composition only has room for what is left of it
-		const remaining = placed.start + placed.duration - timestamp;
-		return packet.clone({ timestamp, duration: Math.max(0, Math.min(packet.duration, remaining)) });
+		// A packet may run past the cut; the composition only has room for what is left of it. The
+		// bound is THIS repeat's end rather than the whole placement's: a resource laid down twice is
+		// two cuts of `fileDuration` each, and a clip-wrapped packet - one element for the whole track
+		// file - otherwise claims every repeat at once.
+		const cycleEnd = Math.min(
+			cycleStart + placed.fileDuration,
+			placed.start + placed.duration,
+		);
+		const remaining = cycleEnd - timestamp;
+		const shifted = packet.clone({
+			timestamp,
+			duration: Math.max(0, Math.min(packet.duration, remaining)),
+			// Where this packet's timestamp sits in the TRACK FILE. The clamp above is what makes this
+			// necessary: a clip-wrapped payload states its own times against the file, and once the
+			// packet is placed at the cut's start instead of at the shift, nothing else relates the
+			// two. A consumer that parses the payload - to keep styling a cue cannot carry - needs it.
+			sideData: {
+				...packet.sideData,
+				sourceTimestamp: placed.fileStart + (timestamp - cycleStart),
+			},
+		});
+
+		// Which cut this came from, for `decodeCues`: a subtitle packet is a whole document whose cues
+		// carry FILE times, and only the cut says where they land in the composition. The packet's own
+		// timestamp cannot answer it, since a repeated resource shifts the same file time more than once.
+		this.cutOf.set(shifted, { placed, cycle, inFile: packet });
+
+		return shifted;
 	}
 
-	/** Whether a packet from the file falls inside this cut at all. */
-	private insideCut(packet: EncodedPacket, placed: PlacedResource) {
-		return packet.timestamp < placed.fileStart + placed.fileDuration - EPSILON
-			&& packet.timestamp >= placed.fileStart - EPSILON;
-	}
+	/** @internal */
+	private readonly cutOf = new WeakMap<
+		EncodedPacket,
+		{ placed: PlacedResource; cycle: number; inFile: EncodedPacket }
+	>();
 
 	/**
 	 * Whether a packet carries any of the cut at all, which is not the same as starting inside it.
@@ -359,6 +403,11 @@ export class ImfTrackBacking implements InputTrackBacking {
 	 * the composition needs. Requiring the packet to *begin* inside the cut discards them - and since
 	 * `getPacket` is at-or-before, the lookup then has nothing to fall back to and the track reads as
 	 * empty.
+	 *
+	 * Clip-wrapped essence is the same thing taken to its limit: an ST 2067-5 timed text file is ONE
+	 * element covering the whole track, so its packet starts at file time 0 whatever the entry point
+	 * is. Asking whether it *starts* inside the cut answers no for every cut but one beginning at
+	 * zero - which left every second resource, and every repeat, reading as empty.
 	 *
 	 * @internal
 	 */
@@ -378,7 +427,11 @@ export class ImfTrackBacking implements InputTrackBacking {
 	}
 
 	getType(): TrackType {
-		return this.track.kind === 'image' ? 'video' : 'audio';
+		if (this.track.kind === 'image') {
+			return 'video';
+		}
+
+		return this.track.kind === 'subtitles' ? 'subtitle' : 'audio';
 	}
 
 	getNumber() {
@@ -463,6 +516,56 @@ export class ImfTrackBacking implements InputTrackBacking {
 		return track;
 	}
 
+	async getConfig() {
+		const track = await this.firstTrack();
+		assert(track.isSubtitleTrack());
+		return track._backing.getConfig();
+	}
+
+	/**
+	 * Maps a document's cues onto the composition.
+	 *
+	 * A subtitle resource is a **cut**, exactly as a video one is: the document covers the whole track
+	 * file and the composition takes a span out of it, laid down `repeatCount` times. The cues inside
+	 * carry FILE times, so each is shifted by the same amount the packet was and **clipped** to the
+	 * cut - a cue the composition does not reach is not in the composition, and one that straddles an
+	 * edge is shown for as long as the cut has room for.
+	 */
+	decodeCues(packet: EncodedPacket): DecodedSubtitleCue[] {
+		const cut = this.cutOf.get(packet);
+		// Only packets this backing produced carry cues, and it records every one of them
+		assert(cut);
+
+		const track = this.trackCache.get(cut.placed);
+		assert(track?.isSubtitleTrack());
+
+		const cutStart = cut.placed.fileStart;
+		const cutEnd = cut.placed.fileStart + cut.placed.fileDuration;
+		const shift = cut.placed.start + cut.cycle * cut.placed.fileDuration - cut.placed.fileStart;
+
+		const out: DecodedSubtitleCue[] = [];
+		for (const decoded of track._backing.decodeCues(cut.inFile)) {
+			const start = decoded.cue.timestamp;
+			const end = start + decoded.cue.duration;
+			if (end <= cutStart + EPSILON || start >= cutEnd - EPSILON) {
+				continue; // Wholly outside the span this resource takes
+			}
+
+			const clippedStart = Math.max(start, cutStart);
+			const clippedEnd = Math.min(end, cutEnd);
+			out.push({
+				cue: {
+					...decoded.cue,
+					timestamp: clippedStart + shift,
+					duration: clippedEnd - clippedStart,
+				},
+				continuationId: decoded.continuationId,
+			});
+		}
+
+		return out;
+	}
+
 	async getInternalCodecId() {
 		return (await this.firstTrack())._backing.getInternalCodecId();
 	}
@@ -529,7 +632,7 @@ export class ImfTrackBacking implements InputTrackBacking {
 
 		const track = await this.trackOf(found.placed);
 		const packet = await track._backing.getPacket(found.fileTime, options);
-		const inside = packet && this.insideCut(packet, found.placed);
+		const inside = packet && this.overlapsCut(packet, found.placed);
 		if (!inside) {
 			const fallback = await this.startOfCut(track, found.placed, options, false);
 			return fallback && this.shift(fallback, found.placed, found.cycle);
@@ -573,7 +676,7 @@ export class ImfTrackBacking implements InputTrackBacking {
 
 		// A key frame before the cut cannot be used: it is not in the composition. The cut's own first
 		// packet is where a decoder has to start, which is why IMF asks for resources to begin on one.
-		if (!packet || !this.insideCut(packet, found.placed)) {
+		if (!packet || !this.overlapsCut(packet, found.placed)) {
 			const edge = await this.startOfCut(track, found.placed, options, true);
 			return edge && this.shift(edge, found.placed, found.cycle);
 		}
@@ -602,13 +705,18 @@ export class ImfTrackBacking implements InputTrackBacking {
 		options: PacketRetrievalOptions,
 		keyOnly: boolean,
 	): Promise<EncodedPacket | null> {
-		const found = this.locate(packet.timestamp);
+		// The cut this packet came from, remembered rather than re-derived. With the clamp in `shift`
+		// the timestamp identifies its own cut again, so `locate` would answer correctly too and a
+		// mutation of this line survives - it is kept because it is the exact in-file packet rather
+		// than a reconstruction of it, which is what a clamped packet cannot give back.
+		const known = this.cutOf.get(packet);
+		const found = known ?? this.locate(packet.timestamp);
 		if (!found) {
 			return null;
 		}
 
 		const track = await this.trackOf(found.placed);
-		const inFile = packet.clone({
+		const inFile = known?.inFile ?? packet.clone({
 			timestamp: found.placed.fileStart
 				+ (packet.timestamp - found.placed.start - found.cycle * found.placed.fileDuration),
 		});
@@ -617,7 +725,7 @@ export class ImfTrackBacking implements InputTrackBacking {
 			? await track._backing.getNextKeyPacket(inFile, options)
 			: await track._backing.getNextPacket(inFile, options);
 
-		if (next && this.insideCut(next, found.placed)) {
+		if (next && this.overlapsCut(next, found.placed)) {
 			return this.shift(next, found.placed, found.cycle);
 		}
 
@@ -631,7 +739,7 @@ export class ImfTrackBacking implements InputTrackBacking {
 		const first = keyOnly
 			? await nextTrack._backing.getKeyPacket(after.placed.fileStart, options)
 			: await nextTrack._backing.getPacket(after.placed.fileStart, options);
-		if (!first || !this.insideCut(first, after.placed)) {
+		if (!first || !this.overlapsCut(first, after.placed)) {
 			return null;
 		}
 

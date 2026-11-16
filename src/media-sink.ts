@@ -2999,18 +2999,26 @@ export class SubtitleCueSink {
 		validateTimestamp(endTimestamp);
 
 		const packetSink = new EncodedPacketSink(this._track);
-		// The parts of a cue live in the packet bodies, so cues can never be recovered from metadata alone.
 		const packetOptions: PacketRetrievalOptions = { ...options, metadataOnly: false };
 
-		// The whole track is read before anything is yielded: a cue's last part can be arbitrarily far from
-		// its first, and only once every part is in can the cues be ordered by start timestamp.
 		const cuesByKey = new Map<string, SubtitleCue>();
 
 		for await (const packet of packetSink.packets(undefined, undefined, packetOptions)) {
+			// Two cues decoded from the SAME packet are distinct by construction - the document says so -
+			// even where their time, id and text are identical. A real IMSC document does exactly that:
+			// four paragraphs at one time with one string between them, differing only in ruby
+			// positioning. Counting the occurrences within the packet keeps them apart here while a
+			// document repeated across packets still lines up, since each copy decodes in the same order.
+			const occurrences = new Map<string, number>();
+
 			for (const decoded of this._track._backing.decodeCues(packet)) {
-				const key = decoded.continuationId !== null
+				const identity = decoded.continuationId !== null
 					? `id:${decoded.continuationId}`
 					: `cue:${decoded.cue.timestamp}:${decoded.cue.identifier ?? ''}:${decoded.cue.text}`;
+
+				const occurrence = occurrences.get(identity) ?? 0;
+				occurrences.set(identity, occurrence + 1);
+				const key = occurrence === 0 ? identity : `${identity}#${occurrence}`;
 
 				const openCue = cuesByKey.get(key);
 				if (!openCue) {

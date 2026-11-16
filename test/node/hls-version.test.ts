@@ -223,3 +223,37 @@ describe('attributes are neither invented nor flattened', () => {
 		expect(serializeHls(without)).not.toContain('RECENTLY-REMOVED-DATERANGES');
 	});
 });
+
+describe('REQ- attributes', () => {
+	// draft-pantos-hls-rfc8216bis section 7: a playlist carrying any attribute whose name begins
+	// REQ- requires version 12, because an older client must not be allowed to ignore a requirement
+	// it does not understand and play the stream anyway.
+	const master = (...body: string[]) => parseHlsPlaylist(['#EXTM3U', ...body, ''].join('\n'));
+
+	test('a variant stating REQ-VIDEO-LAYOUT requires 12', () => {
+		const stereo = master(
+			'#EXT-X-STREAM-INF:BANDWIDTH=6000000,CODECS="hvc1.2.20000000.L120.B0",'
+			+ 'RESOLUTION=1280x1280,REQ-VIDEO-LAYOUT="CH-STEREO/PROJ-RECT"',
+			'v.m3u8',
+		);
+		expect(hlsVersionOf(stereo)).toBe(12);
+	});
+
+	test('an I-frame stream stating it requires 12 too', () => {
+		// The attribute is allowed on both tags, and an I-frame rendition of a stereo stream is still
+		// stereo - a client that cannot render it must not pick it for trick play either
+		const stereo = master(
+			'#EXT-X-I-FRAME-STREAM-INF:BANDWIDTH=2000000,CODECS="hvc1.2.20000000.L120.B0",'
+			+ 'REQ-VIDEO-LAYOUT="CH-STEREO/PROJ-RECT",URI="iframe.m3u8"',
+		);
+		expect(hlsVersionOf(stereo)).toBe(12);
+	});
+
+	test('the same master without it does not', () => {
+		const plain = master(
+			'#EXT-X-STREAM-INF:BANDWIDTH=6000000,CODECS="avc1.64001f",RESOLUTION=1920x1080',
+			'v.m3u8',
+		);
+		expect(hlsVersionOf(plain)).toBe(1);
+	});
+});

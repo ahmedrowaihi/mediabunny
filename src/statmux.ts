@@ -57,6 +57,17 @@ export type StatMuxProgram = {
 	 * A doubling of priority is worth one doubling of bitrate.
 	 */
 	priority?: number;
+	/**
+	 * The finest quantizer this program may be held at, defaulting to the codec's own minimum.
+	 *
+	 * This is the bound that stops a floor chasing content that cannot spend it. `minBitrate` is a
+	 * claim on the pool, not a promise the encoder will fill it, and a programme carrying a static
+	 * picture makes a few kilobits per second *at any quality*. Without a bound the loop reads that as
+	 * "still under its floor" every interval and keeps refining, and the quantizer walks all the way
+	 * to the codec's minimum - which for x264 is lossless, several times slower than real time, and
+	 * still nowhere near the floor.
+	 */
+	minQuantizer?: number;
 };
 
 /**
@@ -170,12 +181,17 @@ export class StatMux {
 			if (!program || typeof program !== 'object') {
 				throw new TypeError(`options.programs[${index}] must be an object.`);
 			}
-			for (const name of ['minBitrate', 'maxBitrate'] as const) {
-				if (!Number.isFinite(program[name]) || program[name] <= 0) {
-					throw new TypeError(
-						`options.programs[${index}].${name} must be a positive number of bits per second.`,
-					);
-				}
+			// minBitrate may be zero: a programme with no floor claims nothing and takes whatever the
+			// shared quantizer gives it, which is the right description of a filler or slate channel
+			if (!Number.isFinite(program.minBitrate) || program.minBitrate < 0) {
+				throw new TypeError(
+					`options.programs[${index}].minBitrate must be a non-negative number of bits per second.`,
+				);
+			}
+			if (!Number.isFinite(program.maxBitrate) || program.maxBitrate <= 0) {
+				throw new TypeError(
+					`options.programs[${index}].maxBitrate must be a positive number of bits per second.`,
+				);
 			}
 			if (program.minBitrate > program.maxBitrate) {
 				throw new TypeError(
@@ -185,6 +201,17 @@ export class StatMux {
 			}
 			if (program.priority !== undefined && !(program.priority > 0 && Number.isFinite(program.priority))) {
 				throw new TypeError(`options.programs[${index}].priority, when provided, must be positive.`);
+			}
+			if (
+				program.minQuantizer !== undefined
+				&& (!Number.isInteger(program.minQuantizer)
+					|| program.minQuantizer < range.min
+					|| program.minQuantizer > range.max)
+			) {
+				throw new TypeError(
+					`options.programs[${index}].minQuantizer, when provided, must be an integer between`
+					+ ` ${range.min} and ${range.max} for codec '${options.codec}'.`,
+				);
 			}
 
 			floor += program.minBitrate;
@@ -284,7 +311,11 @@ export class StatMux {
 	private quantizerFor(program: number) {
 		const state = this.states[program]!;
 		assert(state);
-		return Math.round(clamp(this.shared + state.offset, this.range.min, this.range.max));
+		return Math.round(clamp(
+			this.shared + state.offset,
+			state.options.minQuantizer ?? this.range.min,
+			this.range.max,
+		));
 	}
 
 	/**

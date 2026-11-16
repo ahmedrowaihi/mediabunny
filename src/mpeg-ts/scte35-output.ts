@@ -126,8 +126,6 @@ export const addScte35Section = (
 
 	const muxer = output._muxer;
 	if (muxer instanceof SegmentPipelineMuxer) {
-		// A segmented output opens a muxer per segment, so the section waits in the pipeline until the
-		// segment its splice point falls in is written
 		muxer.writeScte35Section(section, options);
 		return;
 	}

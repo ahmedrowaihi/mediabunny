@@ -4,6 +4,9 @@ import {
 	buildCbcsHlsKey,
 	buildContentProtections,
 	buildHlsKeys,
+	dashContentProtectionSpecs,
+	hlsKeysOf,
+	hlsMethodForScheme,
 	patchMediaPlaylistKeys,
 	patchMpdContentProtection,
 	serializeContentProtection,
@@ -153,6 +156,45 @@ describe('HLS cbcs EXT-X-KEY', () => {
 		expect(keys[2]).toContain(`URI="skd://${KID_UUID}"`);
 	});
 
+	test('hlsKeysOf is the object form of exactly those lines', () => {
+		// The acceptance the consumer stated: they assemble playlists from the model and serialize once,
+		// so taking `buildHlsKeys` lines and parsing them back is a round trip. These must not drift -
+		// `buildHlsKeys` IS this function plus the serializer, and this pins that.
+		const options = {
+			systems: [
+				{ uuid: WIDEVINE_SYSTEM_ID, pssh: buildWidevinePssh(KID) },
+				{ uuid: PLAYREADY_SYSTEM_ID, pssh: buildPlayReadyPssh(KID) },
+				{ uuid: FAIRPLAY_SYSTEM_ID },
+			],
+			fairplayKeyUri: `skd://${KID_UUID}`,
+		};
+
+		const keys = hlsKeysOf(options);
+		expect(keys.map(key => buildCbcsHlsKey({
+			uri: key.uri!,
+			keyFormat: key.keyFormat,
+			keyFormatVersions: '1',
+		}))).toEqual(buildHlsKeys(options));
+
+		// A cbcs key takes its IV from each sample's `senc`, so the tag carries neither IV nor KEYID.
+		expect(keys.map(key => key.method)).toEqual(['SAMPLE-AES', 'SAMPLE-AES', 'SAMPLE-AES']);
+		expect(keys.map(key => key.iv)).toEqual([null, null, null]);
+		expect(keys.map(key => key.keyId)).toEqual([null, null, null]);
+		expect(keys.map(key => key.keyFormatVersions)).toEqual([[1], [1], [1]]);
+		expect(keys.map(key => key.keyFormat)).toEqual([
+			`urn:uuid:${WIDEVINE_SYSTEM_ID}`,
+			'com.microsoft.playready',
+			'com.apple.streamingkeydelivery',
+		]);
+	});
+
+	test('hlsKeysOf refuses a system it cannot signal, as the string form does', () => {
+		expect(() => hlsKeysOf({ systems: [{ uuid: FAIRPLAY_SYSTEM_ID }] }))
+			.toThrow(/fairplayKeyUri is missing/);
+		expect(() => hlsKeysOf({ systems: [{ uuid: WIDEVINE_SYSTEM_ID }] }))
+			.toThrow(/pssh is missing/);
+	});
+
 	test('FairPlay without a fairplayKeyUri throws instead of returning no key', () => {
 		expect(() => buildHlsKeys({ systems: [{ uuid: FAIRPLAY_SYSTEM_ID }] }))
 			.toThrow(/fairplayKeyUri is missing/);
@@ -288,4 +330,59 @@ describe('the DRM system IDs are the registered ones', () => {
 	])('%s', (_name, actual, registered) => {
 		expect(actual).toBe(registered);
 	});
+});
+
+// draft-pantos-hls-rfc8216bis 4.4.4.4 names a METHOD per Common Encryption scheme: SAMPLE-AES is
+// `cbcs`, SAMPLE-AES-CTR is `cenc`. Everything here wrote SAMPLE-AES whatever the scheme, so a
+// `cenc` stream's playlist told a player to decrypt in CBC mode while its own MPD said CTR.
+
+test('a cenc stream is signalled SAMPLE-AES-CTR, and cbcs stays SAMPLE-AES', () => {
+	const systems = [{ uuid: WIDEVINE_SYSTEM_ID, pssh: buildWidevinePssh(KID) }];
+
+	expect(hlsKeysOf({ systems, scheme: 'cenc' })[0]!.method).toBe('SAMPLE-AES-CTR');
+	expect(hlsKeysOf({ systems, scheme: 'cbcs' })[0]!.method).toBe('SAMPLE-AES');
+	// Apple's own sample-AES is the cbcs pattern under another name
+	expect(hlsKeysOf({ systems, scheme: 'cbcs-apple-sample-aes' })[0]!.method).toBe('SAMPLE-AES');
+	// Unstated stays what it has always been, so no existing caller changes behaviour
+	expect(hlsKeysOf({ systems })[0]!.method).toBe('SAMPLE-AES');
+
+	// And the line form says the same thing as the object form
+	expect(buildHlsKeys({ systems, scheme: 'cenc' })[0]!).toContain('METHOD=SAMPLE-AES-CTR');
+	expect(buildHlsKeys({ systems })[0]!).toContain('METHOD=SAMPLE-AES');
+});
+
+test('a scheme HLS states no method for is refused rather than called cbcs', () => {
+	const systems = [{ uuid: WIDEVINE_SYSTEM_ID, pssh: buildWidevinePssh(KID) }];
+
+	// HLS defines a method for the CTR scheme and one for the CBC-pattern scheme, and nothing for
+	// these two. Writing SAMPLE-AES would name a mode the media is not in.
+	for (const scheme of ['cbc1', 'cens'] as const) {
+		expect(() => hlsKeysOf({ systems, scheme }), scheme).toThrow(/no #EXT-X-KEY METHOD/);
+	}
+
+	// FairPlay Streaming decrypts cbcs only, so this combination is a playlist no device can use
+	expect(() => hlsKeysOf({
+		systems: [{ uuid: FAIRPLAY_SYSTEM_ID }],
+		fairplayKeyUri: 'skd://abc',
+		scheme: 'cenc',
+	})).toThrow(/FairPlay cannot be signalled/);
+});
+
+test('drm() states one scheme, not a different one per manifest', () => {
+	// The bug this is really about: `drm()` used its `scheme` for the DASH mp4protection descriptor
+	// and dropped it on the way to the HLS keys, so one call described the same content as CTR in
+	// the MPD and CBC in the playlist.
+	const options = {
+		scheme: 'cenc' as const,
+		defaultKid: KID,
+		systems: [{ uuid: WIDEVINE_SYSTEM_ID, pssh: buildWidevinePssh(KID) }],
+	};
+
+	const dashScheme = dashContentProtectionSpecs(options)
+		.find(spec => spec.schemeIdUri === 'urn:mpeg:dash:mp4protection:2011')!.value;
+	const hlsMethod = hlsKeysOf(options)[0]!.method;
+
+	expect(dashScheme).toBe('cenc');
+	expect(hlsMethod).toBe(hlsMethodForScheme('cenc'));
+	expect(hlsMethod).toBe('SAMPLE-AES-CTR');
 });

@@ -149,7 +149,6 @@ export class Aes128CbcContext {
 			this.roundkey[index + 3] = this.roundkey[index - 1]! ^ this.roundkey[index + 2]!;
 		}
 
-		// Keep the forward key schedule for encryption before the decrypt-only transforms below.
 		this.encryptRoundkey.set(this.roundkey);
 
 		// Invert the order of the round keys
@@ -176,8 +175,6 @@ export class Aes128CbcContext {
 
 	/** Reset the IV without re-deriving the key schedule. A short IV (e.g. 8-byte cbcs) is right-padded with zeros. */
 	setIv(iv: Uint8Array) {
-		// Not via a padded copy + DataView: CTR calls this once per block, and those two
-		// allocations dominated encryption.
 		const length = iv.length;
 		for (let i = 0; i < 4; i++) {
 			const at = i * 4;
@@ -197,7 +194,6 @@ export class Aes128CbcContext {
 
 		let t0, t1, t2, t3;
 
-		// Rounds 1-9
 		for (let round = 1; round < 10; round++) {
 			const offset = round * 4;
 			t0 = Te0[s0 >>> 24]!
@@ -227,7 +223,6 @@ export class Aes128CbcContext {
 			s3 = t3;
 		}
 
-		// Final Round (10): S-Box (Te4) with forward ShiftRows, no MixColumns.
 		const f0 = (Te4[s0 >>> 24]! & 0xff000000)
 			^ (Te4[(s1 >>> 16) & 0xff]! & 0x00ff0000)
 			^ (Te4[(s2 >>> 8) & 0xff]! & 0x0000ff00)
@@ -254,7 +249,6 @@ export class Aes128CbcContext {
 		this.outView.setUint32(8, f2, false);
 		this.outView.setUint32(12, f3, false);
 
-		// Ciphertext becomes the IV for the next block.
 		this.iv[0] = f0;
 		this.iv[1] = f1;
 		this.iv[2] = f2;

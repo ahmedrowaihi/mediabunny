@@ -65,19 +65,29 @@ export const readBerLength = (slice: FileSlice): number => {
 /** How many bytes a BER length occupies at `slice`'s position, without consuming it. */
 export const berLengthSize = (first: number): number => ((first & 0x80) === 0 ? 1 : 1 + (first & 0x7f));
 
-/** Reads one KLV header, or null where the slice does not hold a whole one. */
-export const readKlvHeader = (slice: FileSlice): KlvHeader | null => {
+/**
+ * Reads one KLV header, or null where the slice does not hold a whole one.
+ *
+ * A key that is not a SMPTE universal label is a desynchronised read everywhere a caller knows what
+ * it is looking at, so it is refused by default. Inside header metadata it is not: Avid writes
+ * private sets there under keys of its own, beginning 0x80 rather than 060e2b34, and a reader that
+ * refuses those refuses most Avid files. Callers walking a region where anything may appear pass
+ * `allowPrivateKeys` and step over what they do not recognise.
+ */
+export const readKlvHeader = (slice: FileSlice, allowPrivateKeys = false): KlvHeader | null => {
 	const start = slice.filePos;
 	if (slice.remainingLength < KEY_LENGTH + 1) {
 		return null;
 	}
 
 	const key = readBytes(slice, KEY_LENGTH);
-	for (let i = 0; i < SMPTE_UL_PREFIX.length; i++) {
-		if (key[i] !== SMPTE_UL_PREFIX[i]) {
-			throw new MalformedInputError(
-				`Expected an MXF key at offset ${start}, but the bytes are not a SMPTE universal label.`,
-			);
+	if (!allowPrivateKeys) {
+		for (let i = 0; i < SMPTE_UL_PREFIX.length; i++) {
+			if (key[i] !== SMPTE_UL_PREFIX[i]) {
+				throw new MalformedInputError(
+					`Expected an MXF key at offset ${start}, but the bytes are not a SMPTE universal label.`,
+				);
+			}
 		}
 	}
 
@@ -95,6 +105,40 @@ export const readKlvHeader = (slice: FileSlice): KlvHeader | null => {
  * byte 7 is the registry version and byte 14 is the set's own version, and a `null` in the pattern
  * skips any other byte a caller does not care about.
  */
+/**
+ * How far into a file the header partition pack sits. SMPTE 377-1 lets up to 64 KB of "run-in"
+ * precede it, for systems that put something of their own at the front, and every offset the file
+ * states is measured from the pack rather than from the file - so this is the origin everything else
+ * is relative to. `C0023S01.mxf` opens with eight zero octets and was unreadable without this.
+ */
+export const RUN_IN_LIMIT = 65536;
+
+/**
+ * How far a *probe* looks for it. The limit above is what the specification allows; this is what it
+ * is worth reading to find out whether a file is MXF at all, since every input of every format pays
+ * that read. Four kilobytes covers the run-ins that occur (`C0023S01.mxf`'s is eight octets) without
+ * turning a sixteen-octet probe into a sixty-four-kilobyte one.
+ */
+export const RUN_IN_PROBE_LIMIT = 4096;
+
+/** Where the header partition pack begins within `bytes`, or null where there is none. */
+export const findRunIn = (bytes: Uint8Array, within = RUN_IN_LIMIT): number | null => {
+	const limit = Math.min(bytes.length - KEY_LENGTH, within);
+	for (let at = 0; at <= limit; at++) {
+		if (
+			bytes[at] === SMPTE_UL_PREFIX[0]
+			&& bytes[at + 1] === SMPTE_UL_PREFIX[1]
+			&& bytes[at + 2] === SMPTE_UL_PREFIX[2]
+			&& bytes[at + 3] === SMPTE_UL_PREFIX[3]
+			&& partitionKind(bytes.subarray(at, at + KEY_LENGTH)) === 'header'
+		) {
+			return at;
+		}
+	}
+
+	return null;
+};
+
 export const keyMatches = (key: Uint8Array, pattern: readonly (number | null)[]): boolean => {
 	for (let i = 0; i < KEY_LENGTH; i++) {
 		const expected = pattern[i];
@@ -163,6 +207,26 @@ export const essenceTrackNumber = (key: Uint8Array): number | null => {
 	return ((key[12]! << 24) | (key[13]! << 16) | (key[14]! << 8) | key[15]!) >>> 0;
 };
 
+/**
+ * The Random Index Pack, which closes a complete file: a BodySID and a byte offset per partition,
+ * then a 32-bit length of the whole pack, which is how it is found from the end.
+ */
+export const RANDOM_INDEX_PACK = [
+	0x06, 0x0e, 0x2b, 0x34, 0x02, 0x05, 0x01, null,
+	0x0d, 0x01, 0x02, 0x01, 0x01, 0x11, 0x01, 0x00,
+] as const;
+
+/**
+ * Whether an essence element key is the D-10 sound element, which carries AES3 rather than PCM.
+ *
+ * SMPTE 386M wraps D-10 audio as SMPTE 331M AES3: a four-octet header, then a 32-octet group per
+ * audio sample holding eight 32-bit subframes whatever the channel count, each subframe carrying its
+ * sample in the upper bits. A reader that hands those octets back as PCM hands back noise. FFmpeg
+ * keys on the same three octets (`mxfdec.c`, "check for 8 channels AES3 element").
+ */
+export const isD10Aes3Element = (key: Uint8Array): boolean =>
+	keyMatches(key, ESSENCE_ELEMENT) && key[12] === 0x06 && key[13] === 0x01 && key[14] === 0x10;
+
 export const INDEX_TABLE_SEGMENT = [
 	0x06, 0x0e, 0x2b, 0x34, 0x02, 0x53, 0x01, null,
 	0x0d, 0x01, 0x02, 0x01, 0x01, 0x10, 0x01, 0x00,
@@ -182,6 +246,11 @@ export const setTypeOf = (key: Uint8Array): number | null =>
 
 /** The sets this demuxer reads, by the number SMPTE 377M gives each one. */
 export enum MxfSetType {
+	/**
+	 * SMPTE ST 2067-5's descriptor for a timed text track file. Not in 377M, and read from a real
+	 * IMSC track file rather than a table: it is the one set in such a file that 377M does not name.
+	 */
+	TimedTextDescriptor = 0x0164,
 	Preface = 0x012f,
 	Identification = 0x0130,
 	ContentStorage = 0x0118,
@@ -191,6 +260,12 @@ export enum MxfSetType {
 	Track = 0x013b,
 	EventTrack = 0x0139,
 	StaticTrack = 0x013a,
+	/**
+	 * Alternative representations of the same essence, one SourceClip per choice. A material track
+	 * can hold one of these where a SourceClip would otherwise be, and then nothing points at the
+	 * essence until a choice is followed.
+	 */
+	EssenceGroup = 0x0105,
 	Sequence = 0x010f,
 	SourceClip = 0x0111,
 	TimecodeComponent = 0x0114,

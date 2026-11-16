@@ -22,6 +22,8 @@ import { essenceTrackNumber, readKlvHeader, partitionKind } from './mxf-klv';
 
 export type MxfEssenceElement = {
 	trackNumber: number;
+	/** The element's own key, which says what the essence inside it is wrapped as. */
+	key: Uint8Array;
 	/**
 	 * Byte offset of the element's key. An index states its offsets from here, not from the value: an
 	 * edit unit is the whole KLV triplet.
@@ -41,13 +43,11 @@ export type MxfWrapping = 'frame' | 'clip';
  * Deliberately not read from the essence container label. The label does state it, but where it
  * states it differs per mapping - byte 15 for the MPEG and AVC mappings, byte 14 for VC-3, JPEG 2000
  * and ProRes - so reading it means a table of mappings, which is wrong for every mapping not in the
- * table. The count is the same fact without the table: frame wrapping writes one element per edit
- * unit, clip wrapping writes one element for the whole track.
+ * table. FFmpeg carries that table and still answers "unknown" for containers outside it. The count
+ * is the same fact without the table: frame wrapping writes one element per edit unit, clip wrapping
+ * writes one element for the whole track.
  */
 export const wrappingOf = (elementCount: number, editUnitCount: number | null): MxfWrapping => {
-	// A single element covering a track that runs for more than one edit unit can only be clip wrapped.
-	// A track that is one edit unit long is both at once, and frame is the answer that then reads it
-	// correctly either way.
 	if (elementCount === 1 && editUnitCount !== null && editUnitCount > 1) {
 		return 'clip';
 	}
@@ -75,13 +75,13 @@ export const walkEssenceElements = (
 
 		const trackNumber = essenceTrackNumber(header.key);
 		if (trackNumber === null) {
-			// Fill, an index segment, metadata repeated in a body partition - anything but essence
 			slice.skip(header.length);
 			continue;
 		}
 
 		const stop = onElement({
 			trackNumber,
+			key: header.key,
 			keyStart: header.start,
 			start: header.valueStart,
 			length: header.length,

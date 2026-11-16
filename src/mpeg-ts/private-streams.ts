@@ -144,7 +144,6 @@ const readTeletextEntries = (bytes: Uint8Array, start: number, end: number): Tel
 			language: language(bytes, at),
 			type: (packed >> 3) & 0x1f,
 			magazine,
-			// Two hex digits for the page, and magazine 0 means 8, so 888 reads back as 888
 			page: (magazine === 0 ? 8 : magazine) * 100 + (page >> 4) * 10 + (page & 0xf),
 		});
 	}
@@ -295,8 +294,6 @@ const readPts = (bytes: Uint8Array, at: number) => {
  */
 export const readPrivatePesPayloads = (bytes: Uint8Array, pid: number): PrivatePesPayload[] => {
 	const out: PrivatePesPayload[] = [];
-	// `expected` is the payload length the PES header stated, or null where it stated 0 and the packet
-	// therefore runs until the next one starts
 	let current: { time: number | null; chunks: number[]; expected: number | null } | null = null;
 
 	/**
@@ -320,7 +317,6 @@ export const readPrivatePesPayloads = (bytes: Uint8Array, pid: number): PrivateP
 		}
 
 		if (chunks.length >= expected) {
-			// Trimmed to the stated length: what follows it on this PID belongs to no packet
 			out.push({ pid, time, data: new Uint8Array(chunks.slice(0, expected)) });
 		}
 	};
@@ -369,7 +365,6 @@ export const readPrivatePesPayloads = (bytes: Uint8Array, pid: number): PrivateP
 		}
 	}
 
-	// Not a unit start: a packet still open at the end of the buffer was cut by it, not finished
 	finish(false);
 
 	return out;

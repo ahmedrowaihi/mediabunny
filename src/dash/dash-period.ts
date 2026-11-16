@@ -141,8 +141,6 @@ export class Period {
 		mediaInfo: MediaInfo,
 		contentProtectionInAdaptationSet: boolean,
 	): AdaptationSet | null {
-		// Set duration if it is not set. It may be updated later from duration
-		// calculated from segments.
 		if (this.durationSecondsValue === 0 && mediaInfo.mediaDurationSeconds !== undefined) {
 			this.durationSecondsValue = mediaInfo.mediaDurationSeconds;
 		}
@@ -156,7 +154,6 @@ export class Period {
 			}
 		}
 
-		// None of the adaptation sets match — create a new one.
 		const language = getLanguage(mediaInfo);
 		const newSet = this.newAdaptationSet(language);
 		if (!this.setNewAdaptationSetAttributes(
@@ -169,7 +166,6 @@ export class Period {
 			return null;
 		}
 
-		// Cross-link with switchable peers.
 		for (const existing of adaptationSetsInBucket) {
 			if (existing.switchableAdaptationSet(newSet)) {
 				existing.addAdaptationSetSwitching(newSet);
@@ -192,8 +188,6 @@ export class Period {
 	 *   dynamic-MPD multi-period)
 	 */
 	getXml(outputPeriodDuration: boolean): XmlNode | null {
-		// Sort by AdaptationSet.sortIndex(), placing entries without an index
-		// at the end (mirrors shaka's lambda).
 		this.adaptationSets.sort((a, b) => {
 			const ia = a.sortIndex();
 			const ib = b.sortIndex();
@@ -208,10 +202,8 @@ export class Period {
 
 		const period = new XmlNode('Period');
 
-		// Required for 'dynamic' MPDs.
 		period.setId(this.idValue);
 
-		// Required for LL-DASH MPDs.
 		if (this.mpdOptions.mpdParams.lowLatencyDashMode) {
 			const serviceDescription = new XmlNode('ServiceDescription');
 			serviceDescription.setIntegerAttribute('id', this.idValue);
@@ -222,7 +214,6 @@ export class Period {
 			period.addChild(serviceDescription);
 		}
 
-		// Multi-period MPDs need AdaptationSet ids consistent across periods
 		let idx = 0;
 		for (const set of this.adaptationSets) {
 			if (!set.hasId()) {
@@ -293,7 +284,6 @@ export class Period {
 		contentProtectionInAdaptationSet: boolean,
 		newAdaptationSet: AdaptationSet,
 	): boolean {
-		// Roles from explicit `dashRoles`, or default-language → main.
 		if (mediaInfo.dashRoles && mediaInfo.dashRoles.length > 0) {
 			for (const roleStr of mediaInfo.dashRoles) {
 				const role = roleFromString(roleStr);
@@ -311,7 +301,6 @@ export class Period {
 			}
 		}
 
-		// Accessibility entries (`scheme=value` strings).
 		for (const accessibility of mediaInfo.dashAccessibilities ?? []) {
 			const eq = accessibility.indexOf('=');
 			if (eq === -1) {
@@ -324,8 +313,6 @@ export class Period {
 		newAdaptationSet.setCodec(codec);
 
 		if (mediaInfo.videoInfo) {
-			// Because language is ignored for videos, this bucket holds all video
-			// AdaptationSets — promote each to "main" once there's more than one.
 			if (adaptationSets.length > 1) {
 				newAdaptationSet.addRole('main');
 			} else if (adaptationSets.length === 1) {
@@ -333,7 +320,6 @@ export class Period {
 				newAdaptationSet.addRole('main');
 			}
 
-			// Trick-play matching.
 			if (mediaInfo.videoInfo.playbackRate !== undefined) {
 				const trickPlayMatch = this.findMatchingAdaptationSetForTrickPlay(
 					mediaInfo,
@@ -357,7 +343,6 @@ export class Period {
 				}
 			}
 
-			// Color metadata. Dolby Vision (dvh*) is always PQ; otherwise read from videoInfo.
 			if (codec.startsWith('dvh')) {
 				newAdaptationSet.setTransferCharacteristics(TRANSFER_FUNCTION_PQ);
 			} else if (mediaInfo.videoInfo.transferCharacteristics !== undefined) {
@@ -378,7 +363,6 @@ export class Period {
 				}
 			}
 		} else if (mediaInfo.textInfo) {
-			// IOP wants (sub)segmentAlignment on every AdaptationSet; shaka sets it unconditionally
 			newAdaptationSet.forceSetSegmentAlignment(true);
 		}
 
@@ -387,7 +371,6 @@ export class Period {
 			addContentProtectionElements(mediaInfo, newAdaptationSet);
 		}
 
-		// CEA-608 / CEA-708 captions on regular (non-trickplay) video reps.
 		if (mediaInfo.videoInfo && mediaInfo.videoInfo.playbackRate === undefined) {
 			for (const caption of this.mpdOptions.mpdParams.closedCaptions) {
 				if (caption.channel.startsWith('CC')) {

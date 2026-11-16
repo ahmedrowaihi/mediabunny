@@ -28,6 +28,8 @@ import { Writer } from './writer';
 import { Logging } from './logging';
 import { EncodedPacket } from './packet';
 import { validateAudioChunkMetadata, validateVideoChunkMetadata } from './codec';
+import { parseTimecode } from './timecode';
+import { type Afd, validateAfd } from './afd';
 import { type VideoDecoderConfigWithHdr } from './hdr-metadata';
 import { type ClosedCaptionsMetadata, validateClosedCaptionsMetadata } from './closed-captions';
 
@@ -293,6 +295,35 @@ export type VideoTrackMetadata = BaseTrackMetadata & {
 	 * with the same timestamp.
 	 */
 	frameRate?: number;
+	/**
+	 * The active format description (SMPTE ST 2016-1) to state on this track's frames: which part of the
+	 * coded frame carries the picture, so a receiver whose display has a different shape knows what it
+	 * may crop and what it must letterbox. `10` is a 16:9 picture filling a 16:9 frame; `9` is a centred
+	 * 4:3 one.
+	 *
+	 * Written as an ATSC A/53 `user_data_registered_itu_t_t35` SEI message under the `DTG1` identifier,
+	 * on **every** frame, which is how broadcast receivers expect to find it - one joining mid-GOP must
+	 * still learn the shape. AVC and HEVC only; no container has a box for this, so the bitstream is the
+	 * carriage in every format.
+	 *
+	 * A packet that already states an AFD keeps the one it has, so remuxing someone else's signalled
+	 * stream does not double it up.
+	 */
+	activeFormatDescription?: Afd;
+	/**
+	 * The broadcast timecode of this track's first frame, written `hh:mm:ss:ff` - or `hh:mm:ss;ff` for a
+	 * drop-frame count, which is the only thing in the string that states one.
+	 *
+	 * Requires {@link VideoTrackMetadata.frameRate}: a timecode counts frames, so without the rate those
+	 * frames are stated against it names no instant.
+	 *
+	 * How it is carried depends on the format. ISOBMFF files (MP4, MOV) get a `tmcd` timecode track that
+	 * the video track points at, which every editor reads and which works for any codec. MPEG-TS has no
+	 * such track, so the timecode goes in the bitstream as an SEI message on each frame - which HEVC can
+	 * always carry and AVC can only carry when the encoder's SPS declares `pic_struct_present_flag`,
+	 * since an AVC `pic_timing` message is read against the SPS rather than being self-describing.
+	 */
+	timecode?: string;
 	/**
 	 * When true, this track is marked as being made only out of key frames (I-frames). It is an error to add a non-key
 	 * frame to this track.
@@ -748,6 +779,27 @@ export class Output<
 				`Invalid video frame rate: ${metadata.frameRate}. Must be a positive number.`,
 			);
 		}
+		if (metadata.activeFormatDescription !== undefined) {
+			validateAfd(metadata.activeFormatDescription, 'metadata.activeFormatDescription');
+
+			if (source._codec !== 'avc' && source._codec !== 'hevc') {
+				throw new Error(
+					`metadata.activeFormatDescription was provided, but ${source._codec} has no SEI message`
+					+ ' to carry one. An active format description rides the bitstream, and only AVC and'
+					+ ' HEVC have the ATSC user-data message it uses.',
+				);
+			}
+		}
+		if (metadata.timecode !== undefined) {
+			if (metadata.frameRate === undefined) {
+				throw new Error(
+					'metadata.timecode can only be provided alongside metadata.frameRate; a timecode counts'
+					+ ' frames, so it names no instant without the rate those frames are stated against.',
+				);
+			}
+
+			parseTimecode(metadata.timecode, metadata.frameRate);
+		}
 		if (metadata.hasOnlyKeyPackets !== undefined && typeof metadata.hasOnlyKeyPackets !== 'boolean') {
 			throw new TypeError('metadata.hasOnlyKeyPackets, when provided, must be a boolean.');
 		}
@@ -786,10 +838,11 @@ export class Output<
 		if (metadata.closedCaptions !== undefined) {
 			validateClosedCaptionsMetadata(metadata.closedCaptions, 'metadata.closedCaptions');
 
-			if (source._codec !== 'avc' && source._codec !== 'hevc') {
+			if (source._codec !== 'avc' && source._codec !== 'hevc' && source._codec !== 'mpeg2') {
 				throw new Error(
 					`metadata.closedCaptions was provided, but ${source._codec} has no bitstream that can carry`
-					+ ' them. Closed captions ride in AVC or HEVC SEI messages.',
+					+ ' them. Closed captions ride in AVC or HEVC SEI messages, or in an MPEG-2 picture\'s'
+					+ ' user data.',
 				);
 			}
 		}

@@ -99,7 +99,6 @@ export const hlsReloadState = (
 	const { msn, part } = directive;
 	const last = parsed.mediaSequence + parsed.segments.length - 1;
 	const parts = parsed.trailingParts.length;
-	// A playlist without EXT-X-PART-INF should never reach here; a flat three is the safe fallback
 	const target = parsed.partTarget ?? 1;
 	const limit = target < 1 ? 3 / target : 3;
 

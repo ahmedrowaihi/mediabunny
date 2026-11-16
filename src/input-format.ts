@@ -10,7 +10,7 @@ import { Demuxer } from './demuxer';
 import { Input } from './input';
 import { IsobmffDemuxer } from './isobmff/isobmff-demuxer';
 import { MxfDemuxer } from './mxf/mxf-demuxer';
-import { partitionKind } from './mxf/mxf-klv';
+import { findRunIn, KEY_LENGTH, RUN_IN_PROBE_LIMIT } from './mxf/mxf-klv';
 import type { PsshBox } from './isobmff/isobmff-misc';
 import {
 	EBMLId,
@@ -28,6 +28,8 @@ import { skipId3V2Tags } from './id3';
 import { readConfirmedMp3FrameHeader } from './mp3/mp3-reader';
 import { OggDemuxer } from './ogg/ogg-demuxer';
 import { WaveDemuxer } from './wave/wave-demuxer';
+import { AiffDemuxer } from './aiff/aiff-demuxer';
+import { Y4M_SIGNATURE, Y4mDemuxer } from './y4m/y4m-demuxer';
 import { readConfirmedAdtsFrameHeader } from './adts/adts-reader';
 import { AdtsDemuxer } from './adts/adts-demuxer';
 import { readAscii, readBytes, readU32Be, readU64Be } from './reader';
@@ -433,6 +435,85 @@ export class WaveInputFormat extends InputFormat {
 }
 
 /**
+ * AIFF file format, including AIFF-C.
+ *
+ * Do not instantiate this class; use the {@link AIFF} singleton instead.
+ *
+ * @group Input formats
+ * @public
+ */
+export class AiffInputFormat extends InputFormat {
+	/** @internal */
+	async _getMatchPosition(input: Input) {
+		let slice = input._reader.requestSlice(0, 12);
+		if (isThenable(slice)) slice = await slice;
+		if (!slice) return null;
+
+		if (readAscii(slice, 4) !== 'FORM') {
+			return null;
+		}
+
+		slice.skip(4);
+
+		const formType = readAscii(slice, 4);
+		return formType === 'AIFF' || formType === 'AIFC' ? 0 : null;
+	}
+
+	/** @internal */
+	_createDemuxer(input: Input) {
+		return new AiffDemuxer(input);
+	}
+
+	get name() {
+		return 'AIFF';
+	}
+
+	get mimeType() {
+		return 'audio/aiff';
+	}
+
+	get supportsTimestampedMediaData() {
+		return false;
+	}
+}
+
+/**
+ * YUV4MPEG2 (Y4M) file format.
+ *
+ * Do not instantiate this class; use the {@link Y4M} singleton instead.
+ *
+ * @group Input formats
+ * @public
+ */
+export class Y4mInputFormat extends InputFormat {
+	/** @internal */
+	async _getMatchPosition(input: Input) {
+		let slice = input._reader.requestSlice(0, Y4M_SIGNATURE.length);
+		if (isThenable(slice)) slice = await slice;
+		if (!slice) return null;
+
+		return readAscii(slice, Y4M_SIGNATURE.length) === Y4M_SIGNATURE ? 0 : null;
+	}
+
+	/** @internal */
+	_createDemuxer(input: Input) {
+		return new Y4mDemuxer(input);
+	}
+
+	get name() {
+		return 'Y4M';
+	}
+
+	get mimeType() {
+		return 'video/x-yuv4mpeg';
+	}
+
+	get supportsTimestampedMediaData() {
+		return false;
+	}
+}
+
+/**
  * Ogg file format.
  *
  * Do not instantiate this class; use the {@link OGG} singleton instead.
@@ -678,7 +759,6 @@ export class DashInputFormat extends InputFormat {
 
 		input._rootSource._usedForDash = true;
 
-		// An MPD is the whole file; there is no run-in to skip
 		return 0;
 	}
 
@@ -713,14 +793,40 @@ export class DashInputFormat extends InputFormat {
 export class MxfInputFormat extends InputFormat {
 	/** @internal */
 	async _getMatchPosition(input: Input) {
-		let slice = input._reader.requestSlice(0, 16);
+		// A file begins with a header partition pack, whose key is the only thing that identifies MXF:
+		// there is no magic string, and the SMPTE prefix alone is shared with every other KLV format.
+		const atZero = await this.headerPartitionWithin(input, KEY_LENGTH, 0);
+		if (atZero !== null) {
+			return atZero;
+		}
+
+		// SMPTE 377-1 allows up to 64 KB of run-in before the pack, which some systems write. The
+		// pack is searched for - but only within a few kilobytes, and only when the size is known.
+		// EVERY input of EVERY format runs this probe: asking for 64 KB here turned a 16-octet read
+		// into a 64-kilobyte one for every file opened, and on a source whose size is unknown - a
+		// live stream - it waits for bytes that may not arrive for a long time.
+		const fileSize = input._reader.fileSize;
+		if (fileSize === null || fileSize <= KEY_LENGTH) {
+			return null;
+		}
+
+		return this.headerPartitionWithin(
+			input,
+			Math.min(RUN_IN_PROBE_LIMIT + KEY_LENGTH, fileSize),
+			RUN_IN_PROBE_LIMIT,
+		);
+	}
+
+	/**
+	 * Where a header partition pack begins in the first `length` octets, searching `within` octets of
+	 * run-in, or null where there is none.
+	 */
+	private async headerPartitionWithin(input: Input, length: number, within: number) {
+		let slice = input._reader.requestSlice(0, length);
 		if (isThenable(slice)) slice = await slice;
 		if (!slice) return null;
 
-		// A file begins with a header partition pack, whose key is the only thing that identifies MXF:
-		// there is no magic string, and the SMPTE prefix alone is shared with every other KLV format
-		const key = readBytes(slice, 16);
-		return partitionKind(key) === 'header' ? 0 : null;
+		return findRunIn(readBytes(slice, length), within);
 	}
 
 	/** @internal */
@@ -783,6 +889,18 @@ export const WAVE = /* #__PURE__ */ new WaveInputFormat();
  * @public
  */
 export const OGG = /* #__PURE__ */ new OggInputFormat();
+/**
+ * AIFF input format singleton.
+ * @group Input formats
+ * @public
+ */
+export const AIFF = /* #__PURE__ */ new AiffInputFormat();
+/**
+ * Y4M input format singleton.
+ * @group Input formats
+ * @public
+ */
+export const Y4M = /* #__PURE__ */ new Y4mInputFormat();
 /**
  * ADTS input format singleton.
  * @group Input formats
@@ -903,7 +1021,7 @@ export const IMF = /* #__PURE__ */ new ImfInputFormat();
  * @public
  */
 export const ALL_FORMATS: InputFormat[] = [
-	HLS, DASH, IMF, MP4, QTFF, MATROSKA, WEBM, WAVE, OGG, FLAC, MP3, ADTS, MPEG_TS, MXF,
+	HLS, DASH, IMF, MP4, QTFF, MATROSKA, WEBM, WAVE, AIFF, Y4M, OGG, FLAC, MP3, ADTS, MPEG_TS, MXF,
 ];
 
 /**

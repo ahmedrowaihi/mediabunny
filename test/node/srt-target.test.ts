@@ -14,8 +14,10 @@
 import { waitUntil } from './_network-test.js';
 import { describe, expect, test } from 'vitest';
 import { NetworkSource, SrtTarget, registerMediabunnyServer } from '@mediabunny/server';
-import type { SrtTargetOptions } from '@mediabunny/server';
+import type { SrtCallerInfo, SrtTargetOptions } from '@mediabunny/server';
 import { __resetSecretRedactingLogForTests } from '../../packages/server/src/misc.js';
+import { getLibsrt } from '../../packages/server/src/libsrt.js';
+import { srtUrl } from '../../packages/server/src/srt-target.js';
 import { Input } from '../../src/input.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
 import { Output } from '../../src/output.js';
@@ -97,13 +99,13 @@ type Connected = { source: NetworkSource; first: Uint8Array };
  * A caller dialling a listener that is still binding gets EIO, so it retries. Only the tests where the
  * target is the listener need this, since it binds on its first flush.
  */
-const connect = async (port: number, transtype = 'file'): Promise<Connected> => {
+const connect = async (port: number, transtype = 'file', extra = ''): Promise<Connected> => {
 	let last: unknown = new Error(`srt://127.0.0.1:${port} never answered.`);
 
 	for (let attempt = 1; attempt <= 40; attempt++) {
 		// Both ends have to agree on transtype, or the handshake fails with EIO
 		const source = new NetworkSource(
-			`srt://127.0.0.1:${port}?transtype=${transtype}`,
+			`srt://127.0.0.1:${port}?transtype=${transtype}${extra}`,
 			{ connectTimeout: 5, readTimeout: 25 },
 		);
 		const reader = source._stream.getReader();
@@ -123,6 +125,26 @@ const connect = async (port: number, transtype = 'file'): Promise<Connected> => 
 	}
 
 	throw last;
+};
+
+/**
+ * One bounded connection attempt, reporting only whether any media arrived. The retrying `connect`
+ * above is for callers that should succeed; this is for the ones that should not.
+ */
+const dialOnce = async (port: number): Promise<boolean> => {
+	const source = new NetworkSource(
+		`srt://127.0.0.1:${port}?transtype=live`,
+		{ connectTimeout: 2, readTimeout: 2 },
+	);
+	const reader = source._stream.getReader();
+	try {
+		const { done, value } = await reader.read();
+		return !done && value !== undefined && value.byteLength > 0;
+	} catch {
+		return false;
+	} finally {
+		await reader.cancel().catch(() => {});
+	}
 };
 
 /** Compares by length and first difference, since a truncated hex diff of 50 kB names nothing. */
@@ -177,6 +199,31 @@ const readAll = async (
 	}
 	return out;
 };
+
+// Listener mode was reachable through the URL before it was an option; both spellings have to agree, and
+// a listener's accept bound is libsrt's `listen_timeout` in microseconds rather than `timeout`.
+test('listener mode can be asked for by option or by URL, and bounds its own wait', () => {
+	for (const resolved of [
+		srtUrl('srt://0.0.0.0:17090', { mode: 'listener', connectTimeout: 4 }),
+		srtUrl('srt://0.0.0.0:17091?mode=listener', { connectTimeout: 4 }),
+	]) {
+		const url = new URL(resolved.url);
+		expect(resolved.listening).toBe(true);
+		expect(url.searchParams.get('mode')).toBe('listener');
+		expect(url.searchParams.get('listen_timeout')).toBe('4000000');
+	}
+
+	// A caller states no accept bound, because it is not accepting anything
+	const caller = srtUrl('srt://127.0.0.1:17092', { connectTimeout: 4 });
+	expect(caller.listening).toBe(false);
+	expect(new URL(caller.url).searchParams.get('mode')).toBe('caller');
+	expect(new URL(caller.url).searchParams.get('listen_timeout')).toBe(null);
+});
+
+test('an unknown mode is refused at construction', () => {
+	expect(() => new SrtTarget('srt://127.0.0.1:17093', { mode: 'both' as unknown as 'caller' }))
+		.toThrow('\'caller\' or \'listener\'');
+});
 
 test('a calling target and a listening source carry the bytes unchanged', async () => {
 	const port = freePort();
@@ -498,6 +545,99 @@ test('MPEG-TS written over SRT demuxes to the same packets the same conversion t
 // A relay carries bytes that are already a transport stream, so it needs to write them without an
 // Output in the way. TargetWriter is that path, and these are the three claims it makes: the bytes
 // arrive unchanged, close drains, and flush is where backpressure lands.
+// A sending listener vets the receiver that called in. This goes through the bundled libsrt rather than
+// ffmpeg's srt:// protocol, which offers no hook between the handshake and the first byte - so these
+// are the only tests that exercise that second transport at all.
+//
+// Which also means they are the only ones here that need libsrt to be loadable. Asked of the binding
+// directly rather than by constructing a target, the way the bonding tests do it: the two that open a
+// socket skip without it, while the validation ones below throw before any transport is built and so
+// run everywhere. CI installs the library for this; see .github/workflows/fork-ci.yml.
+const hasLibsrt = (() => {
+	try {
+		getLibsrt();
+		return true;
+	} catch {
+		return false;
+	}
+})();
+const libsrtTest = test.skipIf(!hasLibsrt);
+
+describe('a listening target vets the receiver', () => {
+	libsrtTest('a refused caller gets no bytes, and the refusal is counted', async () => {
+		const port = freePort();
+		const target = new SrtTarget(`srt://0.0.0.0:${port}`, {
+			accept: () => false,
+			connectTimeout: 8,
+		});
+
+		// Starts the listener; the open never completes, because every caller is turned away
+		const sending = startSending(target, [filler(1316)]).catch(() => {});
+
+		// Not `connect`: that retries 40 times to ride out a listener still binding, and a caller that
+		// is *meant* to fail would spend every one of them before the test could assert anything
+		let delivered = false;
+		const dialling = (async () => {
+			for (let attempt = 0; attempt < 4 && !delivered; attempt++) {
+				delivered = await dialOnce(port);
+			}
+		})();
+
+		await waitUntil(() => target.refusedCallers > 0, 12_000, 'the allowlist to turn a caller away');
+		await dialling;
+		await sending;
+
+		expect(delivered).toBe(false);
+		expect(target.sentBytes).toBe(0);
+	}, 40_000);
+
+	libsrtTest('an admitted caller is named to the allowlist and receives the bytes', async () => {
+		const port = freePort();
+		const seen: SrtCallerInfo[] = [];
+		const target = new SrtTarget(`srt://0.0.0.0:${port}`, {
+			accept: (peer: SrtCallerInfo) => {
+				seen.push(peer);
+				return peer.streamId === 'allowed';
+			},
+			connectTimeout: 20,
+		});
+
+		const payload = filler(1316 * 4);
+		const sending = startSending(target, [payload]);
+		const { source, first } = await connect(port, 'live', '&streamid=allowed');
+		// One datagram is enough to prove the libsrt send path carries the bytes; live mode is
+		// latency-bounded, so holding it to all four would measure the runner's spare capacity
+		const received = await readAll(source, 1316, 25_000, first);
+		await sending;
+
+		expect(seen.length).toBeGreaterThan(0);
+		expect(seen[0]!.streamId).toBe('allowed');
+		expect(seen[0]!.address).toBe('127.0.0.1');
+		expect(seen[0]!.family).toBe('ipv4');
+		expect(target.refusedCallers).toBe(0);
+		expectSameBytes(received.subarray(0, 1316), payload.subarray(0, 1316));
+
+		await source._stream.cancel().catch(() => {});
+	}, 40_000);
+
+	test('vetting a receiver needs listener mode, stated either way', () => {
+		expect(() => new SrtTarget('srt://127.0.0.1:17094', { accept: () => true, mode: 'caller' }))
+			.toThrow('needs \'listener\' mode');
+		expect(() => new SrtTarget('srt://127.0.0.1:17095?mode=caller', { accept: () => true }))
+			.toThrow('may not state ?mode=caller');
+		expect(() => new SrtTarget('srt://127.0.0.1:17096', { accept: 'yes' as unknown as () => boolean }))
+			.toThrow('must be a function');
+	});
+
+	// Without `accept` nothing changes: the ffmpeg transport stays, and so does its URL mapping
+	test('a listener without an allowlist still goes through the srt:// protocol', () => {
+		const resolved = srtUrl('srt://0.0.0.0:17097', { mode: 'listener', connectTimeout: 4 });
+		expect(resolved.host).toBe('0.0.0.0');
+		expect(resolved.port).toBe(17_097);
+		expect(new URL(resolved.url).searchParams.get('listen_timeout')).toBe('4000000');
+	});
+});
+
 describe('TargetWriter over SrtTarget', () => {
 	test('bytes written are the bytes readRange hands back', async () => {
 		const port = freePort();

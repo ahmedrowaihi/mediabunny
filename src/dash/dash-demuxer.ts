@@ -127,7 +127,6 @@ export class DashDemuxer extends Demuxer {
 			timeShiftBufferDepth: mpd.timeShiftBufferDepth,
 		};
 
-		// Assigned so a representation keeps the same track number across MPD refreshes
 		const stableKey = `${period.id ?? ''}|${as.id ?? ''}|${rep.id}`;
 		const id = this.stableIdFor(stableKey);
 		const segmentedInput = new DashSegmentedInput(this, context, [
@@ -135,7 +134,6 @@ export class DashDemuxer extends Demuxer {
 		]);
 		this.segmentedInputs.push(segmentedInput);
 
-		// Fall back to a first-segment probe when MPD omits @codecs entirely.
 		let codecString: string | null = item.codecString;
 		if (!codecString) {
 			try {
@@ -189,7 +187,6 @@ export class DashDemuxer extends Demuxer {
 			segmentedInput,
 		};
 
-		// Spread rather than two whole literals: only `info` differs, and the union stays sound
 		const internal: InternalTrack = isVideoAs
 			? {
 					...common,

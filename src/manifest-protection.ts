@@ -7,12 +7,14 @@
  */
 
 import { MalformedInputError } from './errors';
+import type { ProtectionScheme } from './crypto/subsample-generator';
 import type { ContentProtectionElement, Element } from './dash/dash-content-protection';
 import { DASH_NS } from './dash/dash-misc';
 import { ENCRYPTED_MP4_SCHEME, generateCencPsshElement, hexToUUID, parsePsshBoxData } from './dash/dash-mpd-utils';
 import { collectNamespaceFromName } from './dash/dash-xml-node';
 import { EncryptionInfoEntry } from './hls/hls-entries';
-import { bytesToBase64, escapeXmlAttribute } from './misc';
+import type { HlsKey } from './hls/hls-playlist-parser';
+import { assert, bytesToBase64, escapeXmlAttribute } from './misc';
 import { FAIRPLAY_SYSTEM_ID, PLAYREADY_SYSTEM_ID } from './crypto/pssh';
 
 /**
@@ -217,6 +219,57 @@ export const patchMpdContentProtection = (mpd: string, elements: ContentProtecti
 export const CBCS_HLS_METHOD = 'SAMPLE-AES' as const;
 
 /**
+ * HLS encryption method for a `cenc` fMP4 stream: SAMPLE-AES-CTR.
+ *
+ * draft-pantos-hls-rfc8216bis 4.4.4.4 defines the two separately - SAMPLE-AES is the `cbcs` scheme,
+ * SAMPLE-AES-CTR is `cenc` - and states that a client MAY support the latter. It is not Apple's: a
+ * FairPlay stream is always `cbcs`. What needs it is Widevine or PlayReady over Common Encryption's
+ * CTR scheme, which shaka and ExoPlayer both read.
+ *
+ * @group Encryption
+ * @public
+ */
+export const CENC_HLS_METHOD = 'SAMPLE-AES-CTR' as const;
+
+/**
+ * The `#EXT-X-KEY` METHOD a protection scheme is signalled by.
+ *
+ * Throws for `cbc1` and `cens`: HLS defines a method for the CTR scheme and one for the CBC-with-
+ * pattern scheme and nothing for the other two, so there is no honest value to write. Signalling
+ * them as `cbcs` would tell a player to decrypt in a mode the media is not in.
+ *
+ * @group Encryption
+ * @public
+ */
+export const hlsMethodForScheme = (scheme: ProtectionScheme): typeof CBCS_HLS_METHOD | typeof CENC_HLS_METHOD => {
+	switch (scheme) {
+		case 'cenc':
+			return CENC_HLS_METHOD;
+		case 'cbcs':
+		case 'cbcs-apple-sample-aes':
+			return CBCS_HLS_METHOD;
+		default:
+			throw new MalformedInputError(
+				`HLS has no #EXT-X-KEY METHOD for the '${scheme}' protection scheme; it defines`
+				+ ` ${CBCS_HLS_METHOD} for 'cbcs' and ${CENC_HLS_METHOD} for 'cenc' only.`,
+			);
+	}
+};
+
+/** One `#EXT-X-KEY` line under a stated METHOD. */
+const buildHlsKeyLine = (
+	method: typeof CBCS_HLS_METHOD | typeof CENC_HLS_METHOD,
+	options: { uri: string; keyFormat: string; keyFormatVersions?: string; keyId?: string; iv?: string },
+): string => new EncryptionInfoEntry(
+	method,
+	options.uri,
+	options.keyId ?? '',
+	options.iv ?? '',
+	options.keyFormat,
+	options.keyFormatVersions ?? '',
+).toString();
+
+/**
  * Build an `#EXT-X-KEY` line for a `cbcs` (SAMPLE-AES) HLS media playlist.
  *
  * @group Encryption
@@ -233,14 +286,7 @@ export const buildCbcsHlsKey = (options: {
 	keyId?: string;
 	/** `IV` as a hex string. Omitted when each segment derives its own. */
 	iv?: string;
-}): string => new EncryptionInfoEntry(
-	CBCS_HLS_METHOD,
-	options.uri,
-	options.keyId ?? '',
-	options.iv ?? '',
-	options.keyFormat,
-	options.keyFormatVersions ?? '',
-).toString();
+}): string => buildHlsKeyLine(CBCS_HLS_METHOD, options);
 
 /** @internal */
 export type HlsKeySpec = {
@@ -277,7 +323,6 @@ export const hlsKeySpecs = (options: { systems: DrmSystem[]; fairplayKeyUri?: st
 			);
 		}
 		if (system.uuid === PLAYREADY_SYSTEM_ID) {
-			// HLS carries the PlayReady Object (the pssh's data payload), not the full pssh box.
 			const pro = parsePsshBoxData(system.pssh);
 			if (pro === null) {
 				throw new MalformedInputError(
@@ -317,10 +362,74 @@ export const buildHlsKeys = (options: {
 	systems: DrmSystem[];
 	/** The `skd://` URI FairPlay's key is fetched from. Required when FairPlay is among the systems. */
 	fairplayKeyUri?: string;
-}): string[] =>
-	hlsKeySpecs(options).map(spec =>
-		buildCbcsHlsKey({ uri: spec.uri, keyFormat: spec.keyFormat, keyFormatVersions: '1' }),
-	);
+	/** The scheme the media is encrypted with, which decides the METHOD. Defaults to `'cbcs'`. */
+	scheme?: ProtectionScheme;
+}): string[] => {
+	// Taken from the scheme rather than read back off the key: `HlsKey.method` is a plain string
+	// because a parsed key may carry any method, including NONE.
+	const method = hlsMethodForScheme(options.scheme ?? 'cbcs');
+
+	return hlsKeysOf(options).map((key) => {
+		// hlsKeySpecs gives every key a URI or throws, so this never fires; HlsKey.uri is nullable
+		// because a parsed `METHOD=NONE` key carries none.
+		assert(key.uri !== null);
+		return buildHlsKeyLine(method, {
+			uri: key.uri,
+			keyFormat: key.keyFormat,
+			keyFormatVersions: '1',
+		});
+	});
+};
+
+/**
+ * The same keys {@link buildHlsKeys} writes, as {@link HlsKey} objects rather than `#EXT-X-KEY` lines.
+ *
+ * For a caller that assembles a playlist from the model and serializes it once at the end: taking the
+ * lines from {@link buildHlsKeys} and parsing them back into keys is a round trip that this avoids.
+ * Serializing what this returns gives exactly what {@link buildHlsKeys} returns, since that function
+ * is now this one plus the serializer.
+ *
+ * `iv` and `keyId` are null: neither HLS method carries them here, taking the IV from each sample's
+ * `senc` instead - and 4.4.4.4 says IV MUST NOT be present for SAMPLE-AES-CTR at all.
+ *
+ * @throws the same way {@link buildHlsKeys} does — a listed system that cannot be signalled is an
+ * error, never a silently dropped key — and for a scheme HLS states no method for.
+ *
+ * @group Encryption
+ * @public
+ */
+export const hlsKeysOf = (options: {
+	/** The DRM systems to signal, one key each. */
+	systems: DrmSystem[];
+	/** The `skd://` URI FairPlay's key is fetched from. Required when FairPlay is among the systems. */
+	fairplayKeyUri?: string;
+	/**
+	 * The scheme the media is encrypted with, which decides the METHOD: `'cenc'` is signalled as
+	 * SAMPLE-AES-CTR and `'cbcs'` as SAMPLE-AES. Defaults to `'cbcs'`, which is what this wrote
+	 * unconditionally before - and what made a `cenc` stream's playlist contradict its own MPD.
+	 */
+	scheme?: ProtectionScheme;
+}): HlsKey[] => {
+	const method = hlsMethodForScheme(options.scheme ?? 'cbcs');
+
+	// FairPlay Streaming is cbcs only, so a com.apple.streamingkeydelivery key under SAMPLE-AES-CTR
+	// describes a stream no device can play. Refusing beats emitting it.
+	if (method === CENC_HLS_METHOD && options.systems.some(system => system.uuid === FAIRPLAY_SYSTEM_ID)) {
+		throw new MalformedInputError(
+			'FairPlay cannot be signalled under the \'cenc\' scheme: FairPlay Streaming decrypts'
+			+ ` ${CBCS_HLS_METHOD} (cbcs) only.`,
+		);
+	}
+
+	return hlsKeySpecs(options).map((spec): HlsKey => ({
+		method,
+		uri: spec.uri,
+		iv: null,
+		keyId: null,
+		keyFormat: spec.keyFormat,
+		keyFormatVersions: [1],
+	}));
+};
 
 /**
  * Insert `#EXT-X-KEY` lines into an existing HLS media playlist, after the `#EXT-X-MAP`

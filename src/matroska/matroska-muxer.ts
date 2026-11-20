@@ -29,6 +29,7 @@ import {
 	toUint8Array,
 	uint8ArraysAreEqual,
 	roundToDivisor,
+	DEFAULT_MAX_INTERLEAVE_DELTA,
 } from '../misc';
 import {
 	CODEC_STRING_MAP,
@@ -65,7 +66,6 @@ import {
 import {
 	PCM_AUDIO_CODECS,
 	PcmAudioCodec,
-	SubtitleCodec,
 	generateAv1CodecConfigurationFromCodecString,
 	getAudioPreRollDuration,
 	generateVp9CodecConfigurationFromCodecString,
@@ -841,10 +841,8 @@ export class MatroskaMuxer extends Muxer {
 			} else if (trackData.type === 'audio') {
 				return trackData.info.decoderConfig.codec;
 			} else {
-				const map: Record<SubtitleCodec, string> = {
-					webvtt: 'wvtt',
-				};
-				return map[trackData.track.source._codec];
+				assert(trackData.track.source._codec === 'webvtt');
+				return 'wvtt';
 			}
 		});
 
@@ -1174,25 +1172,38 @@ export class MatroskaMuxer extends Muxer {
 		}
 	}
 
+	protected override get maxInterleaveDelta(): number {
+		return this.format._options.maxInterleaveDelta ?? DEFAULT_MAX_INTERLEAVE_DELTA;
+	}
+
 	private async interleaveChunks(isFinalCall = false) {
 		if (!isFinalCall && !this.allTracksAreKnown()) {
 			return; // We can't interleave yet as we don't yet know how many tracks we'll truly have
 		}
 
-		outer:
 		while (true) {
 			let trackWithMinTimestamp: MatroskaTrackData | null = null;
 			let minTimestamp = Infinity;
 
+			let waitingForTrack = false;
+
 			for (const trackData of this.trackDatas) {
 				if (!isFinalCall && trackData.chunkQueue.length === 0 && !this.closedTracks.has(trackData.track)) {
-					break outer;
+					waitingForTrack = true;
+					continue;
 				}
 
 				if (trackData.chunkQueue.length > 0 && trackData.chunkQueue[0]!.timestamp < minTimestamp) {
 					trackWithMinTimestamp = trackData;
 					minTimestamp = trackData.chunkQueue[0]!.timestamp;
 				}
+			}
+
+			if (
+				waitingForTrack
+				&& !this.quietTrackMayBeSkipped(this.trackDatas, x => x.chunkQueue, x => x.timestamp)
+			) {
+				break;
 			}
 
 			if (!trackWithMinTimestamp) {
@@ -1238,6 +1249,7 @@ export class MatroskaMuxer extends Muxer {
 
 		// We wanna only finalize this cluster (and begin a new one) if we know that each track will be able to
 		// start the new one with a key frame.
+		let quietSkippable: boolean | null = null;
 		const keyFrameQueuedEverywhere = this.trackDatas.every((otherTrackData) => {
 			if (trackData === otherTrackData) {
 				return chunk.type === 'key';
@@ -1248,7 +1260,11 @@ export class MatroskaMuxer extends Muxer {
 				return firstQueuedSample.type === 'key';
 			}
 
-			return this.closedTracks.has(otherTrackData.track);
+			return this.closedTracks.has(otherTrackData.track) || (quietSkippable ??= this.quietTrackMayBeSkipped(
+				this.trackDatas,
+				x => x.chunkQueue,
+				x => x.timestamp,
+			));
 		});
 
 		let shouldCreateNewCluster = false;

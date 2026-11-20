@@ -9,7 +9,8 @@
 import { TrackType } from './output';
 import { MediaCodec } from './codec';
 import { DurationMetadataRequestOptions } from './demuxer';
-import { Input } from './input';
+import { InbandEvent, Input } from './input';
+import { SCTE35_BINARY_SCHEME } from './mpeg-ts/scte35';
 import {
 	InputAudioTrack,
 	InputAudioTrackBacking,
@@ -19,7 +20,7 @@ import {
 	InputVideoTrackBacking,
 } from './input-track';
 import { PacketRetrievalOptions } from './media-sink';
-import { arrayCount, assert, MaybePromise, roundIfAlmostInteger, roundToDivisor } from './misc';
+import { arrayCount, assert, bytesToHexString, MaybePromise, roundIfAlmostInteger, roundToDivisor } from './misc';
 import { EncodedPacket } from './packet';
 
 export type SegmentedInputMetadata = {
@@ -59,6 +60,20 @@ export type SegmentedInputTrackDeclaration = {
 	type: TrackType;
 };
 
+/** Enough to span a live window many times over, while a stream that runs for days stays bounded. */
+const MAX_ANNOUNCED_INBAND_EVENTS = 4096;
+
+/**
+ * Events already passed on, so the same one is announced once however many readers found it. Keyed by
+ * what the event is rather than where it was found, since the same splice is repeated across the
+ * segments it covers, and bounded because a live stream never ends.
+ *
+ * It hangs off the `Input` rather than the `SegmentedInput` because there is one of those per variant
+ * or Representation: a presentation with separate video and audio has several, all reading the same
+ * playlist or manifest, and a per-instance set would let each announce the same event again.
+ */
+const announcedInbandEvents = new WeakMap<Input, Set<string>>();
+
 export abstract class SegmentedInput {
 	input: Input;
 	path: string;
@@ -78,6 +93,8 @@ export abstract class SegmentedInput {
 	// Roughly maps local segment timestamps onto actual packet timestamps
 	learnedSegmentTimestampOffset: number | null = null;
 	segmentMediaOffsets = new WeakMap<Segment, Promise<number>>();
+
+	timelineCorrectionPromise: Promise<number> | null = null;
 
 	constructor(input: Input, path: string, trackDeclarations: SegmentedInputTrackDeclaration[] | null) {
 		this.input = input;
@@ -170,6 +187,54 @@ export abstract class SegmentedInput {
 
 			return backings;
 		})();
+	}
+
+	/**
+	 * Passes a segment's in-band events up to the input the caller holds, re-dated onto the composition
+	 * timeline the same way the segment's packets are. Call it on every `Input` built for a segment.
+	 */
+	forwardInbandEvents(segment: Segment, input: Input) {
+		input.on('inbandEvent', (event) => {
+			void (async () => {
+				this.announceInbandEvent({
+					...event,
+					timestamp: event.timestamp === null
+						? null
+						: event.timestamp + await this.getMediaOffset(segment, input),
+				});
+			})();
+		});
+	}
+
+	/** Passes one event up unless the same one already went, whatever found it. */
+	announceInbandEvent(event: InbandEvent) {
+		// A splice is the section: SCTE 35 makes a section unique by its `splice_event_id`, and the same
+		// bytes are deliberately repeated - down a cue stream, and again as a playlist date range - so
+		// the same splice found twice is one event rather than two. Any other scheme is dated: the same
+		// ID3 tag at two times is two tags.
+		const key = event.scheme === SCTE35_BINARY_SCHEME
+			? `${event.scheme}:${bytesToHexString(event.data)}`
+			: `${event.scheme}:${event.timestamp}:${bytesToHexString(event.data)}`;
+
+		let announced = announcedInbandEvents.get(this.input);
+		if (!announced) {
+			announced = new Set();
+			announcedInbandEvents.set(this.input, announced);
+		}
+		if (announced.has(key)) {
+			return;
+		}
+
+		if (announced.size >= MAX_ANNOUNCED_INBAND_EVENTS) {
+			// Insertion-ordered, so the first key is the one longest since announced
+			const oldest = announced.values().next();
+			if (!oldest.done) {
+				announced.delete(oldest.value);
+			}
+		}
+		announced.add(key);
+
+		this.input._emit('inbandEvent', event);
 	}
 
 	getMediaOffset(segment: Segment, input: Input) {
@@ -326,8 +391,16 @@ class SegmentedInputInputTrackBacking implements InputTrackBacking {
 		return this.delegate(() => this.metadataInputTrack!._backing.getCodec());
 	}
 
+	getContainerId() {
+		return this.delegate(() => this.metadataInputTrack!._backing.getContainerId?.() ?? null);
+	}
+
 	getInternalCodecId() {
 		return this.delegate(() => this.metadataInputTrack!._backing.getInternalCodecId());
+	}
+
+	getEncryptionInfo() {
+		return this.delegate(() => this.metadataInputTrack!._backing.getEncryptionInfo());
 	}
 
 	getDisposition() {

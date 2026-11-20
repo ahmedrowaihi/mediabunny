@@ -18,7 +18,10 @@
 		},
 	},
 	"include": ["vitest.config.ts", "./test/**/*"],
-	"exclude": ["./test/public/**/*"],
+	// test/types is compiled by test/types/tsconfig.json instead, under
+	// `exactOptionalPropertyTypes` - the whole point of that fixture is a flag this config does not set,
+	// and its import of the built declarations does not satisfy nodenext's extension rule here.
+	"exclude": ["./test/public/**/*", "./test/fixtures/**/*", "./test/types/**/*"],
 	"references": [
 		{ "path": "./src" },
 		{ "path": "./tsconfig.packages.json" },

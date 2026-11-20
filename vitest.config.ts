@@ -2,6 +2,8 @@ import { defineConfig } from 'vitest/config';
 import { webdriverio } from '@vitest/browser-webdriverio';
 import path from 'node:path';
 
+const CHROME_PROFILE = 'node_modules/.cache/chrome-profile';
+
 export default defineConfig({
 	resolve: {
 		alias: {
@@ -23,6 +25,12 @@ export default defineConfig({
 	},
 	test: {
 		restoreMocks: true,
+		// node-gc tests force collections to check finalization behaviour. --expose-gc is a V8 flag, which
+		// worker_threads execArgv rejects, so the whole run needs the forked pool.
+		pool: 'forks',
+		execArgv: ['--expose-gc'],
+		// UV_THREADPOOL_SIZE is set by the `test` script rather than here: libuv reads it when a process starts,
+		// so `test.env` lands too late to take effect. See the script for why it is needed.
 		projects: [
 			{
 				extends: true,
@@ -33,6 +41,15 @@ export default defineConfig({
 					environment: 'node',
 					// Run after the browser tests instead of alongside them so the two don't fight over CPU
 					sequence: { groupOrder: 1 },
+				},
+			},
+			{
+				extends: true,
+				test: {
+					name: 'node-gc',
+					root: 'test',
+					include: ['node-gc/**/*.test.ts'],
+					environment: 'node',
 				},
 			},
 			{
@@ -51,8 +68,14 @@ export default defineConfig({
 								'wdio:chromedriverOptions': {
 									cacheDir: path.resolve(__dirname, 'node_modules/.cache/webdriver'),
 								},
+								// Chrome leaks the profile directory it picks for itself when the run ends: 81 of
+								// them, 13 GB, filled this machine's disk and the suite then failed with ENOSPC
+								// rather than a test result. Naming one keeps it to a single reused directory.
 								'goog:chromeOptions': {
-									args: ['--autoplay-policy=no-user-gesture-required'],
+									args: [
+										'--autoplay-policy=no-user-gesture-required',
+										`--user-data-dir=${path.resolve(__dirname, CHROME_PROFILE)}`,
+									],
 								},
 							},
 						}),

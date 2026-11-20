@@ -1,0 +1,291 @@
+name: Build libsrt prebuilds
+
+# libsrt with ENABLE_BONDING, built per platform and shipped inside @mediabunny/server so a host needs
+# nothing installed. Homebrew's libsrt carries no bonding and a distro's may not either, so a system
+# library cannot be relied on for the feature this package exists for.
+#
+# One package holds every platform rather than one optionalDependency each: a build is under a megabyte,
+# so all of them together cost a few MB, where node-av splits because each FFmpeg prebuild is 50-100 MB.
+# That also means no new npm package names, and so no new trusted-publisher configuration.
+#
+# **darwin-x64 is deliberately absent.** `macos-13` is the last Intel image and no runner is ever
+# assigned for it on this account: the job sat `queued` for over eight hours on every run, and because
+# the publish job needs this one to succeed, that held five releases indefinitely. An Intel Mac
+# therefore falls back to a system libsrt, or to `MEDIABUNNY_LIBSRT`, and says so by name when it finds
+# neither. Building it as a universal2 slice from the arm64 runner needs an x86_64 mbedTLS and is the
+# way back to covering it.
+#
+# Run on its own; see the note on the trigger below for why the publish does not call it.
+
+# Run this BY HAND when `srt-version` changes. It is deliberately not called by publish-fork.yml:
+# libsrt changes about once a year, and building it per release put a macOS runner on the critical path
+# of every release - GitHub withheld one four times in a single day, failing releases that had nothing
+# wrong with them. The publish instead downloads what this uploaded.
+on:
+  workflow_dispatch:
+    inputs:
+      srt-version:
+        required: false
+        type: string
+        default: v1.5.6
+
+permissions:
+  # write, so a built library can be kept on the prebuilds release - see the upload step below
+  contents: write
+
+env:
+  # Here rather than on the step that uses it, so the cache key below can carry it: a build of a
+  # different mbedTLS is a different artifact, and a key that cannot say so serves the old one.
+  MBEDTLS_VERSION: v3.6.8
+
+jobs:
+  build:
+    name: libsrt ${{ matrix.key }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      # One platform failing must not cost the others: a partial set still tells us which build is wrong,
+      # and the publish job checks for the set it needs.
+      fail-fast: false
+      matrix:
+        include:
+          # `macos-latest`, not a pinned image: `macos-14` was cancelled within a second with no runner
+          # ever assigned, which is what a retired label looks like rather than a build failure.
+          #
+          # `glob` is what the build actually leaves behind, which is not the name the package loads.
+          # macOS puts the version *before* the extension (`libsrt.1.5.6.dylib`) and `libsrt.dylib` is a
+          # symlink to it, so a `libsrt.dylib*` pattern with `-type f` matched nothing and the collect
+          # step failed on a build that had succeeded.
+          - key: darwin-arm64
+            runner: macos-latest
+            glob: 'libsrt*.dylib'
+            library: libsrt.dylib
+          - key: linux-x64
+            runner: ubuntu-22.04
+            glob: 'libsrt.so*'
+            library: libsrt.so
+          - key: linux-arm64
+            runner: ubuntu-22.04-arm
+            glob: 'libsrt.so*'
+            library: libsrt.so
+          - key: win32-x64
+            runner: windows-2022
+            glob: 'srt.dll'
+            library: srt.dll
+
+    steps:
+      - name: Cache the built library
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: out
+          # A cache hit skips both the rebuild and the verification below, so anything that changes
+          # what gets built has to appear here - earlier keys served builds that linked mbedTLS
+          # shared, which made the darwin dylib unloadable off the build machine.
+          key: libsrt-${{ inputs.srt-version }}-mbedtls-${{ env.MBEDTLS_VERSION }}-static-${{ matrix.key }}
+
+      - name: Check out libsrt
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: Haivision/srt
+          ref: ${{ inputs.srt-version }}
+          path: srt
+
+      # mbedTLS rather than OpenSSL: SRT supports both, and mbedTLS is small enough to link statically
+      # without the binary growing into the tens of megabytes. Apache-2.0, so redistributing it is clear.
+      - name: Install cmake (macOS)
+        if: steps.cache.outputs.cache-hit != 'true' && runner.os == 'macOS'
+        run: brew install cmake
+
+      - name: Install cmake (Linux)
+        if: steps.cache.outputs.cache-hit != 'true' && runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake
+
+      # mbedTLS from source rather than from Homebrew or apt, built static into a prefix of its own.
+      #
+      # The packaged ones are shared libraries, and linking them gave a libsrt that could not load off
+      # the build machine - the darwin dylib carried /opt/homebrew/opt/mbedtls@3/... as an absolute
+      # path, and the Linux .so carried NEEDED libmbedcrypto.so.7. Asking cmake to prefer `.a` was not
+      # enough on Linux: whatever libsrt uses to find mbedTLS there still reached the shared one, and
+      # the verification step below caught it. A prefix that contains *only* static archives cannot be
+      # got wrong by any find mechanism, which is why this is built here instead of installed.
+      - name: Build mbedTLS static
+        if: steps.cache.outputs.cache-hit != 'true' && runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # --recurse-submodules: 3.6.x keeps its cmake framework in a submodule, and configuring
+          # without it fails with "mbedtls/framework/CMakeLists.txt not found".
+          #
+          # MBEDTLS_FATAL_WARNINGS=OFF: mbedTLS builds its own sources with -Werror, so a compiler
+          # newer than the release fails it on a warning in code we are not changing. That is exactly
+          # what happened here - the macOS runner's clang rejected 3.6.2's TLS 1.3 label table under
+          # -Wunterminated-string-initialization while both Linux runners built it fine. Their
+          # -Werror is a policy for their CI, not for a consumer pinning a tag.
+          git clone --depth 1 --branch "${MBEDTLS_VERSION}" --recurse-submodules --shallow-submodules \
+            https://github.com/Mbed-TLS/mbedtls.git mbedtls
+          cmake -S mbedtls -B mbedtls/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DUSE_SHARED_MBEDTLS_LIBRARY=OFF \
+            -DUSE_STATIC_MBEDTLS_LIBRARY=ON \
+            -DENABLE_TESTING=OFF \
+            -DENABLE_PROGRAMS=OFF \
+            -DMBEDTLS_FATAL_WARNINGS=OFF \
+            -DCMAKE_INSTALL_PREFIX="${HOME}/mbedtls-static"
+          cmake --build mbedtls/build --parallel
+          cmake --install mbedtls/build
+
+          # State it rather than assume it: a shared library here would defeat the whole point
+          echo "installed:"
+          ls -l "${HOME}/mbedtls-static/lib"
+          if ls "${HOME}/mbedtls-static/lib" | grep -E '\.(so|dylib)'; then
+            echo "::error::mbedTLS installed a shared library; libsrt would link that" >&2
+            exit 1
+          fi
+
+      - name: Install mbedTLS (Windows)
+        if: steps.cache.outputs.cache-hit != 'true' && runner.os == 'Windows'
+        run: vcpkg install mbedtls:x64-windows-static
+
+      - name: Configure and build
+        if: steps.cache.outputs.cache-hit != 'true'
+        shell: bash
+        working-directory: srt
+        run: |
+          set -euo pipefail
+          EXTRA=()
+          # libsrt's own options, from scripts/FindMbedTLS.cmake: STATIC_MBEDTLS makes it look for
+          # libmbedtls.a rather than the shared library, and MBEDTLS_PREFIX is the HINTS path it
+          # searches. CMAKE_PREFIX_PATH and CMAKE_FIND_LIBRARY_SUFFIXES were tried first and neither
+          # works here - that find module consults neither, so it kept resolving mbedTLS from
+          # /usr/lib and linking it shared. Reading the module settled in a minute what two guesses
+          # had not.
+          if [ "${RUNNER_OS}" != "Windows" ]; then
+            EXTRA+=("-DSTATIC_MBEDTLS=ON" "-DMBEDTLS_PREFIX=${HOME}/mbedtls-static")
+          fi
+          if [ "${RUNNER_OS}" = "macOS" ]; then
+            EXTRA+=("-DCMAKE_OSX_DEPLOYMENT_TARGET=11.0")
+          fi
+          if [ "${RUNNER_OS}" = "Windows" ]; then
+            EXTRA+=("-DCMAKE_TOOLCHAIN_FILE=${VCPKG_INSTALLATION_ROOT}/scripts/buildsystems/vcpkg.cmake")
+            EXTRA+=("-DVCPKG_TARGET_TRIPLET=x64-windows-static")
+          fi
+
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DENABLE_BONDING=ON \
+            -DENABLE_ENCRYPTION=ON \
+            -DUSE_ENCLIB=mbedtls \
+            -DENABLE_SHARED=ON \
+            -DENABLE_STATIC=OFF \
+            -DENABLE_APPS=OFF \
+            -DENABLE_UNITTESTS=OFF \
+            "${EXTRA[@]}"
+          cmake --build build --config Release --parallel
+
+      # The build leaves versioned names and symlinks; the package wants one real file under a fixed name
+      - name: Collect the library
+        if: steps.cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          # Longest name first: the versioned file is the real one, the short name is a symlink to it
+          found="$(find srt/build -name '${{ matrix.glob }}' -type f | awk '{ print length, $0 }' \
+            | sort -rn | cut -d' ' -f2- | head -1)"
+          if [ -z "${found}" ]; then
+            echo "nothing matching ${{ matrix.glob }} produced by the build:" >&2
+            find srt/build -name 'libsrt*' -o -name 'srt*' | head -20 >&2
+            exit 1
+          fi
+          cp "${found}" "out/${{ matrix.library }}"
+
+      - name: Refuse an artifact that depends on mbedTLS at runtime
+        if: steps.cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          lib="out/${{ matrix.library }}"
+
+          # Every reader below reports a missing file on stderr and the Windows one swallows it
+          # entirely, so without this the check passes whenever it is pointed at nothing. It was,
+          # for one run: the step had inherited `working-directory: srt` from the build above it.
+          test -f "$lib"
+
+          # The whole promise of shipping these is that a host needs nothing installed. A dynamic
+          # reference to mbedTLS breaks that promise silently: the library simply fails to load and the
+          # caller gets whatever libsrt the system happens to have, which is usually one without
+          # bonding. Shipped twice before this check existed.
+          case "${RUNNER_OS}" in
+            macOS)
+              otool -L "$lib"
+              deps="$(otool -L "$lib" | tail -n +2 | awk '{print $1}')"
+              ;;
+            Linux)
+              readelf -d "$lib" | grep NEEDED || true
+              deps="$(readelf -d "$lib" | sed -n 's/.*NEEDED.*\[\(.*\)\]/\1/p')"
+              ;;
+            Windows)
+              # The x64-windows-static triplet links it in; this states that rather than assuming it
+              deps="$(strings "$lib" | grep -i 'mbed.*\.dll' || true)"
+              ;;
+          esac
+
+          if printf '%s\n' "$deps" | grep -i mbed; then
+            echo "::error::${{ matrix.library }} still depends on mbedTLS at runtime; it must be linked statically" >&2
+            exit 1
+          fi
+          echo "no runtime mbedTLS dependency"
+
+      - name: State what was built
+        shell: bash
+        run: |
+          set -euo pipefail
+          ls -l out
+          # A build without bonding exports the group API as stubs, so the symbol alone proves nothing on
+          # a platform with nm; this only states what shipped. The runtime probe in libsrt.ts is the test.
+          if command -v nm > /dev/null 2>&1; then
+            nm -g "out/${{ matrix.library }}" 2>/dev/null | grep -c srt_create_group || true
+          fi
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: libsrt-${{ matrix.key }}
+          path: out/${{ matrix.library }}
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Keep a copy on the prebuilds release
+        # So a release stops needing every platform's runner to exist on the day it ships. GitHub
+        # provides macOS runners unreliably - twice on 2026-11-17 the darwin job sat queued from the
+        # start of the run and was cancelled at 15 minutes, which skipped the publish and failed the
+        # release, with the other three platforms built and fine. A publish now falls back to this copy.
+        #
+        # The tag carries the libsrt version, so this can never serve a build of a different one: bump
+        # `srt-version` and the fallback is empty until a runner has actually built it.
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="libsrt-prebuilds-${{ inputs.srt-version }}"
+
+          # Four jobs race to create it; whichever loses finds it already there
+          # NOT --prerelease, and --latest=false. publish-fork.yml prunes older *prereleases* to keep
+          # the release list short, and it did not care that one of them was this: it deleted the tag
+          # with --cleanup-tag, which turned this release into a draft and took the darwin asset with
+          # it. The prune now also filters to `v*` tags, but a release that is not a prerelease cannot
+          # be caught by that rule at all, which is the belt to that braces.
+          gh release view "$tag" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1 \
+            || gh release create "$tag" --repo "$GITHUB_REPOSITORY" --latest=false \
+              --title "libsrt prebuilds ${{ inputs.srt-version }}" \
+              --notes "Built by build-libsrt.yml. A publish downloads from here when a platform's runner is unavailable, so the release does not wait on one. Not a prerelease: publish-fork.yml prunes those." \
+            || gh release view "$tag" --repo "$GITHUB_REPOSITORY" > /dev/null
+
+          cp "out/${{ matrix.library }}" "${{ matrix.key }}-${{ matrix.library }}"
+          gh release upload "$tag" "${{ matrix.key }}-${{ matrix.library }}" \
+            --repo "$GITHUB_REPOSITORY" --clobber

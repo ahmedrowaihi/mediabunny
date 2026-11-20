@@ -226,3 +226,35 @@ export enum XingFlags {
 export const getMp3ChannelCount = (channel: number) => {
 	return channel === 3 ? 1 : 2;
 };
+
+/**
+ * The raw two-bit `layer` field, which is inverted: 1 is Layer III, 2 is Layer II, 3 is Layer I, and 0
+ * is reserved.
+ */
+export const MPEG_AUDIO_LAYER_II = 2;
+
+/**
+ * Which codec an MPEG audio elementary stream carries, read from its first frame header.
+ *
+ * No container states this. MPEG-TS stream types 0x03 and 0x04 are "MPEG-1 audio" and "MPEG-2 audio",
+ * and an MP4 `esds` object type indication of 0x6B or 0x69 says the same - all of them cover Layers I,
+ * II and III alike, because the layer lives in the frame header. ffprobe reads it the same way.
+ *
+ * Returns null when no frame header is found at all. Layer I reports `mp3`, since there is no codec of
+ * its own here for it; that is what the stream reported before this distinction existed.
+ */
+export const readMpegAudioCodec = (bytes: Uint8Array): 'mp2' | 'mp3' | null => {
+	let at = 0;
+
+	while (at + MP3_FRAME_HEADER_SIZE <= bytes.length) {
+		const word = ((bytes[at]! << 24) | (bytes[at + 1]! << 16) | (bytes[at + 2]! << 8) | bytes[at + 3]!) >>> 0;
+		const { header, bytesAdvanced } = readMp3FrameHeader(word, null);
+		if (header) {
+			return header.layer === MPEG_AUDIO_LAYER_II ? 'mp2' : 'mp3';
+		}
+
+		at += bytesAdvanced;
+	}
+
+	return null;
+};

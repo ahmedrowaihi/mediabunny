@@ -31,6 +31,13 @@ import {
 	mapTransferCharacteristics,
 } from './misc';
 
+/**
+ * Resampling flags for every `scale` in the transform chain. `lanczos` for the kernel, `accurate_rnd`
+ * so intermediate results are not truncated, and `full_chroma_int` so chroma is interpolated at full
+ * resolution rather than at its subsampled grid.
+ */
+const SCALE_FLAGS = 'lanczos+accurate_rnd+full_chroma_int';
+
 const JPEG_RANGE_PIX_FORMATS = new Set([
 	NodeAv.AV_PIX_FMT_YUVJ411P,
 	NodeAv.AV_PIX_FMT_YUVJ420P,
@@ -84,18 +91,22 @@ export class AvFrameVideoSampleResource extends VideoSampleResource {
 		this._frame = frame;
 	}
 
+	/** WebCodecs pixel format mapped from the underlying AvFrame, or `null` if unsupported. */
 	getFormat(): VideoSamplePixelFormat | null {
 		return toPixelFormat(this.frame.format as NodeAv.AVPixelFormat);
 	}
 
+	/** Coded frame width in pixels (may differ from display width when SAR ≠ 1). */
 	getCodedWidth(): number {
 		return this.frame.width;
 	}
 
+	/** Coded frame height in pixels (may differ from display height when SAR ≠ 1). */
 	getCodedHeight(): number {
 		return this.frame.height;
 	}
 
+	/** Display width after applying the sample aspect ratio. */
 	getSquarePixelWidth(): number {
 		if (this.frame.sampleAspectRatio.num > this.frame.sampleAspectRatio.den) {
 			return Math.round(this.frame.width * this.frame.sampleAspectRatio.num / this.frame.sampleAspectRatio.den);
@@ -104,6 +115,7 @@ export class AvFrameVideoSampleResource extends VideoSampleResource {
 		}
 	}
 
+	/** Display height after applying the sample aspect ratio. */
 	getSquarePixelHeight(): number {
 		if (
 			this.frame.sampleAspectRatio.num > this.frame.sampleAspectRatio.den
@@ -115,6 +127,7 @@ export class AvFrameVideoSampleResource extends VideoSampleResource {
 		}
 	}
 
+	/** Color space (primaries / transfer / matrix / full-range) of the underlying frame. */
 	getColorSpace(): VideoSampleColorSpace {
 		return new VideoSampleColorSpace({
 			primaries: unmapColorPrimaries(this.frame.colorPrimaries) as VideoColorPrimaries | null,
@@ -129,11 +142,13 @@ export class AvFrameVideoSampleResource extends VideoSampleResource {
 		});
 	}
 
+	/** Release the underlying AvFrame; after this call the resource is unusable. */
 	close(): void {
 		this.frame.free();
 		this._frame = null;
 	}
 
+	/** Return one entry per plane (`data` + per-line `stride` in bytes). */
 	getDataPlanes(): MaybePromise<VideoDataPlane[]> {
 		assert(this.frame.data);
 
@@ -143,6 +158,7 @@ export class AvFrameVideoSampleResource extends VideoSampleResource {
 		}));
 	}
 
+	/** Convert the frame to a packed RGBA `VideoSample`. The `colorSpace` argument is currently unused. */
 	async toRgbSample(
 		init: SetRequired<VideoSampleInit, 'timestamp'>,
 		// Will respect it when somebody complains
@@ -202,6 +218,20 @@ export class AvFrameVideoSampleResource extends VideoSampleResource {
 	}
 }
 
+export const applySampleColorToFrame = (sample: VideoSample, frame: NodeAv.Frame) => {
+	frame.colorPrimaries = mapColorPrimaries(sample.colorSpace.primaries ?? 'unknown')
+		?? NodeAv.AVCOL_PRI_UNSPECIFIED;
+	frame.colorSpace = mapMatrixCoefficients(sample.colorSpace.matrix ?? 'unknown')
+		?? NodeAv.AVCOL_SPC_UNSPECIFIED;
+	frame.colorTrc = mapTransferCharacteristics(sample.colorSpace.transfer ?? 'unknown')
+		?? NodeAv.AVCOL_TRC_UNSPECIFIED;
+	frame.colorRange = sample.colorSpace.fullRange === false
+		? NodeAv.AVCOL_RANGE_MPEG
+		: sample.colorSpace.fullRange === true
+			? NodeAv.AVCOL_RANGE_JPEG
+			: NodeAv.AVCOL_RANGE_UNSPECIFIED;
+};
+
 export const copyVideoSampleToAvFrame = async (sample: VideoSample, frame: NodeAv.Frame, lastBuffer: Buffer | null) => {
 	assert(sample.format !== null);
 
@@ -218,17 +248,7 @@ export const copyVideoSampleToAvFrame = async (sample: VideoSample, frame: NodeA
 		sample.pixelAspectRatio.num,
 		sample.pixelAspectRatio.den,
 	);
-	frame.colorPrimaries = mapColorPrimaries(sample.colorSpace.primaries ?? 'unknown')
-		?? NodeAv.AVCOL_PRI_UNSPECIFIED;
-	frame.colorSpace = mapMatrixCoefficients(sample.colorSpace.matrix ?? 'unknown')
-		?? NodeAv.AVCOL_SPC_UNSPECIFIED;
-	frame.colorTrc = mapTransferCharacteristics(sample.colorSpace.transfer ?? 'unknown')
-		?? NodeAv.AVCOL_TRC_UNSPECIFIED;
-	frame.colorRange = sample.colorSpace.fullRange === false
-		? NodeAv.AVCOL_RANGE_MPEG
-		: sample.colorSpace.fullRange === true
-			? NodeAv.AVCOL_RANGE_JPEG
-			: NodeAv.AVCOL_RANGE_UNSPECIFIED;
+	applySampleColorToFrame(sample, frame);
 
 	const size = sample.allocationSize();
 	if (!lastBuffer || lastBuffer.byteLength !== size) {
@@ -249,6 +269,108 @@ export const copyVideoSampleToAvFrame = async (sample: VideoSample, frame: NodeA
 	return lastBuffer;
 };
 
+type FilterGraphEntry = {
+	key: string;
+	graph: NodeAv.FilterGraph;
+	src: NodeAv.FilterContext;
+	sink: NodeAv.FilterContext;
+	busy: boolean;
+};
+
+const FILTER_GRAPH_CACHE_SIZE = 16;
+const filterGraphCache: FilterGraphEntry[] = [];
+
+const buildFilterGraph = (srcArgs: string, chainString: string): FilterGraphEntry => {
+	const graph = new NodeAv.FilterGraph();
+	graph.alloc();
+
+	try {
+		const src = graph.createFilter(NodeAv.Filter.getByName('buffer')!, 'src', srcArgs);
+		const sink = graph.createFilter(NodeAv.Filter.getByName('buffersink')!, 'sink');
+		assert(src && sink);
+
+		// The naming here looks inverted but matches FFmpeg's parse semantics: from the parsed chain's
+		// perspective, its inputs are fed by the graph's existing outputs (the buffer src), and its outputs
+		// feed the graph's existing inputs (the buffer sink).
+		const outputs = NodeAv.FilterInOut.createList([{ name: 'in', filterCtx: src, padIdx: 0 }]);
+		const inputs = NodeAv.FilterInOut.createList([{ name: 'out', filterCtx: sink, padIdx: 0 }]);
+
+		const parseRet = graph.parsePtr(`[in]${chainString}[out]`, inputs, outputs);
+		NodeAv.FFmpegError.throwIfError(parseRet, 'FilterGraph.parsePtr');
+
+		NodeAv.FFmpegError.throwIfError(graph.configSync(), 'FilterGraph.config');
+
+		return { key: `${srcArgs}|${chainString}`, graph, src, sink, busy: true };
+	} catch (error) {
+		graph.free();
+		throw error;
+	}
+};
+
+const takeIdleFilterGraph = (srcArgs: string, chainString: string): FilterGraphEntry | null => {
+	const key = `${srcArgs}|${chainString}`;
+	const index = filterGraphCache.findIndex(entry => entry.key === key && !entry.busy);
+	if (index === -1) {
+		return null;
+	}
+
+	const entry = filterGraphCache[index]!;
+	entry.busy = true;
+
+	filterGraphCache.splice(index, 1);
+	filterGraphCache.push(entry);
+
+	return entry;
+};
+
+const returnFilterGraph = (entry: FilterGraphEntry) => {
+	if (filterGraphCache.length >= FILTER_GRAPH_CACHE_SIZE) {
+		const evictIndex = filterGraphCache.findIndex(candidate => !candidate.busy);
+		if (evictIndex === -1) {
+			entry.graph.free();
+			return;
+		}
+
+		filterGraphCache.splice(evictIndex, 1)[0]!.graph.free();
+	}
+
+	entry.busy = false;
+	filterGraphCache.push(entry);
+};
+
+const pushThroughFilterGraph = async (
+	entry: FilterGraphEntry,
+	sample: VideoSample,
+	srcFrame: NodeAv.Frame,
+): Promise<VideoSample> => {
+	// Without KEEP_REF, the graph would take the frame's buffers away from the sample
+	NodeAv.FFmpegError.throwIfError(
+		await entry.src.buffersrcAddFrame(srcFrame, NodeAv.AV_BUFFERSRC_FLAG_KEEP_REF),
+		'buffersrcAddFrame',
+	);
+
+	const dstFrame = new NodeAv.Frame();
+	dstFrame.alloc();
+
+	NodeAv.FFmpegError.throwIfError(await entry.sink.buffersinkGetFrame(dstFrame), 'buffersinkGetFrame');
+
+	if (dstFrame.colorPrimaries === NodeAv.AVCOL_PRI_UNSPECIFIED) {
+		dstFrame.colorPrimaries = srcFrame.colorPrimaries;
+	}
+	if (dstFrame.colorTrc === NodeAv.AVCOL_TRC_UNSPECIFIED) {
+		dstFrame.colorTrc = srcFrame.colorTrc;
+	}
+
+	return new VideoSample(new AvFrameVideoSampleResource(dstFrame), {
+		timestamp: sample.timestamp,
+		duration: sample.duration,
+		// Baked in by the filter graph:
+		rotation: 0,
+		flip: false,
+		encodeOptions: sample.encodeOptions,
+	});
+};
+
 export const transformVideoSample = async (
 	sample: VideoSample,
 	description: VideoSampleTransformationDescription,
@@ -257,7 +379,11 @@ export const transformVideoSample = async (
 	let srcFrameOwned = false;
 
 	if (sample._data instanceof AvFrameVideoSampleResource) {
-		srcFrame = sample._data.frame;
+		srcFrame = new NodeAv.Frame();
+		srcFrame.alloc();
+		srcFrameOwned = true;
+
+		NodeAv.FFmpegError.throwIfError(srcFrame.ref(sample._data.frame), 'Frame.ref');
 	} else {
 		if (sample.format === null) {
 			return null;
@@ -268,11 +394,14 @@ export const transformVideoSample = async (
 		srcFrameOwned = true;
 	}
 
+	// swscale's default with no flags is bicubic (bit-identical to `flags=bicubic`); lanczos holds fine
+	// detail that bicubic softens, and `accurate_rnd` and `full_chroma_int` stop the chroma planes being
+	// rounded and interpolated more coarsely than the luma. Measured against FFmpeg's own lanczos.
 	// Build the filter chain. Order: square-pixel normalize -> rotate -> flip -> crop -> resize-with-fit.
 	const chain: string[] = [];
 
 	if (sample.squarePixelWidth !== sample.codedWidth || sample.squarePixelHeight !== sample.codedHeight) {
-		chain.push(`scale=${sample.squarePixelWidth}:${sample.squarePixelHeight}`);
+		chain.push(`scale=${sample.squarePixelWidth}:${sample.squarePixelHeight}:flags=${SCALE_FLAGS}`);
 		chain.push('setsar=1');
 	}
 
@@ -292,22 +421,21 @@ export const transformVideoSample = async (
 		+ `:${Math.round(description.crop.left)}:${Math.round(description.crop.top)}`);
 
 	if (description.fit === 'fill') {
-		chain.push(`scale=${description.width}:${description.height}`);
+		chain.push(`scale=${description.width}:${description.height}:flags=${SCALE_FLAGS}`);
 	} else if (description.fit === 'contain') {
-		chain.push(`scale=${description.width}:${description.height}:force_original_aspect_ratio=decrease`);
+		chain.push(`scale=${description.width}:${description.height}`
+			+ `:force_original_aspect_ratio=decrease:flags=${SCALE_FLAGS}`);
 		chain.push(`pad=${description.width}:${description.height}:(ow-iw)/2:(oh-ih)/2:color=black@0`);
 	} else if (description.fit === 'cover') {
-		chain.push(`scale=${description.width}:${description.height}:force_original_aspect_ratio=increase`);
+		chain.push(`scale=${description.width}:${description.height}`
+			+ `:force_original_aspect_ratio=increase:flags=${SCALE_FLAGS}`);
 		chain.push(`crop=${description.width}:${description.height}`);
 	}
 
 	chain.push('setsar=1');
 
-	const graph = new NodeAv.FilterGraph();
-	graph.alloc();
-
 	try {
-		if (srcFrameOwned) {
+		if (srcFrameOwned && !(sample._data instanceof AvFrameVideoSampleResource)) {
 			await copyVideoSampleToAvFrame(sample, srcFrame, null);
 		}
 
@@ -338,46 +466,21 @@ export const transformVideoSample = async (
 			+ `:colorspace=${srcFrame.colorSpace}`
 			+ `:range=${srcFrame.colorRange}`;
 
-		const bufferSrc = graph.createFilter(NodeAv.Filter.getByName('buffer')!, 'src', srcArgs);
-		const bufferSink = graph.createFilter(NodeAv.Filter.getByName('buffersink')!, 'sink');
-		assert(bufferSrc && bufferSink);
+		const chainString = chain.join(',');
 
-		// The naming here looks inverted but matches FFmpeg's parse semantics: from the parsed chain's
-		// perspective, its inputs are fed by the graph's existing outputs (the buffer src), and its outputs
-		// feed the graph's existing inputs (the buffer sink).
-		const outputs = NodeAv.FilterInOut.createList([{ name: 'in', filterCtx: bufferSrc, padIdx: 0 }]);
-		const inputs = NodeAv.FilterInOut.createList([{ name: 'out', filterCtx: bufferSink, padIdx: 0 }]);
+		const cached = takeIdleFilterGraph(srcArgs, chainString);
+		const entry = cached ?? buildFilterGraph(srcArgs, chainString);
 
-		const parseRet = graph.parsePtr(`[in]${chain.join(',')}[out]`, inputs, outputs);
-		NodeAv.FFmpegError.throwIfError(parseRet, 'FilterGraph.parsePtr');
-
-		const configRet = await graph.config();
-		NodeAv.FFmpegError.throwIfError(configRet, 'FilterGraph.config');
-
-		// Without KEEP_REF, the graph would take the frame's buffers away from the sample
-		const addRet = await bufferSrc.buffersrcAddFrame(srcFrame, NodeAv.AV_BUFFERSRC_FLAG_KEEP_REF);
-		NodeAv.FFmpegError.throwIfError(addRet, 'buffersrcAddFrame');
-
-		// Flush - we only ever push a single frame through this graph.
-		await bufferSrc.buffersrcAddFrame(null);
-
-		const dstFrame = new NodeAv.Frame();
-		dstFrame.alloc();
-
-		const getRet = await bufferSink.buffersinkGetFrame(dstFrame);
-		NodeAv.FFmpegError.throwIfError(getRet, 'buffersinkGetFrame');
-
-		return new VideoSample(new AvFrameVideoSampleResource(dstFrame), {
-			timestamp: sample.timestamp,
-			duration: sample.duration,
-			// Baked in by the filter graph:
-			rotation: 0,
-			flip: false,
-			encodeOptions: sample.encodeOptions,
-		});
+		try {
+			return await pushThroughFilterGraph(entry, sample, srcFrame);
+		} finally {
+			if (cached) {
+				cached.busy = false;
+			} else {
+				returnFilterGraph(entry);
+			}
+		}
 	} finally {
-		graph.free();
-
 		if (srcFrameOwned) {
 			srcFrame.free();
 		}

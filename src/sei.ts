@@ -1,0 +1,286 @@
+/*!
+ * Copyright (c) 2026-present, Vanilagy and contributors
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
+
+import {
+	addEmulationPreventionBytes,
+	AvcNalUnitType,
+	concatAvcNalUnits,
+	concatHevcNalUnits,
+	extractNalUnitTypeForAvc,
+	extractNalUnitTypeForHevc,
+	HevcNalUnitType,
+	iterateAvcNalUnits,
+	iterateHevcNalUnits,
+	type NalUnitLocation,
+	removeEmulationPreventionBytes,
+} from './codec-data';
+
+/**
+ * The codecs whose SEI messages this library reads and writes. They differ in NAL header length and in
+ * which NAL unit type carries an SEI.
+ *
+ * @group Codecs
+ * @public
+ */
+export type SeiCodec = 'avc' | 'hevc';
+
+/**
+ * `user_data_registered_itu_t_t35`, payload type 4 in both H.264 Table D-1 and H.265 Table D.1. Several
+ * unrelated things ride it - ATSC A/53 captions and HDR10+ among them - so a reader matches the payload's
+ * own header to tell them apart.
+ *
+ * @internal
+ */
+export const USER_DATA_REGISTERED_ITU_T_T35 = 4;
+
+/** @internal */
+export type SeiMessage = {
+	payloadType: number;
+	payload: Uint8Array;
+};
+
+type SeiFraming = {
+	nalHeader: number[];
+	isSeiNalUnit: (firstByte: number) => boolean;
+	isVcl: (firstByte: number) => boolean;
+	iterateNalUnits: (packetData: Uint8Array, decoderConfig: VideoDecoderConfig) => Iterable<NalUnitLocation>;
+	concatNalUnits: (nalUnits: Uint8Array[], decoderConfig: VideoDecoderConfig) => Uint8Array;
+};
+
+/**
+ * Every field reads its `codec-data` import lazily, on access. This module sits on an import cycle
+ * through `codec-data`, so a field evaluated while the table is constructed sees the binding in its
+ * TDZ and throws — which is what kept `parameter-sets.test.ts` from loading in the browser at all.
+ *
+ * @internal
+ */
+export const SEI_FRAMINGS: Record<SeiCodec, SeiFraming> = {
+	avc: {
+		get nalHeader() { return [AvcNalUnitType.SEI]; },
+		isSeiNalUnit: firstByte => extractNalUnitTypeForAvc(firstByte) === AvcNalUnitType.SEI,
+		isVcl: (firstByte) => {
+			const type = extractNalUnitTypeForAvc(firstByte);
+			return type >= AvcNalUnitType.NON_IDR_SLICE && type <= AvcNalUnitType.IDR;
+		},
+		iterateNalUnits: (packetData, decoderConfig) => iterateAvcNalUnits(packetData, decoderConfig),
+		concatNalUnits: (nalUnits, decoderConfig) => concatAvcNalUnits(nalUnits, decoderConfig),
+	},
+	hevc: {
+		get nalHeader() { return [HevcNalUnitType.PREFIX_SEI_NUT << 1, 1]; },
+		isSeiNalUnit: (firstByte) => {
+			const type = extractNalUnitTypeForHevc(firstByte);
+			return type === HevcNalUnitType.PREFIX_SEI_NUT || type === HevcNalUnitType.SUFFIX_SEI_NUT;
+		},
+		isVcl: firstByte => extractNalUnitTypeForHevc(firstByte) < HevcNalUnitType.VPS_NUT,
+		iterateNalUnits: (packetData, decoderConfig) => iterateHevcNalUnits(packetData, decoderConfig),
+		concatNalUnits: (nalUnits, decoderConfig) => concatHevcNalUnits(nalUnits, decoderConfig),
+	},
+};
+
+/** @internal */
+export const iterateSeiMessages = function* (seiNalUnit: Uint8Array, codec: SeiCodec): Generator<SeiMessage> {
+	const rbsp = removeEmulationPreventionBytes(seiNalUnit.subarray(SEI_FRAMINGS[codec].nalHeader.length));
+	let pos = 0;
+
+	while (pos < rbsp.length && rbsp[pos] !== 0x80) { // 0x80 = rbsp_trailing_bits
+		let payloadType = 0;
+		while (rbsp[pos] === 0xff) {
+			payloadType += 255;
+			pos++;
+		}
+		payloadType += rbsp[pos++]!;
+
+		let payloadSize = 0;
+		while (rbsp[pos] === 0xff) {
+			payloadSize += 255;
+			pos++;
+		}
+		payloadSize += rbsp[pos++]!;
+
+		yield { payloadType, payload: rbsp.subarray(pos, pos + payloadSize) };
+		pos += payloadSize;
+	}
+};
+
+/** @internal */
+export const iterateSeiNalUnits = function* (
+	packetData: Uint8Array,
+	decoderConfig: VideoDecoderConfig,
+	codec: SeiCodec,
+): Generator<Uint8Array> {
+	const framing = SEI_FRAMINGS[codec];
+
+	for (const location of framing.iterateNalUnits(packetData, decoderConfig)) {
+		const nalUnit = packetData.subarray(location.offset, location.offset + location.length);
+
+		if (framing.isSeiNalUnit(nalUnit[0]!)) {
+			yield nalUnit;
+		}
+	}
+};
+
+// sei_message(): payload type and size are both coded as a run of 0xff bytes plus a final byte below 255.
+const appendSeiMessage = (out: number[], message: SeiMessage) => {
+	for (const value of [message.payloadType, message.payload.length]) {
+		let remaining = value;
+		while (remaining >= 255) {
+			out.push(0xff);
+			remaining -= 255;
+		}
+		out.push(remaining);
+	}
+	out.push(...message.payload);
+};
+
+/** @internal */
+export const buildSeiNalUnit = (messages: SeiMessage[], codec: SeiCodec): Uint8Array | null => {
+	if (messages.length === 0) {
+		return null;
+	}
+
+	const rbsp: number[] = [];
+	for (const message of messages) {
+		appendSeiMessage(rbsp, message);
+	}
+
+	rbsp.push(0x80); // rbsp_trailing_bits
+
+	// Only the payload is escaped; the NAL header holds no zero byte, so no start-code pattern can straddle it.
+	const framing = SEI_FRAMINGS[codec];
+	const escaped = addEmulationPreventionBytes(new Uint8Array(rbsp));
+	const nalUnit = new Uint8Array(framing.nalHeader.length + escaped.length);
+	nalUnit.set(framing.nalHeader, 0);
+	nalUnit.set(escaped, framing.nalHeader.length);
+
+	return nalUnit;
+};
+
+/**
+ * Rewrites the SEI messages of an access unit, leaving every other NAL unit as it came.
+ *
+ * `transform` is called for each message and returns a replacement, or the message itself to leave it
+ * be. A rewritten SEI NAL unit is rebuilt whole, so its message sizes and escaping come out right. The
+ * return says whether anything changed, because a caller that has to ADD a message needs to know that
+ * nothing took its edit.
+ *
+ * @internal
+ */
+export const rewriteSeiMessages = (
+	packetData: Uint8Array,
+	decoderConfig: VideoDecoderConfig,
+	codec: SeiCodec,
+	transform: (message: SeiMessage) => SeiMessage,
+): { data: Uint8Array; changed: boolean } => {
+	const framing = SEI_FRAMINGS[codec];
+	const nalUnits: Uint8Array[] = [];
+	let changed = false;
+
+	for (const location of framing.iterateNalUnits(packetData, decoderConfig)) {
+		const nalUnit = packetData.subarray(location.offset, location.offset + location.length);
+
+		if (!framing.isSeiNalUnit(nalUnit[0]!)) {
+			nalUnits.push(nalUnit);
+			continue;
+		}
+
+		const messages: SeiMessage[] = [];
+		let nalChanged = false;
+		for (const message of iterateSeiMessages(nalUnit, codec)) {
+			const replacement = transform(message);
+			nalChanged ||= replacement !== message;
+			messages.push(replacement);
+		}
+
+		const rebuilt = nalChanged ? buildSeiNalUnit(messages, codec) : null;
+		nalUnits.push(rebuilt ?? nalUnit);
+		changed ||= nalChanged;
+	}
+
+	if (!changed) {
+		return { data: packetData, changed: false };
+	}
+
+	return { data: framing.concatNalUnits(nalUnits, decoderConfig), changed: true };
+};
+
+/**
+ * Splice a NAL unit into one access unit, ahead of its first VCL NAL unit so that it follows any
+ * in-band parameter sets — where both an SEI message and a Dolby Vision RPU belong. Every other NAL
+ * unit is copied verbatim, in the framing it came in.
+ *
+ * @internal
+ */
+export const spliceNalUnitBeforeVcl = (
+	packetData: Uint8Array,
+	decoderConfig: VideoDecoderConfig,
+	codec: SeiCodec,
+	nalUnit: Uint8Array,
+): Uint8Array => {
+	const framing = SEI_FRAMINGS[codec];
+	const nalUnits: Uint8Array[] = [];
+	let firstVclIndex = -1;
+
+	for (const location of framing.iterateNalUnits(packetData, decoderConfig)) {
+		const nalUnit = packetData.subarray(location.offset, location.offset + location.length);
+
+		if (firstVclIndex === -1 && framing.isVcl(nalUnit[0]!)) {
+			firstVclIndex = nalUnits.length;
+		}
+
+		nalUnits.push(nalUnit);
+	}
+
+	if (firstVclIndex === -1) {
+		throw new Error(`Expected a VCL NAL unit in the ${codec.toUpperCase()} access unit, found none.`);
+	}
+
+	nalUnits.splice(firstVclIndex, 0, nalUnit);
+
+	return framing.concatNalUnits(nalUnits, decoderConfig);
+};
+
+/**
+ * Splice a NAL unit into one access unit AFTER its last VCL NAL unit, which is where a Dolby Vision
+ * RPU belongs.
+ *
+ * Not interchangeable with {@link spliceNalUnitBeforeVcl}: an RPU placed ahead of the slices is read
+ * as belonging to the PREVIOUS picture, because a parser ends an access unit at the next picture's
+ * first slice and everything before that falls to the one before. Dolby's own streams put it last -
+ * `39/20/62` on a key frame and `1/62` after - and `dovi_tool extract-rpu` discards an RPU it finds
+ * anywhere else, so per-frame metadata lands a frame early and the last frame's is dropped entirely.
+ *
+ * @internal
+ */
+export const spliceNalUnitAfterVcl = (
+	packetData: Uint8Array,
+	decoderConfig: VideoDecoderConfig,
+	codec: SeiCodec,
+	nalUnit: Uint8Array,
+): Uint8Array => {
+	const framing = SEI_FRAMINGS[codec];
+	const nalUnits: Uint8Array[] = [];
+	let lastVclIndex = -1;
+
+	for (const location of framing.iterateNalUnits(packetData, decoderConfig)) {
+		const unit = packetData.subarray(location.offset, location.offset + location.length);
+
+		if (framing.isVcl(unit[0]!)) {
+			lastVclIndex = nalUnits.length;
+		}
+
+		nalUnits.push(unit);
+	}
+
+	if (lastVclIndex === -1) {
+		throw new Error(`Expected a VCL NAL unit in the ${codec.toUpperCase()} access unit, found none.`);
+	}
+
+	nalUnits.splice(lastVclIndex + 1, 0, nalUnit);
+
+	return framing.concatNalUnits(nalUnits, decoderConfig);
+};

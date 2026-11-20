@@ -6,11 +6,14 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
+import { InvalidUsageError, UnsupportedMediaError } from './errors';
 import { Demuxer, DurationMetadataRequestOptions } from './demuxer';
 import { InputFormat, InputFormatOptions, validateInputFormatOptions } from './input-format';
 import {
 	InputAudioTrack,
 	InputAudioTrackBacking,
+	InputSubtitleTrack,
+	InputSubtitleTrackBacking,
 	InputTrack,
 	InputTrackBacking,
 	InputVideoTrack,
@@ -95,6 +98,39 @@ export type InputEvents = {
 		/** Whether the source is the root file of the media. */
 		isRoot: boolean;
 	};
+	/**
+	 * Emitted for an event carried **inside** the media rather than alongside it: an SCTE-35 splice on
+	 * an MPEG-TS cue stream, and in time whatever else a container carries this way.
+	 *
+	 * It is an event rather than a track because these are not media: they have no samples, no codec
+	 * and no duration of their own, and a reader that had to pull a track to see a splice would have
+	 * to keep pulling it in step with the media to see one in time.
+	 *
+	 * Listen before reading. They are emitted as the bytes carrying them are parsed, so a listener
+	 * added after a read has already passed a splice will not be told about it.
+	 */
+	inbandEvent: InbandEvent;
+};
+
+/**
+ * An event carried inside the media, as the container carried it.
+ *
+ * @group Input files & tracks
+ * @public
+ */
+export type InbandEvent = {
+	/**
+	 * Where it sits on the input's timeline, in seconds, or null where the carriage states no time of
+	 * its own - an SCTE-35 section states its splice time inside the payload rather than outside it.
+	 */
+	timestamp: number | null;
+	/**
+	 * What kind of event this is. `urn:scte:scte35:2013:bin` for a binary SCTE-35 section, which is
+	 * the identifier the same payload carries in DASH and HLS.
+	 */
+	scheme: string;
+	/** The payload exactly as it was carried, unparsed. */
+	data: Uint8Array;
 };
 
 /**
@@ -457,6 +493,15 @@ export class Input<S extends Source = Source> extends EventEmitter<InputEvents> 
 		return queryInputTracks(audioTracks, query);
 	}
 
+	/** Returns the list of all subtitle tracks of this input file. An optional query can be provided. */
+	async getSubtitleTracks(query?: InputTrackQuery<InputSubtitleTrack>): Promise<InputSubtitleTrack[]> {
+		query &&= toValidatedInputTrackQuery(query);
+
+		const tracks = await this.getTracks();
+		const subtitleTracks = tracks.filter((x): x is InputSubtitleTrack => x.isSubtitleTrack());
+		return queryInputTracks(subtitleTracks, query);
+	}
+
 	/**
 	 * Returns the primary video track of this input file, or null if there are no video tracks.
 	 *
@@ -520,9 +565,14 @@ export class Input<S extends Source = Source> extends EventEmitter<InputEvents> 
 		}
 
 		const type = backing.getType();
-		const track = type === 'video'
-			? new InputVideoTrack(this, backing as InputVideoTrackBacking)
-			: new InputAudioTrack(this, backing as InputAudioTrackBacking);
+		let track: InputTrack;
+		if (type === 'video') {
+			track = new InputVideoTrack(this, backing as InputVideoTrackBacking);
+		} else if (type === 'audio') {
+			track = new InputAudioTrack(this, backing as InputAudioTrackBacking);
+		} else {
+			track = new InputSubtitleTrack(this, backing as InputSubtitleTrackBacking);
+		}
 
 		this._backingToTrack.set(backing, track);
 		return track;
@@ -541,6 +591,40 @@ export class Input<S extends Source = Source> extends EventEmitter<InputEvents> 
 	async getMetadataTags() {
 		const demuxer = await this._getDemuxer();
 		return demuxer.getMetadataTags();
+	}
+
+	/**
+	 * Returns parsed `sidx` (Segment Index) boxes from the file, if any. Multiple boxes are valid (typically
+	 * one per track, distinguished by their `referenceID`). Returns an empty array for formats without a
+	 * `sidx` equivalent.
+	 */
+	async getSegmentIndex() {
+		const demuxer = await this._getDemuxer();
+		return demuxer.getSegmentIndex();
+	}
+
+	/**
+	 * Returns top-level Protection System Specific Header (`pssh`) boxes from the file, one per DRM system
+	 * (Widevine, PlayReady, FairPlay, etc.). Use {@link parsePsshBoxContents} on the raw bytes to get
+	 * structured fields. Returns an empty array for clear files and for formats without a `pssh` equivalent.
+	 */
+	async getPsshBoxes() {
+		const demuxer = await this._getDemuxer();
+		return demuxer.getPsshBoxes();
+	}
+
+	/**
+	 * Returns the frames of the file's ancillary data tracks (SMPTE ST 436M), which is how an MXF broadcast
+	 * master carries VANC - closed captions, AFD, timecode - beside its picture and sound. Use
+	 * {@link ancillaryCaptionsOf} or {@link ancillaryPacketsOf} to read one.
+	 *
+	 * There is no track type for ancillary essence, so these frames do not appear in
+	 * {@link Input.getTracks} and are read whole rather than through a sink. Returns an empty array for
+	 * files that carry none.
+	 */
+	async getAncillaryFrames() {
+		const demuxer = await this._getDemuxer();
+		return demuxer.getAncillaryFrames();
 	}
 
 	/**
@@ -591,7 +675,7 @@ export class Input<S extends Source = Source> extends EventEmitter<InputEvents> 
  * @group Input files & tracks
  * @public
  */
-export class UnsupportedInputFormatError extends Error {
+export class UnsupportedInputFormatError extends UnsupportedMediaError {
 	/** Creates a new {@link UnsupportedInputFormatError}. */
 	constructor(message = 'Input has an unsupported or unrecognizable format.') {
 		super(message);
@@ -604,7 +688,7 @@ export class UnsupportedInputFormatError extends Error {
  * @group Input files & tracks
  * @public
  */
-export class InputDisposedError extends Error {
+export class InputDisposedError extends InvalidUsageError {
 	/** Creates a new {@link InputDisposedError}. */
 	constructor(message = 'Input has been disposed.') {
 		super(message);

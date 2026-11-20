@@ -60,7 +60,7 @@ tsx scripts/check-docblocks.ts \
 	packages/aac-encoder/dist/mediabunny-aac-encoder.d.ts \
 	packages/flac-encoder/dist/mediabunny-flac-encoder.d.ts \
 	packages/prores/dist/mediabunny-prores.d.ts \
-	packages/server/dist/mediabunny-server.d.ts
+	packages/server/dist/mediabunny-server.d.ts \
 
 # Checks that API docs are generatable
 npm run docs:generate -- --dry

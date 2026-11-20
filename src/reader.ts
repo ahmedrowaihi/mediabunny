@@ -10,6 +10,18 @@ import { InputDisposedError } from './input';
 import { assert, clamp, getUint24, isThenable, MaybePromise, textDecoder, toDataView } from './misc';
 import { DEFAULT_MAX_READ_POSITION, DEFAULT_MIN_READ_POSITION, Source } from './source';
 
+// Only valid on a fresh slice: bufferPos starts at `start - offset` and advances as readers consume.
+const assertWholeFile = (slice: FileSlice | null) => {
+	const available = slice ? slice.bytes.length - slice.bufferPos : 0;
+	if (slice && available < slice.length) {
+		throw new Error(
+			`Short read: asked for bytes [${slice.start}, ${slice.end}) but the source provided ${available} of`
+			+ ` ${slice.length}.`,
+		);
+	}
+	return slice;
+};
+
 export class Reader {
 	constructor(public source: Source) {}
 
@@ -28,7 +40,9 @@ export class Reader {
 
 	requestSlice(start: number, length: number): MaybePromise<FileSlice | null> {
 		if (this.source._disposed) {
-			throw new InputDisposedError();
+			throw new InputDisposedError(
+				`Cannot read bytes [${start}, ${start + length}); the source has been disposed.`,
+			);
 		}
 
 		if (start < 0) {
@@ -66,7 +80,10 @@ export class Reader {
 
 	requestSliceRange(start: number, minLength: number, maxLength: number): MaybePromise<FileSlice | null> {
 		if (this.source._disposed) {
-			throw new InputDisposedError();
+			throw new InputDisposedError(
+				`Cannot read bytes [${start}, ${start + minLength}..${start + maxLength});`
+				+ ` the source has been disposed.`,
+			);
 		}
 
 		if (start < 0) {
@@ -105,7 +122,8 @@ export class Reader {
 
 	requestEntireFile(): MaybePromise<FileSlice | null> {
 		if (this.fileSizeNonStrict !== null) {
-			return this.requestSlice(0, this.fileSizeNonStrict);
+			const whole = this.requestSlice(0, this.fileSizeNonStrict);
+			return isThenable(whole) ? whole.then(assertWholeFile) : assertWholeFile(whole);
 		}
 
 		const CHUNK_SIZE = 1024;
@@ -117,7 +135,8 @@ export class Reader {
 			while (true) {
 				if (chunks.length === 1 && this.fileSizeNonStrict !== null) {
 					// It only took one read to get to know the whole file size
-					return this.requestSlice(0, this.fileSizeNonStrict);
+					const whole = await this.requestSlice(0, this.fileSizeNonStrict);
+					return assertWholeFile(whole);
 				}
 
 				let slice = this.requestSliceRange(currentSize, 0, CHUNK_SIZE);

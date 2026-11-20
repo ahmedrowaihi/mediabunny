@@ -1,0 +1,17 @@
+# The vendor MXF files test/node/mxf-vendor.test.ts reads. Fetch them with `npm run capture-mxf-fixtures`;
+# the files themselves are not committed, being third-party media.
+#
+# Every MXF the rest of the suite reads is one ffmpeg wrote, so the suite only ever saw one writer's
+# shape. These are Avid, Sony, Omneon, Apple and Quantel, and between them they carry Avid's private
+# metadata sets and legacy data definitions, clip wrapping, a run-in, an index in the footer with no
+# pointer to it, an empty index entry array, and A-law audio - none of which ffmpeg writes.
+https://fate-suite.ffmpeg.org/mxf/Avid-00005.mxf
+https://fate-suite.ffmpeg.org/mxf/C0023S01.mxf
+https://fate-suite.ffmpeg.org/mxf/Meridian-Apple_ProResProxy-HDR10.mxf
+https://fate-suite.ffmpeg.org/mxf/Sony-00001.mxf
+https://fate-suite.ffmpeg.org/mxf/multiple_components.mxf
+https://fate-suite.ffmpeg.org/mxf/omneon_8.3.0.0_xdcam_startc_footer.mxf
+https://fate-suite.ffmpeg.org/mxf/opatom_essencegroup_alpha_raw.mxf
+https://fate-suite.ffmpeg.org/mxf/opatom_missing_index.mxf
+https://fate-suite.ffmpeg.org/mxf/track_01_v02.mxf
+https://fate-suite.ffmpeg.org/mxf/track_02_a01.mxf

@@ -13,6 +13,7 @@ import {
 	extractDtsFourCcFromPacket,
 	extractAvcDecoderConfigurationRecord,
 	extractHevcDecoderConfigurationRecord,
+	extractMpeg2CodecInfoFromPacket,
 	extractProresCodecInfoFromPacket,
 	extractVp9CodecInfoFromPacket,
 } from '../codec-data';
@@ -28,16 +29,20 @@ import {
 	OPUS_SAMPLE_RATE,
 	PRORES_FOURCCS,
 	ProresFourCc,
+	SubtitleCodec,
 	VideoCodec,
 } from '../codec';
 import { Demuxer } from '../demuxer';
 import { Input } from '../input';
 import { Logging } from '../logging';
 import {
+	DecodedSubtitleCue,
 	InputAudioTrackBacking,
+	InputSubtitleTrackBacking,
 	InputTrackBacking,
 	InputVideoTrackBacking,
 } from '../input-track';
+import { SubtitleConfig } from '../subtitles';
 import { AttachedFile, DEFAULT_TRACK_DISPOSITION, MetadataTags, TrackDisposition } from '../metadata';
 import { PacketRetrievalOptions } from '../media-sink';
 import {
@@ -262,10 +267,16 @@ type InternalTrack = {
 			codecDescription: Uint8Array | null;
 			aacCodecInfo: AacCodecInfo | null;
 			dtsFormat: DtsFourCc | null;
+		}
+		| {
+			type: 'subtitle';
+			codec: SubtitleCodec | null;
+			config: SubtitleConfig | null;
 		};
 };
 type InternalVideoTrack = InternalTrack & { info: { type: 'video' } };
 type InternalAudioTrack = InternalTrack & { info: { type: 'audio' } };
+type InternalSubtitleTrack = InternalTrack & { info: { type: 'subtitle' } };
 
 const METADATA_ELEMENTS = [
 	{ id: EBMLId.SeekHead, flag: 'seekHeadSeen' },
@@ -1286,6 +1297,8 @@ export class MatroskaDemuxer extends Demuxer {
 						} else if (this.currentTrack.codecId === CODEC_STRING_MAP.hevc) {
 							this.currentTrack.info.codec = 'hevc';
 							this.currentTrack.info.codecDescription = this.currentTrack.codecPrivate;
+						} else if (this.currentTrack.codecId === CODEC_STRING_MAP.mpeg2) {
+							this.currentTrack.info.codec = 'mpeg2';
 						} else if (codecIdWithoutSuffix === CODEC_STRING_MAP.vp8) {
 							this.currentTrack.info.codec = 'vp8';
 						} else if (codecIdWithoutSuffix === CODEC_STRING_MAP.vp9) {
@@ -1348,6 +1361,8 @@ export class MatroskaDemuxer extends Demuxer {
 							}
 						} else if (this.currentTrack.codecId === CODEC_STRING_MAP.mp3) {
 							this.currentTrack.info.codec = 'mp3';
+						} else if (this.currentTrack.codecId === CODEC_STRING_MAP.mp2) {
+							this.currentTrack.info.codec = 'mp2';
 						} else if (codecIdWithoutSuffix === CODEC_STRING_MAP.opus) {
 							this.currentTrack.info.codec = 'opus';
 							this.currentTrack.info.codecDescription = this.currentTrack.codecPrivate;
@@ -1406,6 +1421,22 @@ export class MatroskaDemuxer extends Demuxer {
 						this.currentTrack.trackBacking = new MatroskaAudioTrackBacking(audioTrack);
 						this.currentSegment.tracks.push(this.currentTrack);
 						this.currentSegment.idToTrack.set(this.currentTrack.id, this.currentTrack);
+					} else if (this.currentTrack.info.type === 'subtitle') {
+						if (this.currentTrack.codecId === CODEC_STRING_MAP.webvtt) {
+							this.currentTrack.info.codec = 'webvtt';
+							this.currentTrack.info.config = {
+								description: textDecoder.decode(this.currentTrack.codecPrivate ?? new Uint8Array(0)),
+							};
+
+							const subtitleTrack = this.currentTrack as InternalSubtitleTrack;
+							this.currentTrack.trackBacking = new MatroskaSubtitleTrackBacking(subtitleTrack);
+							this.currentSegment.tracks.push(this.currentTrack);
+							this.currentSegment.idToTrack.set(this.currentTrack.id, this.currentTrack);
+						} else {
+							Logging._warn(
+								`Unsupported subtitle codec (CodecID '${this.currentTrack.codecId}').`,
+							);
+						}
 					}
 				}
 
@@ -1453,6 +1484,12 @@ export class MatroskaDemuxer extends Demuxer {
 						codecDescription: null,
 						aacCodecInfo: null,
 						dtsFormat: null,
+					};
+				} else if (type === 17) {
+					this.currentTrack.info = {
+						type: 'subtitle',
+						codec: null,
+						config: null,
 					};
 				}
 			}; break;
@@ -2283,6 +2320,10 @@ abstract class MatroskaTrackBacking implements InputTrackBacking {
 	abstract getType(): TrackType;
 	abstract getDecoderConfig(): Promise<VideoDecoderConfig | AudioDecoderConfig | null>;
 
+	getContainerId() {
+		return this.internalTrack.id;
+	}
+
 	getNumber() {
 		const demuxer = this.internalTrack.demuxer;
 		const trackType = this.internalTrack.trackBacking!.getType();
@@ -2311,6 +2352,10 @@ abstract class MatroskaTrackBacking implements InputTrackBacking {
 		return this.internalTrack.codecId;
 	}
 
+	getEncryptionInfo() {
+		return null;
+	}
+
 	getName() {
 		return this.internalTrack.name;
 	}
@@ -2321,6 +2366,10 @@ abstract class MatroskaTrackBacking implements InputTrackBacking {
 
 	getTimeResolution() {
 		return this.internalTrack.segment.timestampFactor;
+	}
+
+	getPresentationOffset() {
+		return this.internalTrack.codecDelay / this.internalTrack.segment.timestampFactor;
 	}
 
 	isRelativeToUnixEpoch() {
@@ -2883,6 +2932,7 @@ class MatroskaVideoTrackBacking extends MatroskaTrackBacking implements InputVid
 				= this.internalTrack.info.codec === 'vp9'
 					|| (this.internalTrack.info.codec === 'av1' && !av1CodecInfo)
 					|| this.internalTrack.info.codec === 'prores'
+					|| this.internalTrack.info.codec === 'mpeg2'
 					// Packets are in Annex B format:
 					|| (this.internalTrack.info.codec === 'avc' && !this.internalTrack.info.codecDescription)
 					// Packets are in Annex B format:
@@ -2903,10 +2953,10 @@ class MatroskaVideoTrackBacking extends MatroskaTrackBacking implements InputVid
 				codecDescription: this.internalTrack.info.codecDescription,
 				colorSpace: this.internalTrack.info.colorSpace,
 				avcType: 1 as const, // We don't know better (or do we?) so just assume 'avc1'
+				hevcType: 'hev1' as const, // Matroska doesn't promise that parameter sets stay out of the blocks
 				avcCodecInfo: this.internalTrack.info.codec === 'avc' && firstPacket
 					? extractAvcDecoderConfigurationRecord(firstPacket.data)
 					: null,
-				hevcType: 'hev1' as const, // Matroska doesn't promise that parameter sets stay out of the blocks
 				hevcCodecInfo: this.internalTrack.info.codec === 'hevc' && firstPacket
 					? extractHevcDecoderConfigurationRecord(firstPacket.data)
 					: null,
@@ -2914,6 +2964,9 @@ class MatroskaVideoTrackBacking extends MatroskaTrackBacking implements InputVid
 					? extractVp9CodecInfoFromPacket(firstPacket.data)
 					: null,
 				av1CodecInfo,
+				mpeg2CodecInfo: this.internalTrack.info.codec === 'mpeg2' && firstPacket
+					? extractMpeg2CodecInfoFromPacket(firstPacket.data)
+					: null,
 				proresCodecInfo: this.internalTrack.info.codec === 'prores' && firstPacket
 					? extractProresCodecInfoFromPacket(firstPacket.data)
 					: null,
@@ -2999,5 +3052,55 @@ class MatroskaAudioTrackBacking extends MatroskaTrackBacking implements InputAud
 				description: this.internalTrack.info.codecDescription ?? undefined,
 			};
 		})();
+	}
+}
+
+class MatroskaSubtitleTrackBacking extends MatroskaTrackBacking implements InputSubtitleTrackBacking {
+	override internalTrack: InternalSubtitleTrack;
+
+	constructor(internalTrack: InternalSubtitleTrack) {
+		super(internalTrack);
+		this.internalTrack = internalTrack;
+	}
+
+	getType() {
+		return 'subtitle' as const;
+	}
+
+	override getCodec(): SubtitleCodec | null {
+		return this.internalTrack.info.codec;
+	}
+
+	getConfig(): SubtitleConfig | null {
+		return this.internalTrack.info.config;
+	}
+
+	async getDecoderConfig(): Promise<null> {
+		return null;
+	}
+
+	decodeCues(packet: EncodedPacket): DecodedSubtitleCue[] {
+		const location = this.packetToClusterLocation.get(packet);
+		if (location === undefined) {
+			throw new Error('Packet was not created from this track.');
+		}
+
+		const block = location.cluster.trackData.get(this.internalTrack.id)!.blocks[location.blockIndex]!;
+
+		const [settings, identifier, notes] = block.mainAdditional
+			? textDecoder.decode(block.mainAdditional).split('\n')
+			: [];
+
+		return [{
+			cue: {
+				timestamp: packet.timestamp,
+				duration: packet.duration,
+				text: textDecoder.decode(packet.data),
+				identifier: identifier === '' ? undefined : identifier,
+				settings: settings === '' ? undefined : settings,
+				notes: notes === '' ? undefined : notes,
+			},
+			continuationId: null,
+		}];
 	}
 }

@@ -22,7 +22,8 @@ import { BufferTarget, PathedTarget } from '../../src/target.js';
 import { InputAudioTrack, InputVideoTrack } from '../../src/input-track.js';
 import { Conversion } from '../../src/conversion.js';
 import { assert } from '../../src/misc.js';
-import { PAT_PID, PMT_PID } from '../../src/mpeg-ts/mpeg-ts-muxer.js';
+// This fork makes the PMT PID configurable, so upstream's `PMT_PID` is `DEFAULT_PMT_PID` here.
+import { PAT_PID, DEFAULT_PMT_PID as PMT_PID } from '../../src/mpeg-ts/mpeg-ts-muxer.js';
 
 type EmptyMediaVariant =
 	| { type: 'mp4'; fastStart: false | 'in-memory' | 'reserve' | 'fragmented' }

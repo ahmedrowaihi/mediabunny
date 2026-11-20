@@ -8,7 +8,7 @@
 
 import type { FileHandle } from 'node:fs/promises';
 import * as nodeAlias from './node';
-import { assert, EventEmitter, FilePath, isWebKit, MaybePromise } from './misc';
+import { assert, EventEmitter, FilePath, isBun, isWebKit, MaybePromise } from './misc';
 
 const node = typeof nodeAlias !== 'undefined'
 	? nodeAlias // Aliasing it prevents some bundler warnings
@@ -155,7 +155,7 @@ export class BufferTarget extends Target {
 
 		this._options = options;
 
-		this._supportsResize = 'resize' in new ArrayBuffer(0);
+		this._supportsResize = !isBun() && 'resize' in new ArrayBuffer(0);
 		if (this._supportsResize) {
 			try {
 				// @ts-expect-error Don't want to bump "lib" in tsconfig

@@ -8,6 +8,7 @@
 
 import { Bitstream } from '../shared/bitstream';
 import { Logging } from './logging';
+import { RetryTimeoutError } from './errors';
 
 export function assert(x: unknown): asserts x {
 	if (!x) {
@@ -184,6 +185,91 @@ export const readExpGolomb = (bitstream: Bitstream) => {
 	return result;
 };
 
+/**
+ * A bit writer that grows, for the bitstreams this library writes whose length is not known until they
+ * are written - a Dolby Vision RPU, an all-skip slice. Big-endian, as every coded bitstream here is.
+ *
+ * @internal
+ */
+export class BitWriter {
+	private bytes = new Uint8Array(512);
+	private bitLength = 0;
+
+	private ensure(bits: number) {
+		const needed = (this.bitLength + bits + 7) >> 3;
+		if (needed <= this.bytes.length) {
+			return;
+		}
+
+		const grown = new Uint8Array(Math.max(needed, this.bytes.length * 2));
+		grown.set(this.bytes);
+		this.bytes = grown;
+	}
+
+	/** Writes the low `count` bits of `value`, most significant first. */
+	writeBits(count: number, value: number) {
+		this.ensure(count);
+
+		for (let i = count - 1; i >= 0; i--) {
+			const bit = (value >>> i) & 1;
+			if (bit) {
+				this.bytes[this.bitLength >> 3]! |= 0x80 >> (this.bitLength & 7);
+			}
+
+			this.bitLength++;
+		}
+	}
+
+	/** Two's complement in `count` bits. */
+	writeSignedBits(count: number, value: number) {
+		this.writeBits(count, value < 0 ? value + (1 << count) : value);
+	}
+
+	/** More than 31 bits at a time, for the 32-bit fields. */
+	writeBits32(value: number) {
+		this.writeBits(16, (value >>> 16) & 0xffff);
+		this.writeBits(16, value & 0xffff);
+	}
+
+	/** Unsigned exp-Golomb. */
+	writeUe(value: number) {
+		const code = value + 1;
+		let bits = 0;
+		while (code >>> (bits + 1) !== 0) {
+			bits++;
+		}
+
+		this.writeBits(bits, 0);
+		this.writeBits(bits + 1, code);
+	}
+
+	/** Signed exp-Golomb, which maps a signed value onto an unsigned one. */
+	writeSe(value: number) {
+		this.writeUe(value > 0 ? 2 * value - 1 : -2 * value);
+	}
+
+	byteAlign() {
+		while ((this.bitLength & 7) !== 0) {
+			this.writeBits(1, 0);
+		}
+	}
+
+	/** Zero bits. */
+	pad(bits: number) {
+		for (let i = 0; i < bits; i++) {
+			this.writeBits(1, 0);
+		}
+	}
+
+	get bitsWritten() {
+		return this.bitLength;
+	}
+
+	finish() {
+		return this.bytes.subarray(0, (this.bitLength + 7) >> 3);
+	}
+}
+
 export const writeExpGolomb = (bitstream: Bitstream, value: number) => {
 	const codeNum = value + 1;
 	const leadingZeroBits = Math.floor(Math.log2(codeNum));
@@ -191,6 +277,15 @@ export const writeExpGolomb = (bitstream: Bitstream, value: number) => {
 	bitstream.writeBits(1, 1);
 	bitstream.writeBits(leadingZeroBits, codeNum - 2 ** leadingZeroBits);
 };
+
+/**
+ * `Array.isArray`, retyped. The built-in is declared `arg is any[]`, which a `readonly T[]` is not
+ * assignable to, so guarding one with it replaces the type instead of narrowing it and every element
+ * becomes `any` for the rest of the scope.
+ *
+ * @internal
+ */
+export const isArray = Array.isArray as (value: unknown) => value is readonly unknown[];
 
 /** Reads a signed exponential-Golomb universal code from a Bitstream. */
 export const readSignedExpGolomb = (bitstream: Bitstream) => {
@@ -414,6 +509,9 @@ export const COLOR_PRIMARIES_MAP = {
 	bt470bg: 5, // ITU-R BT.470BG
 	smpte170m: 6, // ITU-R BT.601 525 - SMPTE 170M
 	bt2020: 9, // ITU-R BT.202
+	// Neither of the next two is in WebCodecs' own enums, so a caller states them as a string the type
+	// widens to; everything downstream reads these maps rather than the enum
+	smpte431: 11, // SMPTE RP 431-2 — DCI-P3, which is what MediaConvert's FORCE_P3DCI asks for
 	smpte432: 12, // SMPTE EG 432-1
 };
 export const COLOR_PRIMARIES_MAP_INVERSE = /* #__PURE__ */ invertObject(COLOR_PRIMARIES_MAP);
@@ -424,8 +522,28 @@ export const TRANSFER_CHARACTERISTICS_MAP = {
 	'linear': 8, // Linear transfer characteristics
 	'iec61966-2-1': 13, // IEC 61966-2-1
 	'pq': 16, // Rec. ITU-R BT.2100-2 perceptual quantization (PQ) system
+	'smpte428': 17, // SMPTE ST 428-1 — digital cinema's 2.6 gamma over X'Y'Z'
 	'hlg': 18, // Rec. ITU-R BT.2100-2 hybrid loggamma (HLG) system
 };
+// CICP transfer characteristics (ISO/IEC 23091-2) that a player treats as HDR. Anything else the
+// caller can name is display-referred SDR; anything unnameable stays null so it can be left unstated.
+/** @internal */
+export const videoRangeFromTransferCharacteristics = (
+	transferCharacteristics: number | null | undefined,
+): 'SDR' | 'HLG' | 'PQ' | null => {
+	switch (transferCharacteristics) {
+		case TRANSFER_CHARACTERISTICS_MAP.pq: return 'PQ';
+		case TRANSFER_CHARACTERISTICS_MAP.hlg: return 'HLG';
+		case TRANSFER_CHARACTERISTICS_MAP.bt709:
+		case TRANSFER_CHARACTERISTICS_MAP.smpte170m:
+		case TRANSFER_CHARACTERISTICS_MAP['iec61966-2-1']:
+		case 14:
+		case 15:
+			return 'SDR';
+		default: return null;
+	}
+};
+
 export const TRANSFER_CHARACTERISTICS_MAP_INVERSE = /* #__PURE__ */ invertObject(TRANSFER_CHARACTERISTICS_MAP);
 
 export const MATRIX_COEFFICIENTS_MAP = {
@@ -436,6 +554,40 @@ export const MATRIX_COEFFICIENTS_MAP = {
 	'bt2020-ncl': 9, // ITU-R BT.2020-2 (non-constant luminance)
 };
 export const MATRIX_COEFFICIENTS_MAP_INVERSE = /* #__PURE__ */ invertObject(MATRIX_COEFFICIENTS_MAP);
+
+/**
+ * A color space in the terms this library can state, which is a superset of WebCodecs'
+ * `VideoColorSpaceInit`: that enum names neither DCI-P3 primaries nor digital cinema's 2.6 gamma, and
+ * both are ordinary requests for a mastering or cinema deliverable.
+ *
+ * The CICP maps above stay the runtime source of truth — `validateVideoColorSpaceInit` checks against
+ * them — so a value added to one of them belongs in this union too, and a drift is rejected at
+ * validation rather than silently accepted. Only the paths that take a color space *from a caller* use
+ * this; everything that hands one to WebCodecs keeps
+ * `VideoColorSpaceInit`, because a `VideoDecoder` or `VideoFrame` rejects a value it does not know.
+ *
+ * Every field spells out `| undefined` even though it is already optional. Under
+ * `exactOptionalPropertyTypes` the two are not the same thing: `?: T | null` accepts an absent property
+ * but refuses one explicitly set to `undefined`, so a caller compiling with that flag cannot pass the
+ * `VideoColorSpaceInit` an input track hands back - `colorSpace: await track.getColorSpace()` fails on
+ * every field. Without the flag the `| undefined` changes nothing.
+ *
+ * @group Miscellaneous
+ * @public
+ */
+export type WideVideoColorSpaceInit = {
+	/** The color primaries standard. `smpte431` is DCI-P3, which WebCodecs cannot name. */
+	primaries?: 'bt709' | 'bt470bg' | 'smpte170m' | 'bt2020' | 'smpte431' | 'smpte432' | null | undefined;
+	/** The transfer characteristics. `smpte428` is digital cinema's 2.6 gamma. */
+	transfer?:
+		| 'bt709' | 'smpte170m' | 'linear' | 'iec61966-2-1' | 'pq' | 'smpte428' | 'hlg'
+		| null
+		| undefined;
+	/** The color matrix coefficients. */
+	matrix?: 'rgb' | 'bt709' | 'bt470bg' | 'smpte170m' | 'bt2020-ncl' | null | undefined;
+	/** Whether the color values use the full range rather than the limited range. */
+	fullRange?: boolean | null | undefined;
+};
 
 export type RequiredNonNull<T> = {
 	[K in keyof T]-?: NonNullable<T[K]>;
@@ -453,7 +605,7 @@ export const colorSpaceIsComplete = (
 	);
 };
 
-export const colorSpaceIsEmpty = (colorSpace: VideoColorSpaceInit | undefined) => {
+export const colorSpaceIsEmpty = (colorSpace: WideVideoColorSpaceInit | undefined) => {
 	return (
 		!colorSpace
 		|| (
@@ -782,7 +934,9 @@ export const floorToMultiple = (value: number, multiple: number) => {
 };
 
 export const floorToDivisor = (value: number, multiple: number) => {
-	return Math.floor(value * multiple) / multiple;
+	// 1/25 and 1/30 are not exact in binary, so a time that is mathematically on a boundary can land
+	// ulps below it, and flooring then puts it one divisor too low
+	return Math.floor(roundIfAlmostInteger(value * multiple)) / multiple;
 };
 
 export const ilog = (x: number) => {
@@ -897,8 +1051,11 @@ export const retriedFetch = async (
 	requestInit: RequestInit,
 	getRetryDelay: (previousAttempts: number, error: unknown, url: string | URL | Request) => number | null,
 	shouldStop: () => boolean,
+	retryTimeoutInSeconds: number | null = null,
+	quietRetries = false,
 ) => {
 	let attempts = 0;
+	const giveUpAt = retryTimeoutInSeconds === null ? Infinity : Date.now() + 1000 * retryTimeoutInSeconds;
 
 	while (true) {
 		try {
@@ -909,24 +1066,43 @@ export const retriedFetch = async (
 			}
 
 			attempts++;
+
+			if (Date.now() >= giveUpAt) {
+				throw new RetryTimeoutError(
+					// eslint-disable-next-line @typescript-eslint/no-base-to-string
+					`Gave up fetching ${String(url)} after ${retryTimeoutInSeconds} s of failed attempts.`,
+					{ cause: error },
+				);
+			}
+
 			const retryDelayInSeconds = getRetryDelay(attempts, error, url);
 
 			if (retryDelayInSeconds === null) {
 				throw error;
 			}
 
-			Logging._error('Retrying failed fetch. Error:', error);
+			if (!quietRetries) {
+				Logging._error('Retrying failed fetch. Error:', error);
+			}
 
 			if (!Number.isFinite(retryDelayInSeconds) || retryDelayInSeconds < 0) {
 				throw new TypeError('Retry delay must be a non-negative finite number.');
 			}
 
 			if (retryDelayInSeconds > 0) {
-				await wait(1000 * retryDelayInSeconds);
+				await wait(Math.min(1000 * retryDelayInSeconds, Math.max(0, giveUpAt - Date.now())));
 			}
 
 			if (shouldStop()) {
 				throw error;
+			}
+
+			if (Date.now() >= giveUpAt) {
+				throw new RetryTimeoutError(
+					// eslint-disable-next-line @typescript-eslint/no-base-to-string
+					`Gave up fetching ${String(url)} after ${retryTimeoutInSeconds} s of failed attempts.`,
+					{ cause: error },
+				);
 			}
 		}
 	}
@@ -981,6 +1157,7 @@ export class CallSerializer {
 
 	call(fn: () => Promise<void> | void) {
 		const result = this.currentPromise.then(fn);
+
 		this.currentPromise = result.catch(() => {});
 
 		return result;
@@ -1013,6 +1190,20 @@ export const isFirefox = () => {
 	}
 
 	return isFirefoxCache = typeof navigator !== 'undefined' && navigator.userAgent?.includes('Firefox');
+};
+
+let isBunCache: boolean | null = null;
+export const isBun = () => {
+	if (isBunCache !== null) {
+		return isBunCache;
+	}
+
+	return isBunCache = typeof (globalThis as { Bun?: unknown }).Bun !== 'undefined';
+};
+
+/** @internal Lets tests exercise the engine-specific paths from another runtime. */
+export const setIsBunForTesting = (value: boolean | null) => {
+	isBunCache = value;
 };
 
 let isChromiumCache: boolean | null = null;
@@ -1828,3 +2019,168 @@ export const parseIsoSuffix = (text: string) => {
 
 	return date;
 };
+/**
+ * Escape a string for an XML text node. `"` needs no escaping between tags; see
+ * {@link escapeXmlAttribute} for the attribute form.
+ *
+ * @internal
+ */
+export const escapeXmlText = (text: string): string => text
+	.replaceAll('&', '&amp;')
+	.replaceAll('<', '&lt;')
+	.replaceAll('>', '&gt;');
+
+/**
+ * Escape a string for a double-quoted XML attribute value.
+ *
+ * @internal
+ */
+export const escapeXmlAttribute = (text: string): string => escapeXmlText(text).replaceAll('"', '&quot;');
+
+/**
+ * ISO 639-2 (3-letter) → ISO 639-1 (2-letter) language code map. Verbatim
+ * port of shaka's `kLanguageMap` from `language_utils.cc`. Some 3-letter codes
+ * map to the same 2-letter code (e.g. `alb` and `sqi` both → `sq`).
+ *
+ * @internal
+ */
+const ISO_639_2_TO_ISO_639_1: ReadonlyArray<[string, string]> = [
+	['aar', 'aa'], ['abk', 'ab'], ['afr', 'af'], ['aka', 'ak'], ['alb', 'sq'],
+	['amh', 'am'], ['ara', 'ar'], ['arg', 'an'], ['arm', 'hy'], ['asm', 'as'],
+	['ava', 'av'], ['ave', 'ae'], ['aym', 'ay'], ['aze', 'az'], ['bak', 'ba'],
+	['bam', 'bm'], ['baq', 'eu'], ['bel', 'be'], ['ben', 'bn'], ['bih', 'bh'],
+	['bis', 'bi'], ['bod', 'bo'], ['bos', 'bs'], ['bre', 'br'], ['bul', 'bg'],
+	['bur', 'my'], ['cat', 'ca'], ['ces', 'cs'], ['cha', 'ch'], ['che', 'ce'],
+	['chi', 'zh'], ['chu', 'cu'], ['chv', 'cv'], ['cor', 'kw'], ['cos', 'co'],
+	['cre', 'cr'], ['cym', 'cy'], ['cze', 'cs'], ['dan', 'da'], ['deu', 'de'],
+	['div', 'dv'], ['dut', 'nl'], ['dzo', 'dz'], ['ell', 'el'], ['eng', 'en'],
+	['epo', 'eo'], ['est', 'et'], ['eus', 'eu'], ['ewe', 'ee'], ['fao', 'fo'],
+	['fas', 'fa'], ['fij', 'fj'], ['fin', 'fi'], ['fra', 'fr'], ['fre', 'fr'],
+	['fry', 'fy'], ['ful', 'ff'], ['geo', 'ka'], ['ger', 'de'], ['gla', 'gd'],
+	['gle', 'ga'], ['glg', 'gl'], ['glv', 'gv'], ['gre', 'el'], ['grn', 'gn'],
+	['guj', 'gu'], ['hat', 'ht'], ['hau', 'ha'], ['heb', 'he'], ['heb', 'iw'],
+	['her', 'hz'], ['hin', 'hi'], ['hmo', 'ho'], ['hrv', 'hr'], ['hun', 'hu'],
+	['hye', 'hy'], ['ibo', 'ig'], ['ice', 'is'], ['ido', 'io'], ['iii', 'ii'],
+	['iku', 'iu'], ['ile', 'ie'], ['ina', 'ia'], ['ind', 'id'], ['ipk', 'ik'],
+	['isl', 'is'], ['ita', 'it'], ['jav', 'jv'], ['jpn', 'ja'], ['kal', 'kl'],
+	['kan', 'kn'], ['kas', 'ks'], ['kat', 'ka'], ['kau', 'kr'], ['kaz', 'kk'],
+	['khm', 'km'], ['kik', 'ki'], ['kin', 'rw'], ['kir', 'ky'], ['kom', 'kv'],
+	['kon', 'kg'], ['kor', 'ko'], ['kua', 'kj'], ['kur', 'ku'], ['lao', 'lo'],
+	['lat', 'la'], ['lav', 'lv'], ['lim', 'li'], ['lin', 'ln'], ['lit', 'lt'],
+	['ltz', 'lb'], ['lub', 'lu'], ['lug', 'lg'], ['mac', 'mk'], ['mah', 'mh'],
+	['mal', 'ml'], ['mao', 'mi'], ['mar', 'mr'], ['may', 'ms'], ['mkd', 'mk'],
+	['mlg', 'mg'], ['mlt', 'mt'], ['mon', 'mn'], ['mri', 'mi'], ['msa', 'ms'],
+	['mya', 'my'], ['nau', 'na'], ['nav', 'nv'], ['nbl', 'nr'], ['nde', 'nd'],
+	['ndo', 'ng'], ['nep', 'ne'], ['nld', 'nl'], ['nno', 'nn'], ['nob', 'nb'],
+	['nor', 'no'], ['nya', 'ny'], ['oci', 'oc'], ['oji', 'oj'], ['ori', 'or'],
+	['orm', 'om'], ['oss', 'os'], ['pan', 'pa'], ['per', 'fa'], ['pli', 'pi'],
+	['pol', 'pl'], ['por', 'pt'], ['pus', 'ps'], ['que', 'qu'], ['roh', 'rm'],
+	['ron', 'ro'], ['rum', 'ro'], ['run', 'rn'], ['rus', 'ru'], ['sag', 'sg'],
+	['san', 'sa'], ['sin', 'si'], ['slk', 'sk'], ['slo', 'sk'], ['slv', 'sl'],
+	['sme', 'se'], ['smo', 'sm'], ['sna', 'sn'], ['snd', 'sd'], ['som', 'so'],
+	['sot', 'st'], ['spa', 'es'], ['sqi', 'sq'], ['srd', 'sc'], ['srp', 'sr'],
+	['ssw', 'ss'], ['sun', 'su'], ['swa', 'sw'], ['swe', 'sv'], ['tah', 'ty'],
+	['tam', 'ta'], ['tat', 'tt'], ['tel', 'te'], ['tgk', 'tg'], ['tgl', 'tl'],
+	['tha', 'th'], ['tib', 'bo'], ['tir', 'ti'], ['ton', 'to'], ['tsn', 'tn'],
+	['tso', 'ts'], ['tuk', 'tk'], ['tur', 'tr'], ['twi', 'tw'], ['uig', 'ug'],
+	['ukr', 'uk'], ['urd', 'ur'], ['uzb', 'uz'], ['ven', 've'], ['vie', 'vi'],
+	['vol', 'vo'], ['wel', 'cy'], ['wln', 'wa'], ['wol', 'wo'], ['xho', 'xh'],
+	['yid', 'yi'], ['yor', 'yo'], ['zha', 'za'], ['zho', 'zh'], ['zul', 'zu'],
+];
+
+/**
+ * Splits a BCP-47 / RFC-5646 language tag at the first hyphen into the main
+ * language code and an optional subtag (preserving the leading `-`).
+ *
+ * @internal
+ */
+const splitLanguageTag = (tag: string): { mainLanguage: string; subtag: string } => {
+	const dash = tag.indexOf('-');
+	if (dash === -1) {
+		return { mainLanguage: tag, subtag: '' };
+	}
+	return { mainLanguage: tag.slice(0, dash), subtag: tag.slice(dash) };
+};
+
+/**
+ * Returns the BCP-47-compliant shortest form of a language code: prefers the
+ * 2-letter ISO 639-1 code when one exists. Mirrors shaka's
+ * `LanguageToShortestForm`. Subtags (e.g. `-US`) are preserved unchanged.
+ *
+ * Examples:
+ * - `'en'` → `'en'`
+ * - `'eng'` → `'en'`
+ * - `'eng-US'` → `'en-US'`
+ * - `'mis'` → `'mis'` (no 2-letter code; passed through)
+ * - `''` → `''`
+ *
+ * @group DASH
+ * @public
+ */
+export const languageToShortestForm = (language: string): string => {
+	if (language.length === 0) {
+		return language;
+	}
+
+	const { mainLanguage, subtag } = splitLanguageTag(language);
+
+	if (mainLanguage.length === 2) {
+		// Already a 2-letter code; assumed valid ISO 639-1.
+		return mainLanguage + subtag;
+	}
+
+	for (const [iso6392, iso6391] of ISO_639_2_TO_ISO_639_1) {
+		if (mainLanguage === iso6392) {
+			return iso6391 + subtag;
+		}
+	}
+
+	return mainLanguage + subtag;
+};
+
+/**
+ * Returns the ISO 639-2 (3-letter) form of a language code. Mirrors shaka's
+ * `LanguageToISO_639_2`. Returns `'und'` when no equivalent 3-letter code is
+ * known for a 2-letter input.
+ *
+ * @group DASH
+ * @public
+ */
+export const languageToISO6392 = (language: string): string => {
+	const { mainLanguage, subtag } = splitLanguageTag(language);
+
+	if (mainLanguage.length === 3) {
+		return mainLanguage + subtag;
+	}
+
+	for (const [iso6392, iso6391] of ISO_639_2_TO_ISO_639_1) {
+		if (mainLanguage === iso6391) {
+			return iso6392 + subtag;
+		}
+	}
+
+	return 'und';
+};
+
+/**
+ * Whether more than one copy of Mediabunny is loaded in this realm. Counted by the entry point; a second
+ * copy strands an extension's registered codecs on the instance the caller is not holding.
+ *
+ * @internal
+ */
+export const duplicateMediabunnyLoaded = () =>
+	((globalThis as Record<symbol, number>)[Symbol.for('mediabunny loaded')] ?? 0) > 1;
+
+/**
+ * A copy that does not alias the input. `Buffer.prototype.slice` returns a VIEW while
+ * `Uint8Array.prototype.slice` copies, so a helper that edits "its own" copy silently wrote through
+ * to the caller's bytes whenever they passed a Node Buffer — a cached `readFileSync` result came
+ * back encrypted.
+ *
+ * @internal
+ */
+export const copyOf = (bytes: Uint8Array, start = 0, end = bytes.length) =>
+	new Uint8Array(bytes.subarray(start, end));
+
+/** Seconds of media another track may buffer while an open track supplies nothing. @internal */
+export const DEFAULT_MAX_INTERLEAVE_DELTA = 10;

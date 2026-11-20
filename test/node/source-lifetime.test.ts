@@ -418,3 +418,45 @@ test('CustomSource cancels streams yielding more than requested', async () => {
 	expect(await new Reader(ref.source).requestSlice(0, 10)).not.toBeNull();
 	expect(cancel).toHaveBeenCalledOnce();
 });
+
+// Regression test for upstream #542.
+test('A source that resolves after dispose is freed, and the caller is told', async () => {
+	const { promise, resolve } = promiseWithResolvers<BufferSource>();
+	const root = new CustomPathedSource('root.m3u8', () => promise);
+
+	const input = new Input({ source: root, formats: ALL_FORMATS });
+	const inFlight = input._getSourceCached({ path: 'segment.ts', isRoot: false });
+
+	// Dispose while the request handler is still unresolved
+	input.dispose();
+
+	const resolved = new BufferSource(new Uint8Array(8));
+	resolve(resolved);
+
+	await expect(inFlight).rejects.toThrow(InputDisposedError);
+	expect(resolved._disposed).toBe(true);
+});
+
+// HLS and DASH deliberately hand out refs the reader does not free - a segment source lives until the
+// cache evicts it - so the leak warning is suppressed for sources flagged as theirs. A source derived
+// from one of those is still theirs, and was not being flagged: a `slice` is a brand new Source, so a
+// byte-range segment or an AES-128 one warned on every fetch about a leak the format allows.
+test('a slice of an HLS or DASH source is still one', () => {
+	const hls = new BufferSource(new Uint8Array(64).buffer);
+	hls._usedForHls = true;
+	expect(hls.slice(0, 16)._usedForHls).toBe(true);
+	expect(hls.slice(0, 16)._usedForDash).toBe(false);
+
+	const dash = new BufferSource(new Uint8Array(64).buffer);
+	dash._usedForDash = true;
+	expect(dash.slice(8)._usedForDash).toBe(true);
+
+	// A slice of a slice too, since that is what a ranged read of a ranged segment produces
+	expect(hls.slice(0, 32).slice(0, 8)._usedForHls).toBe(true);
+
+	// And an ordinary source is unaffected: the suppression must not spread to reads that really
+	// should warn
+	const plain = new BufferSource(new Uint8Array(64).buffer);
+	expect(plain.slice(0, 16)._usedForHls).toBe(false);
+	expect(plain.slice(0, 16)._usedForDash).toBe(false);
+});

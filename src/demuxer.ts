@@ -6,8 +6,10 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
+import { AncillaryFrame } from './ancillary';
 import { Input } from './input';
 import { InputTrackBacking } from './input-track';
+import { PsshBox, SidxBox } from './isobmff/isobmff-misc';
 import { MetadataTags } from './metadata';
 
 /**
@@ -36,6 +38,27 @@ export abstract class Demuxer {
 	abstract getTrackBackings(): Promise<InputTrackBacking[]>;
 	abstract getMimeType(): Promise<string>;
 	abstract getMetadataTags(): Promise<MetadataTags>;
+
+	async getSegmentIndex(): Promise<SidxBox[]> {
+		return [];
+	}
+
+	/**
+	 * Top-level Protection System Specific Header (`pssh`) boxes — typically present once per
+	 * encrypted file under `moov`, one per DRM system. Returns an empty array for non-isobmff
+	 * formats and for clear isobmff files.
+	 */
+	async getPsshBoxes(): Promise<PsshBox[]> {
+		return [];
+	}
+
+	/**
+	 * Ancillary data essence (SMPTE ST 436M), which an MXF broadcast master carries beside its picture and
+	 * sound. There is no track type for it, so its frames are read whole rather than through a sink.
+	 */
+	async getAncillaryFrames(): Promise<AncillaryFrame[]> {
+		return [];
+	}
 
 	dispose() {
 		// Can be overridden

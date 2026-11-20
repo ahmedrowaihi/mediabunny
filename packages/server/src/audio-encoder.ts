@@ -74,6 +74,9 @@ export class NodeAvAudioEncoder extends CustomAudioEncoder {
 			codec === 'mp3' && numberOfChannels >= 1 && numberOfChannels <= 2
 			&& MP3_SAMPLE_RATES.includes(sampleRate)
 		) || (
+			codec === 'mp2' && numberOfChannels >= 1 && numberOfChannels <= 2
+			&& MP3_SAMPLE_RATES.includes(sampleRate)
+		) || (
 			codec === 'vorbis' && numberOfChannels >= 1 && numberOfChannels <= 8
 			&& sampleRate <= 50000
 		) || (

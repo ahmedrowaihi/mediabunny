@@ -9,6 +9,8 @@
 import { Demuxer } from './demuxer';
 import { Input } from './input';
 import { IsobmffDemuxer } from './isobmff/isobmff-demuxer';
+import { MxfDemuxer } from './mxf/mxf-demuxer';
+import { findRunIn, KEY_LENGTH, RUN_IN_PROBE_LIMIT } from './mxf/mxf-klv';
 import type { PsshBox } from './isobmff/isobmff-misc';
 import {
 	EBMLId,
@@ -26,13 +28,18 @@ import { skipId3V2Tags } from './id3';
 import { readConfirmedMp3FrameHeader } from './mp3/mp3-reader';
 import { OggDemuxer } from './ogg/ogg-demuxer';
 import { WaveDemuxer } from './wave/wave-demuxer';
+import { AiffDemuxer } from './aiff/aiff-demuxer';
+import { Y4M_SIGNATURE, Y4mDemuxer } from './y4m/y4m-demuxer';
 import { readConfirmedAdtsFrameHeader } from './adts/adts-reader';
 import { AdtsDemuxer } from './adts/adts-demuxer';
 import { readAscii, readBytes, readU32Be, readU64Be } from './reader';
 import { FlacDemuxer } from './flac/flac-demuxer';
 import { MpegTsDemuxer } from './mpeg-ts/mpeg-ts-demuxer';
 import { TS_PACKET_SIZE } from './mpeg-ts/mpeg-ts-misc';
+import { DashDemuxer } from './dash/dash-demuxer';
+import { DASH_MIME_TYPE, looksLikeMpd } from './dash/dash-misc';
 import { HlsDemuxer } from './hls/hls-demuxer';
+import { ImfDemuxer } from './imf/imf-demuxer';
 import { HLS_MIME_TYPE } from './hls/hls-misc';
 import { PathedSource } from './source';
 import { isThenable, MaybePromise } from './misc';
@@ -428,6 +435,85 @@ export class WaveInputFormat extends InputFormat {
 }
 
 /**
+ * AIFF file format, including AIFF-C.
+ *
+ * Do not instantiate this class; use the {@link AIFF} singleton instead.
+ *
+ * @group Input formats
+ * @public
+ */
+export class AiffInputFormat extends InputFormat {
+	/** @internal */
+	async _getMatchPosition(input: Input) {
+		let slice = input._reader.requestSlice(0, 12);
+		if (isThenable(slice)) slice = await slice;
+		if (!slice) return null;
+
+		if (readAscii(slice, 4) !== 'FORM') {
+			return null;
+		}
+
+		slice.skip(4);
+
+		const formType = readAscii(slice, 4);
+		return formType === 'AIFF' || formType === 'AIFC' ? 0 : null;
+	}
+
+	/** @internal */
+	_createDemuxer(input: Input) {
+		return new AiffDemuxer(input);
+	}
+
+	get name() {
+		return 'AIFF';
+	}
+
+	get mimeType() {
+		return 'audio/aiff';
+	}
+
+	get supportsTimestampedMediaData() {
+		return false;
+	}
+}
+
+/**
+ * YUV4MPEG2 (Y4M) file format.
+ *
+ * Do not instantiate this class; use the {@link Y4M} singleton instead.
+ *
+ * @group Input formats
+ * @public
+ */
+export class Y4mInputFormat extends InputFormat {
+	/** @internal */
+	async _getMatchPosition(input: Input) {
+		let slice = input._reader.requestSlice(0, Y4M_SIGNATURE.length);
+		if (isThenable(slice)) slice = await slice;
+		if (!slice) return null;
+
+		return readAscii(slice, Y4M_SIGNATURE.length) === Y4M_SIGNATURE ? 0 : null;
+	}
+
+	/** @internal */
+	_createDemuxer(input: Input) {
+		return new Y4mDemuxer(input);
+	}
+
+	get name() {
+		return 'Y4M';
+	}
+
+	get mimeType() {
+		return 'video/x-yuv4mpeg';
+	}
+
+	get supportsTimestampedMediaData() {
+		return false;
+	}
+}
+
+/**
  * Ogg file format.
  *
  * Do not instantiate this class; use the {@link OGG} singleton instead.
@@ -642,6 +728,126 @@ export class HlsInputFormat extends InputFormat {
 }
 
 /**
+ * DASH MPD input format. Used for reading Dynamic Adaptive Streaming over
+ * HTTP manifests (`.mpd`).
+ * @group Input formats
+ * @public
+ */
+export class DashInputFormat extends InputFormat {
+	/** @internal */
+	async _getMatchPosition(input: Input) {
+		let slice = input._reader.requestSlice(0, 16);
+		if (slice instanceof Promise) slice = await slice;
+		if (!slice) return null;
+
+		const fileSize = input._reader.fileSizeNonStrict;
+		const probeEnd = fileSize !== null ? Math.min(2048, fileSize) : 2048;
+		if (slice.end < probeEnd) {
+			let bigger = input._reader.requestSlice(0, probeEnd);
+			if (bigger instanceof Promise) bigger = await bigger;
+			if (bigger) slice = bigger;
+		}
+
+		const head = slice.bytes.subarray(slice.start, slice.end);
+		if (!looksLikeMpd(head)) {
+			return null;
+		}
+
+		if (!(input._rootSource instanceof PathedSource)) {
+			throw new TypeError('DASH inputs require `InputOptions.source` to be a PathedSource or a ref to one.');
+		}
+
+		input._rootSource._usedForDash = true;
+
+		return 0;
+	}
+
+	/** @internal */
+	_createDemuxer(input: Input) {
+		return new DashDemuxer(input);
+	}
+
+	get name() {
+		return 'Dynamic Adaptive Streaming over HTTP (DASH)';
+	}
+
+	get mimeType() {
+		return DASH_MIME_TYPE;
+	}
+
+	get supportsTimestampedMediaData() {
+		return true;
+	}
+}
+
+/**
+ * Format representing Material Exchange Format files (.mxf), the SMPTE 377M container used across
+ * broadcast and post production.
+ *
+ * Tracks whose essence coding this library has no codec name for - DV, JPEG 2000, VC-3 among them -
+ * are still read, with their SMPTE label as the internal codec id and no decoder config.
+ *
+ * @group Input formats
+ * @public
+ */
+export class MxfInputFormat extends InputFormat {
+	/** @internal */
+	async _getMatchPosition(input: Input) {
+		// A file begins with a header partition pack, whose key is the only thing that identifies MXF:
+		// there is no magic string, and the SMPTE prefix alone is shared with every other KLV format.
+		const atZero = await this.headerPartitionWithin(input, KEY_LENGTH, 0);
+		if (atZero !== null) {
+			return atZero;
+		}
+
+		// SMPTE 377-1 allows up to 64 KB of run-in before the pack, which some systems write. The
+		// pack is searched for - but only within a few kilobytes, and only when the size is known.
+		// EVERY input of EVERY format runs this probe: asking for 64 KB here turned a 16-octet read
+		// into a 64-kilobyte one for every file opened, and on a source whose size is unknown - a
+		// live stream - it waits for bytes that may not arrive for a long time.
+		const fileSize = input._reader.fileSize;
+		if (fileSize === null || fileSize <= KEY_LENGTH) {
+			return null;
+		}
+
+		return this.headerPartitionWithin(
+			input,
+			Math.min(RUN_IN_PROBE_LIMIT + KEY_LENGTH, fileSize),
+			RUN_IN_PROBE_LIMIT,
+		);
+	}
+
+	/**
+	 * Where a header partition pack begins in the first `length` octets, searching `within` octets of
+	 * run-in, or null where there is none.
+	 */
+	private async headerPartitionWithin(input: Input, length: number, within: number) {
+		let slice = input._reader.requestSlice(0, length);
+		if (isThenable(slice)) slice = await slice;
+		if (!slice) return null;
+
+		return findRunIn(readBytes(slice, length), within);
+	}
+
+	/** @internal */
+	_createDemuxer(input: Input) {
+		return new MxfDemuxer(input);
+	}
+
+	get name() {
+		return 'MXF';
+	}
+
+	get mimeType() {
+		return 'application/mxf';
+	}
+
+	get supportsTimestampedMediaData() {
+		return false;
+	}
+}
+
+/**
  * MP4 input format singleton.
  * @group Input formats
  * @public
@@ -684,6 +890,18 @@ export const WAVE = /* #__PURE__ */ new WaveInputFormat();
  */
 export const OGG = /* #__PURE__ */ new OggInputFormat();
 /**
+ * AIFF input format singleton.
+ * @group Input formats
+ * @public
+ */
+export const AIFF = /* #__PURE__ */ new AiffInputFormat();
+/**
+ * Y4M input format singleton.
+ * @group Input formats
+ * @public
+ */
+export const Y4M = /* #__PURE__ */ new Y4mInputFormat();
+/**
  * ADTS input format singleton.
  * @group Input formats
  * @public
@@ -703,6 +921,12 @@ export const FLAC = /* #__PURE__ */ new FlacInputFormat();
  * @public
  */
 export const MPEG_TS = /* #__PURE__ */ new MpegTsInputFormat();
+/**
+ * MXF input format singleton.
+ * @group Input formats
+ * @public
+ */
+export const MXF = /* #__PURE__ */ new MxfInputFormat();
 
 /**
  * HLS input format singleton.
@@ -712,12 +936,93 @@ export const MPEG_TS = /* #__PURE__ */ new MpegTsInputFormat();
 export const HLS = /* #__PURE__ */ new HlsInputFormat();
 
 /**
+ * DASH MPD input format singleton.
+ * @group Input formats
+ * @public
+ */
+export const DASH = /* #__PURE__ */ new DashInputFormat();
+
+/**
  * List of all input format singletons. If you don't need to support all input formats, you should specify the
  * formats individually for better tree shaking.
  * @group Input formats
  * @public
  */
-export const ALL_FORMATS: InputFormat[] = [HLS, MP4, QTFF, MATROSKA, WEBM, WAVE, OGG, FLAC, MP3, ADTS, MPEG_TS];
+/**
+ * Format representing an IMF composition playlist, the timeline of an Interoperable Master Package
+ * (SMPTE ST 2067). The file this points at is the CPL; the MXF track files it cuts from and the
+ * ASSETMAP that locates them are read from beside it, so the source must be a
+ * {@link PathedSource}.
+ *
+ * @group Input formats
+ * @public
+ */
+export class ImfInputFormat extends InputFormat {
+	/** @internal */
+	async _getMatchPosition(input: Input) {
+		let slice = input._reader.requestSlice(0, 16);
+		if (isThenable(slice)) slice = await slice;
+		if (!slice) return null;
+
+		const fileSize = input._reader.fileSizeNonStrict;
+		const probeEnd = fileSize !== null ? Math.min(4096, fileSize) : 4096;
+		if (slice.end < probeEnd) {
+			let bigger = input._reader.requestSlice(0, probeEnd);
+			if (isThenable(bigger)) bigger = await bigger;
+			if (bigger) slice = bigger;
+		}
+
+		// There is no magic number; a CPL is XML whose root element says what it is. The element may
+		// carry any namespace prefix, so the local name is what is matched.
+		const head = new TextDecoder('utf-8').decode(slice.bytes.subarray(slice.start, slice.end));
+		if (!/<\s*(?:[\w.-]+:)?CompositionPlaylist[\s>]/.test(head)) {
+			return null;
+		}
+
+		if (!(input._rootSource instanceof PathedSource)) {
+			throw new TypeError(
+				'IMF inputs require `InputOptions.source` to be a PathedSource or a ref to one: the CPL'
+				+ ' names its track files by UUID, and they are read from beside it.',
+			);
+		}
+
+		return 0;
+	}
+
+	/** @internal */
+	_createDemuxer(input: Input) {
+		return new ImfDemuxer(input);
+	}
+
+	get name() {
+		return 'Interoperable Master Format (IMF)';
+	}
+
+	get mimeType() {
+		return 'application/xml';
+	}
+
+	get supportsTimestampedMediaData() {
+		return false;
+	}
+}
+
+/**
+ * IMF composition playlist singleton.
+ * @group Input formats
+ * @public
+ */
+export const IMF = /* #__PURE__ */ new ImfInputFormat();
+
+/**
+ * List of all input format singletons. If you don't need to support all input formats, you should specify the
+ * formats individually for better tree shaking.
+ * @group Input formats
+ * @public
+ */
+export const ALL_FORMATS: InputFormat[] = [
+	HLS, DASH, IMF, MP4, QTFF, MATROSKA, WEBM, WAVE, AIFF, Y4M, OGG, FLAC, MP3, ADTS, MPEG_TS, MXF,
+];
 
 /**
  * List of input formats required for playback of typical HLS manifests. Includes HLS itself as well as the typical
@@ -726,6 +1031,14 @@ export const ALL_FORMATS: InputFormat[] = [HLS, MP4, QTFF, MATROSKA, WEBM, WAVE,
  * @public
  */
 export const HLS_FORMATS: InputFormat[] = [HLS, MP4, QTFF, MP3, ADTS, MPEG_TS];
+
+/**
+ * List of input formats required for playback of typical DASH manifests. Includes DASH itself plus the segment
+ * containers DASH commonly carries: MP4 (CMAF), QuickTime (legacy), Matroska/WebM.
+ * @group Input formats
+ * @public
+ */
+export const DASH_FORMATS: InputFormat[] = [DASH, MP4, QTFF, MATROSKA, WEBM];
 
 /**
  * Additional per-format configuration.
@@ -737,6 +1050,21 @@ export type InputFormatOptions = {
 	isobmff?: IsobmffInputFormatOptions;
 	/** HLS-specific configuration. */
 	hls?: HlsInputFormatOptions;
+	/** DASH-specific configuration. */
+	dash?: DashInputFormatOptions;
+};
+
+/**
+ * Additional DASH input configuration.
+ * @group Input formats
+ * @public
+ */
+export type DashInputFormatOptions = {
+	/**
+	 * The `DOMParser` implementation used to read the MPD. Defaults to the global one; server runtimes, which have
+	 * none, use a built-in XML parser.
+	 */
+	domParser?: typeof DOMParser;
 };
 
 /**
@@ -795,6 +1123,14 @@ export const validateInputFormatOptions = (options: InputFormatOptions, prefix: 
 		}
 		if (options.isobmff.resolveKeyId !== undefined && typeof options.isobmff.resolveKeyId !== 'function') {
 			throw new TypeError(`${prefix}.isobmff.resolveKeyId, when provided, must be a function.`);
+		}
+	}
+	if (options.dash !== undefined) {
+		if (!options.dash || typeof options.dash !== 'object') {
+			throw new TypeError(`${prefix}.dash, when provided, must be an object.`);
+		}
+		if (options.dash.domParser !== undefined && typeof options.dash.domParser !== 'function') {
+			throw new TypeError(`${prefix}.dash.domParser, when provided, must be a DOMParser constructor.`);
 		}
 	}
 	if (options.hls !== undefined) {

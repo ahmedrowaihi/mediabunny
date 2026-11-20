@@ -6,6 +6,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
+import { MalformedInputError, UnsupportedMediaError } from '../errors';
 import { AES_128_BLOCK_SIZE, createAes128CbcDecryptStream } from '../aes';
 import { ENCRYPTION_KEY_CACHE_GROUP, Input } from '../input';
 import {
@@ -28,6 +29,7 @@ import {
 	isThenable,
 	textDecoder,
 	toArray,
+	hexStringToBytes,
 } from '../misc';
 import { readAllLines, readBytes, Reader } from '../reader';
 import { CustomPathedSource, PathedSource, ReadableStreamSource, SourceRef, SourceRequest } from '../source';
@@ -37,6 +39,7 @@ import {
 	canIgnoreLine,
 	HlsPlaylistVariables,
 	TAG_BYTERANGE,
+	TAG_DATERANGE,
 	TAG_DEFINE,
 	TAG_DISCONTINUITY,
 	TAG_DISCONTINUITY_SEQUENCE,
@@ -53,6 +56,8 @@ import {
 } from './hls-misc';
 import { HlsInputFormat, type InputFormatOptions } from '../input-format';
 import { parsePsshBoxContents, psshBoxesAreEqual, type PsshBox } from '../isobmff/isobmff-misc';
+import { parseIsoDateTimeAsUtc } from '../iso-date';
+import { SCTE35_BINARY_SCHEME } from '../mpeg-ts/scte35';
 import {
 	createTimestampWrapInfo,
 	normalizeWrappedTimestamp,
@@ -92,6 +97,13 @@ export type HlsSegmentLocation = {
 // Way more than any real duration, but small enough to keep all timestamp (and derived sequence number) math finite
 const MAX_DURATION = 1e9; // In seconds
 
+/**
+ * The three `#EXT-X-DATERANGE` attributes that carry a `splice_info_section` as a hexadecimal-sequence
+ * (RFC 8216bis 4.4.5.1). A playlist signals a splice this way where the stream itself carries no cue
+ * stream, which is how this library's own HLS output signals one.
+ */
+const SCTE35_DATERANGE_ATTRIBUTES = ['SCTE35-CMD', 'SCTE35-OUT', 'SCTE35-IN'];
+
 export class HlsSegmentedInput extends SegmentedInput {
 	rootPath: string;
 	demuxer: HlsDemuxer;
@@ -103,6 +115,7 @@ export class HlsSegmentedInput extends SegmentedInput {
 	lastSegmentUpdateTime = -Infinity;
 	refreshInterval = 5; // Reasonable default in case the playlist doesn't specify it
 	segmentTimestampOffsetPromise: Promise<number> | null = null;
+	implicitInitSegments = new WeakSet<HlsSegment>();
 
 	constructor(
 		demuxer: HlsDemuxer,
@@ -132,6 +145,9 @@ export class HlsSegmentedInput extends SegmentedInput {
 			}
 		})();
 	}
+
+	/** Date ranges parsed before the playlist had a segment to date them against. */
+	pendingDateRangeEvents: { timestamp: number; data: Uint8Array }[] = [];
 
 	getRemainingWaitTimeMs() {
 		const elapsed = performance.now() - this.lastSegmentUpdateTime;
@@ -166,7 +182,7 @@ export class HlsSegmentedInput extends SegmentedInput {
 			if (headerSlice) {
 				const header = textDecoder.decode(readBytes(headerSlice, headerSlice.length));
 				if (!header.trimStart().startsWith('#EXTM3U')) {
-					throw new Error('Invalid M3U8 file; expected first line to be #EXTM3U.');
+					throw new MalformedInputError('Invalid M3U8 file; expected first line to be #EXTM3U.');
 				}
 			}
 
@@ -200,6 +216,8 @@ export class HlsSegmentedInput extends SegmentedInput {
 		let lastByteRangeEnd: number | null = null;
 		let nextByteRange: { offset: number; length: number } | null = null;
 		let lastProgramDateTimeSeconds: number | null = null;
+		let iFramesOnly = false;
+		const dateRangeEvents: { timestamp: number; data: Uint8Array }[] = [];
 
 		// Used for repeated parses where our job it is to only add the new segments
 		let prevLastSegment = last(this.segments) ?? null;
@@ -209,14 +227,14 @@ export class HlsSegmentedInput extends SegmentedInput {
 
 			const length = Number(atIndex === -1 ? content : content.slice(0, atIndex));
 			if (!Number.isInteger(length) || length < 0) {
-				throw new Error(`Invalid #EXT-X-BYTERANGE length '${content}'.`);
+				throw new MalformedInputError(`Invalid #EXT-X-BYTERANGE length '${content}'.`);
 			}
 
 			let offset: number | null = null;
 			if (atIndex !== -1) {
 				offset = Number(content.slice(atIndex + 1));
 				if (!Number.isInteger(offset) || offset < 0) {
-					throw new Error(`Invalid #EXT-X-BYTERANGE offset '${content}'.`);
+					throw new MalformedInputError(`Invalid #EXT-X-BYTERANGE offset '${content}'.`);
 				}
 			}
 
@@ -251,7 +269,7 @@ export class HlsSegmentedInput extends SegmentedInput {
 
 			if (!headerRead) {
 				if (line !== '#EXTM3U') {
-					throw new Error('Invalid M3U8 file; expected first line to be #EXTM3U.');
+					throw new MalformedInputError('Invalid M3U8 file; expected first line to be #EXTM3U.');
 				}
 
 				headerRead = true;
@@ -261,7 +279,9 @@ export class HlsSegmentedInput extends SegmentedInput {
 			if (!line.startsWith('#')) {
 				if (!prevLastSegment) {
 					if (nextSegmentDuration === null) {
-						throw new Error('Invalid M3U8 file; a segment must be preceded by an #EXTINF tag.');
+						throw new MalformedInputError(
+							'Invalid M3U8 file; a segment must be preceded by an #EXTINF tag.',
+						);
 					}
 
 					let key = currentKey;
@@ -288,6 +308,31 @@ export class HlsSegmentedInput extends SegmentedInput {
 					if (currentFirstSegment && currentFirstSegment.discontinuityNumber !== nextDiscontinuityNumber) {
 						// A discontinuity happened in segments that dropped out before we ever saw them
 						currentFirstSegment = null;
+					}
+
+					if (
+						iFramesOnly
+						&& currentFirstSegment === null
+						&& currentInitSegment === null
+						&& location.offset > 0
+						&& !(currentKey?.method === 'AES-128' && !currentKey.iv)
+					) {
+						// RFC 8216 §4.3.2.5: without #EXT-X-MAP, the bytes before the first I-frame are its init
+						const initSegment: HlsSegment = {
+							index: -1,
+							timestamp: accumulatedTime,
+							unixEpochTimestamp: accumulatedUnixTime,
+							discontinuityNumber: nextDiscontinuityNumber,
+							firstSegment: null,
+							sequenceNumber: null,
+							location: { path: fullPath, offset: 0, length: location.offset },
+							duration: 0,
+							encryption: currentKey,
+							initSegment: null,
+							lastProgramDateTimeSeconds,
+						};
+						this.implicitInitSegments.add(initSegment);
+						currentInitSegment = initSegment;
 					}
 
 					const segment: HlsSegment = {
@@ -336,7 +381,7 @@ export class HlsSegmentedInput extends SegmentedInput {
 				const durationStr = commaIndex === -1 ? extinfContent : extinfContent.slice(0, commaIndex);
 				const duration = Number(durationStr);
 				if (!Number.isFinite(duration) || duration < 0 || duration > MAX_DURATION) {
-					throw new Error(`Invalid #EXTINF tag duration '${durationStr}'.`);
+					throw new MalformedInputError(`Invalid #EXTINF tag duration '${durationStr}'.`);
 				}
 
 				nextSegmentDuration = duration;
@@ -346,7 +391,7 @@ export class HlsSegmentedInput extends SegmentedInput {
 				const attributes = new AttributeList(line.slice(TAG_MAP.length), variables);
 				const uri = attributes.get('uri');
 				if (!uri) {
-					throw new Error('Invalid #EXT-X-MAP tag; missing URI attribute.');
+					throw new MalformedInputError('Invalid #EXT-X-MAP tag; missing URI attribute.');
 				}
 
 				const byteRange = attributes.get('byterange');
@@ -356,7 +401,9 @@ export class HlsSegmentedInput extends SegmentedInput {
 				}
 
 				if (parsedByteRange && parsedByteRange.offset === null) {
-					throw new Error('Invalid #EXT-X-MAP tag; BYTERANGE attribute must have a specified offset.');
+					throw new MalformedInputError(
+						'Invalid #EXT-X-MAP tag; BYTERANGE attribute must have a specified offset.',
+					);
 				}
 
 				if (!prevLastSegment) {
@@ -369,7 +416,9 @@ export class HlsSegmentedInput extends SegmentedInput {
 
 					if (currentKey?.method === 'AES-128' && !currentKey.iv) {
 						// Required by the spec
-						throw new Error('IV attribute must be set on #EXT-X-KEY tag preceding the #EXT-X-MAP tag.');
+						throw new MalformedInputError(
+							'IV attribute must be set on #EXT-X-KEY tag preceding the #EXT-X-MAP tag.',
+						);
 					}
 
 					const segment: HlsSegment = {
@@ -400,14 +449,14 @@ export class HlsSegmentedInput extends SegmentedInput {
 				} else if (method === 'AES-128') {
 					const uri = attributes.get('uri');
 					if (!uri) {
-						throw new Error('Invalid #EXT-X-KEY: AES-128 requires a URI attribute.');
+						throw new MalformedInputError('Invalid #EXT-X-KEY: AES-128 requires a URI attribute.');
 					}
 
 					let iv: Uint8Array | null = null;
 					const ivString = attributes.get('iv');
 					if (ivString) {
 						if (!IV_STRING_REGEX.test(ivString)) {
-							throw new Error(`Unsupported IV format '${ivString}'.`);
+							throw new UnsupportedMediaError(`Unsupported IV format '${ivString}'.`);
 						}
 
 						let hex = ivString.slice(2);
@@ -423,7 +472,7 @@ export class HlsSegmentedInput extends SegmentedInput {
 
 					const keyFormat = attributes.get('keyformat') ?? 'identity';
 					if (keyFormat !== 'identity') {
-						throw new Error(
+						throw new MalformedInputError(
 							'For AES-128 encryption, only the \'identity\' KEYFORMAT is currently supported. If you'
 							+ ' think other formats should be supported, please raise an issue.',
 						);
@@ -438,12 +487,12 @@ export class HlsSegmentedInput extends SegmentedInput {
 				} else if (method === 'SAMPLE-AES' || method === 'SAMPLE-AES-CTR') {
 					const uri = attributes.get('uri');
 					if (!uri) {
-						throw new Error(`Invalid #EXT-X-KEY: ${method} requires a URI attribute.`);
+						throw new MalformedInputError(`Invalid #EXT-X-KEY: ${method} requires a URI attribute.`);
 					}
 
 					const keyFormat = attributes.get('keyformat') ?? 'identity';
 					if (keyFormat === 'identity') {
-						throw new Error(
+						throw new MalformedInputError(
 							'For SAMPLE-AES and SAMPLE-AES-CTR encryption, the \'identity\' KEYFORMAT is not'
 							+ ' supported. If you think this format should be supported, please raise an issue.',
 						);
@@ -462,7 +511,10 @@ export class HlsSegmentedInput extends SegmentedInput {
 							&& bytes[7] === 0x68
 						) {
 							const size = toDataView(bytes).getUint32(0);
-							psshBox = parsePsshBoxContents(bytes.subarray(8, Math.min(size, bytes.length)));
+							psshBox = {
+								...parsePsshBoxContents(bytes.subarray(8, Math.min(size, bytes.length))),
+								bytes,
+							};
 						}
 					}
 
@@ -471,7 +523,7 @@ export class HlsSegmentedInput extends SegmentedInput {
 						psshBox,
 					};
 				} else {
-					throw new Error(
+					throw new UnsupportedMediaError(
 						`Unsupported encryption method '${method}'. If you think this method should be supported,`
 						+ ` please raise an issue.`,
 					);
@@ -481,7 +533,7 @@ export class HlsSegmentedInput extends SegmentedInput {
 				const number = Number(value);
 
 				if (!Number.isSafeInteger(number) || number < 0) {
-					throw new Error(`Invalid EXT-X-MEDIA-SEQUENCE value '${value}'.`);
+					throw new MalformedInputError(`Invalid EXT-X-MEDIA-SEQUENCE value '${value}'.`);
 				}
 
 				setNextSequenceNumber(number);
@@ -489,7 +541,7 @@ export class HlsSegmentedInput extends SegmentedInput {
 				const parsed = parseByteRange(line.slice(TAG_BYTERANGE.length));
 				if (parsed.offset === null) {
 					if (lastByteRangeEnd === null) {
-						throw new Error(
+						throw new MalformedInputError(
 							'Invalid M3U8 file; #EXT-X-BYTERANGE without offset requires a previous byte range.',
 						);
 					}
@@ -506,7 +558,7 @@ export class HlsSegmentedInput extends SegmentedInput {
 				}
 
 				const dateTime = line.slice(TAG_PROGRAM_DATE_TIME.length);
-				const dateTimeMs = Date.parse(dateTime);
+				const dateTimeMs = parseIsoDateTimeAsUtc(dateTime);
 
 				if (!Number.isFinite(dateTimeMs)) {
 					continue;
@@ -538,13 +590,47 @@ export class HlsSegmentedInput extends SegmentedInput {
 				if (offsetTimestampsByDateTime) {
 					accumulatedTime = dateTimeSeconds; // Snap the accumulated time into Unix space
 				}
+			} else if (line.startsWith(TAG_DATERANGE)) {
+				const attributes = new AttributeList(line.slice(TAG_DATERANGE.length), variables);
+				const id = attributes.get('ID');
+				if (id === null) {
+					continue; // A range with no ID cannot be told from the next copy of itself
+				}
+
+				// A date range is written where it applies, so the position the tag was reached at places
+				// it; START-DATE places it more precisely where the playlist dates its segments at all.
+				let timestamp = accumulatedTime;
+				const startDateMs = parseIsoDateTimeAsUtc(attributes.get('START-DATE') ?? '');
+				if (Number.isFinite(startDateMs) && accumulatedUnixTime !== null) {
+					timestamp = accumulatedTime + (startDateMs / 1000 - accumulatedUnixTime);
+				}
+
+				for (const name of SCTE35_DATERANGE_ATTRIBUTES) {
+					const hex = attributes.get(name);
+					if (hex === null) {
+						continue;
+					}
+
+					let section: Uint8Array;
+					try {
+						section = hexStringToBytes(hex.replace(/^0[xX]/, ''));
+					} catch {
+						continue; // Not a hexadecimal-sequence, whatever the attribute is named
+					}
+
+					dateRangeEvents.push({ timestamp, data: section });
+				}
 			} else if (line === TAG_DISCONTINUITY) {
 				currentFirstSegment = null;
 				// Counted even for known segments since the discontinuity number is absolute, derived from the
 				// playlist's discontinuity sequence
 				nextDiscontinuityNumber++;
-				// Note: the init segment is not reset; the #EXT-X-MAP statement simply lasts until the next
-				// #EXT-X-MAP statement.
+				if (currentInitSegment && this.implicitInitSegments.has(currentInitSegment)) {
+					currentInitSegment = null;
+				}
+			} else if (line === TAG_I_FRAMES_ONLY) {
+				iFramesOnly = true;
+				this.hasOnlyKeyPackets = true;
 			} else if (line.startsWith(TAG_DISCONTINUITY_SEQUENCE)) {
 				const value = line.slice(TAG_DISCONTINUITY_SEQUENCE.length);
 				const number = Number(value);
@@ -559,12 +645,10 @@ export class HlsSegmentedInput extends SegmentedInput {
 				const duration = Number(value);
 
 				if (!Number.isFinite(duration) || duration < 0 || duration > MAX_DURATION) {
-					throw new Error(`Invalid EXT-X-TARGETDURATION value '${value}'.`);
+					throw new MalformedInputError(`Invalid EXT-X-TARGETDURATION value '${value}'.`);
 				}
 
 				this.refreshInterval = clamp(duration, 0.5, 3600); // Clamped for safety
-			} else if (line === TAG_I_FRAMES_ONLY) {
-				this.hasOnlyKeyPackets = true;
 			} else if (line === TAG_ENDLIST) {
 				this.streamHasEnded = true;
 				break; // No need to keep reading after this
@@ -584,16 +668,52 @@ export class HlsSegmentedInput extends SegmentedInput {
 		}
 
 		if (!headerRead) {
-			throw new Error('Invalid M3U8 file; no #EXTM3U header.');
+			throw new MalformedInputError('Invalid M3U8 file; no #EXTM3U header.');
+		}
+
+		this.pendingDateRangeEvents.push(...dateRangeEvents);
+
+		// Only once there are segments. Dating these needs the first segment's offset, and asking for
+		// that while the playlist holds none re-enters this very update and waits on itself.
+		if (this.pendingDateRangeEvents.length > 0 && this.segments.length > 0) {
+			const pending = this.pendingDateRangeEvents;
+			this.pendingDateRangeEvents = [];
+			const offset = await this.getFirstSegmentTimestampOffset();
+
+			for (const event of pending) {
+				this.announceInbandEvent({
+					timestamp: event.timestamp + offset,
+					scheme: SCTE35_BINARY_SCHEME,
+					data: event.data,
+				});
+			}
 		}
 	}
 
-	async getFirstSegment() {
-		if (this.segments.length === 0 && !this.streamHasEnded) {
-			await this.runUpdateSegments();
-		}
+	async getFirstSegment(options: SegmentRetrievalOptions = {}) {
+		// Waits for the first segment the same way reading past the live edge waits for the next one.
+		// A single reload was not enough: a channel that has published its playlist but not yet its
+		// first segment answered null, which a consumer cannot tell apart from "this playlist has no
+		// video" - and the right answer, for a stream that has not ended, is "not yet".
+		let isLazy = !!options.skipLiveWait && this.getRemainingWaitTimeMs() > 0;
 
-		return this.segments[0] ?? null;
+		while (true) {
+			if (this.segments.length > 0) {
+				return this.segments[0]!;
+			}
+
+			// A playlist with an ENDLIST and no segments really does have nothing, so this is where the
+			// loop has to stop rather than wait for an edge that will never move
+			if (this.streamHasEnded || isLazy) {
+				return this.segments[0] ?? null;
+			}
+
+			await this.runUpdateSegments();
+
+			if (options.skipLiveWait) {
+				isLazy = true;
+			}
+		}
 	}
 
 	async getSegmentAt(timestamp: number, options: SegmentRetrievalOptions) {
@@ -768,7 +888,9 @@ export class HlsSegmentedInput extends SegmentedInput {
 							const keyReader = new Reader(keyRef.source);
 							const keySlice = await keyReader.requestSlice(0, AES_128_BLOCK_SIZE);
 							if (!keySlice) {
-								throw new Error('Invalid AES-128 key; expected at least 16 bytes of data.');
+								throw new MalformedInputError(
+									'Invalid AES-128 key; expected at least 16 bytes of data.',
+								);
 							}
 							const key = readBytes(keySlice, AES_128_BLOCK_SIZE);
 
@@ -777,7 +899,11 @@ export class HlsSegmentedInput extends SegmentedInput {
 							ciphertextRef.free();
 						});
 
-						ref = new ReadableStreamSource(stream).ref();
+						// Decrypting produces a new source, and it is as much part of this HLS read as the
+						// ciphertext it came from
+						const plaintext = new ReadableStreamSource(stream);
+						plaintext._usedForHls = true;
+						ref = plaintext.ref();
 					} else {
 						assert(false);
 					}
@@ -800,12 +926,14 @@ export class HlsSegmentedInput extends SegmentedInput {
 				// eslint-disable-next-line @stylistic/max-len
 				// (see https://developer.apple.com/library/archive/documentation/AudioVideo/Conceptual/HLS_Sample_Encryption/Encryption/Encryption.html)
 				// but we don't support them there yet, so instead of silently decrypting nothing, we throw an error.
-				throw new Error(
+				throw new MalformedInputError(
 					'The SAMPLE-AES and SAMPLE-AES-CTR encryption methods are currently only supported for'
 					+ ' ISOBMFF files.',
 				);
 			}
 		};
+
+		this.forwardInbandEvents(hlsSegment, input);
 
 		this.inputCache.push({
 			segment: hlsSegment,

@@ -792,3 +792,68 @@ test('Opus start before the pre-skip with the header already written', async () 
 		'Packets had to be discarded because their timestamp is too negative to represent in Ogg.',
 	);
 });
+
+test('Ogg keeps writing one track when another open track stops supplying packets', async () => {
+	const SAMPLE_RATE = 48000;
+	const SAMPLES_PER_FRAME = 960; // 20 ms at 48 kHz
+	const packetDuration = SAMPLES_PER_FRAME / SAMPLE_RATE;
+	const QUIET_TRACK_STOPS_AT = 6;
+	const TIMELINE_RUNS_TO = 25;
+
+	const opusHead = new Uint8Array(19);
+	const opusHeadView = new DataView(opusHead.buffer);
+	opusHead.set([0x4f, 0x70, 0x75, 0x73, 0x48, 0x65, 0x61, 0x64], 0); // 'OpusHead'
+	opusHead[8] = 1; // Version
+	opusHead[9] = 1; // Channel count
+	opusHeadView.setUint32(12, SAMPLE_RATE, true);
+
+	const decoderConfig: AudioDecoderConfig = {
+		codec: 'opus',
+		numberOfChannels: 1,
+		sampleRate: SAMPLE_RATE,
+		description: opusHead,
+	};
+	const opusPacket = new Uint8Array([(31 << 3) | 0b00, 0]); // TOC: config 31 (CELT fullband, 20 ms), code 0
+
+	const run = async (maxInterleaveDelta: number) => {
+		let written = 0;
+		const output = new Output({
+			format: new OggOutputFormat({
+				maxInterleaveDelta,
+				onPage: (data) => {
+					written += data.byteLength;
+				},
+			}),
+			target: new NullTarget(),
+		});
+
+		const running = new EncodedAudioPacketSource('opus');
+		const quiet = new EncodedAudioPacketSource('opus');
+		output.addAudioTrack(running);
+		output.addAudioTrack(quiet);
+		await output.start();
+
+		for (let i = 0; i * packetDuration < TIMELINE_RUNS_TO; i++) {
+			const timestamp = i * packetDuration;
+			const packet = new EncodedPacket(opusPacket, 'key', timestamp, packetDuration);
+			await running.add(packet, { decoderConfig });
+
+			// The second track simply stops; its source is never closed.
+			if (timestamp < QUIET_TRACK_STOPS_AT) {
+				await quiet.add(packet, { decoderConfig });
+			}
+		}
+
+		const beforeFinalize = written;
+		await output.finalize();
+		return { beforeFinalize, total: written };
+	};
+
+	const bounded = await run(10);
+	const unbounded = await run(Infinity);
+
+	expect(bounded.total).toBeGreaterThan(0);
+	// Same media either way, so only the moment of writing differs.
+	expect(bounded.total).toBeCloseTo(unbounded.total, -3);
+	expect(bounded.beforeFinalize).toBeGreaterThan(2 * unbounded.beforeFinalize);
+});

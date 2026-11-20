@@ -34,6 +34,18 @@ export type EncodedPacketSideData = {
 	 * `alpha` field contains no bytes.
 	 */
 	alphaByteLength?: number;
+	/**
+	 * Where this packet's own {@link EncodedPacket.timestamp} sits on the timeline its **payload** is
+	 * stated against, in seconds, for a payload that carries times of its own.
+	 *
+	 * Only present where the two differ. A self-timed payload - an IMSC document, which states each
+	 * cue's time inside itself - is normally read whole and placed by its packet's timestamp. A
+	 * composition that cuts such a payload breaks that: the packet is placed where the **cut** begins
+	 * while the times inside it still belong to the **source**, and a reader parsing the payload has
+	 * nothing to relate the two by. This states it: add a time read out of the payload to
+	 * `timestamp - sourceTimestamp` to put it on the same timeline as the packet.
+	 */
+	sourceTimestamp?: number;
 };
 
 /**
@@ -53,6 +65,19 @@ export class EncodedPacket {
 
 	/** Additional data carried with this packet. */
 	readonly sideData: EncodedPacketSideData;
+	/**
+	 * The decode timestamp of this packet in seconds — when this packet must be decoded, as opposed
+	 * to when it is presented. Equal to {@link EncodedPacket.timestamp} for a stream with no
+	 * reordering, and earlier for a packet that is presented after a later-decoded one.
+	 */
+	readonly decodeTimestamp: number;
+	/**
+	 * Whether the source stated a decode timestamp of its own, rather than it defaulting to
+	 * {@link EncodedPacket.timestamp}. A muxer that must write a decode timeline cannot recover one from
+	 * presentation timestamps whenever decode and presentation order hold different values, such as across
+	 * an open GOP, so it needs to know whether {@link EncodedPacket.decodeTimestamp} carries the answer.
+	 */
+	readonly statesDecodeTimestamp: boolean;
 
 	/** Creates a new {@link EncodedPacket} from raw bytes and timing information. */
 	constructor(
@@ -79,6 +104,12 @@ export class EncodedPacket {
 		public readonly sequenceNumber = -1,
 		byteLength?: number,
 		sideData?: EncodedPacketSideData,
+		/**
+		 * The decode timestamp in seconds, when the source states one. Equal to {@link timestamp}
+		 * unless the packet is reordered, where it is earlier. Muxers that must write a decode time
+		 * (MPEG-TS) need it: it cannot be derived from presentation timestamps alone.
+		 */
+		decodeTimestamp?: number,
 	) {
 		if (data === PLACEHOLDER_DATA && byteLength === undefined) {
 			throw new Error(
@@ -89,6 +120,9 @@ export class EncodedPacket {
 		if (byteLength === undefined) {
 			byteLength = data.byteLength;
 		}
+
+		this.decodeTimestamp = decodeTimestamp ?? timestamp;
+		this.statesDecodeTimestamp = decodeTimestamp !== undefined;
 
 		if (!(data instanceof Uint8Array)) {
 			throw new TypeError('data must be a Uint8Array.');
@@ -251,6 +285,8 @@ export class EncodedPacket {
 		sequenceNumber?: number;
 		/** The side data of the cloned packet. */
 		sideData?: EncodedPacketSideData;
+		/** The decode timestamp of the cloned packet in seconds. */
+		decodeTimestamp?: number;
 	}): EncodedPacket {
 		if (options !== undefined && (typeof options !== 'object' || options === null)) {
 			throw new TypeError('options, when provided, must be an object.');
@@ -274,14 +310,19 @@ export class EncodedPacket {
 			throw new TypeError('options.sideData, when provided, must be an object.');
 		}
 
+		const timestamp = options?.timestamp ?? this.timestamp;
+		const decodeTimestamp = options?.decodeTimestamp
+			?? (this.statesDecodeTimestamp ? this.decodeTimestamp + (timestamp - this.timestamp) : undefined);
+
 		return new EncodedPacket(
 			options?.data ?? this.data,
 			options?.type ?? this.type,
-			options?.timestamp ?? this.timestamp,
+			timestamp,
 			options?.duration ?? this.duration,
 			options?.sequenceNumber ?? this.sequenceNumber,
 			options?.data?.byteLength ?? this.byteLength,
 			options?.sideData ?? this.sideData,
+			decodeTimestamp,
 		);
 	}
 }

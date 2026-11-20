@@ -14,3 +14,16 @@ packages/aac-encoder/dist
 packages/flac-encoder/dist
 packages/server/dist
 packages/prores/dist
+packages/rist/dist
+packages/srt/dist
+# Captured HLS test media: 84 MB of third-party streams, rebuilt with `npm run capture-hls-fixtures`
+test/fixtures/hls/
+
+# libsrt prebuilds: produced by CI before publish, never committed
+packages/server/prebuilt/
+
+# MV-HEVC test media: third-party stereo samples, rebuilt with `npm run capture-mvhevc-fixtures`
+test/fixtures/mvhevc/
+
+# MXF test media: third-party vendor files, rebuilt with `npm run capture-mxf-fixtures`
+test/fixtures/mxf/

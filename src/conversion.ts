@@ -9,12 +9,23 @@
 import {
 	AUDIO_CODECS,
 	AudioCodec,
+	extractVideoBitDepth,
 	MediaCodec,
 	getMinimumAudioPacketSize,
 	NON_PCM_AUDIO_CODECS,
+	SUBTITLE_CODECS,
+	SubtitleCodec,
+	validateBitDepthCarriesTransfer,
+	validateHdrStaticMetadata,
+	validateTransferCarriesHdrStaticMetadata,
+	validateVideoColorSpaceInit,
+	VIDEO_BIT_DEPTHS,
 	VIDEO_CODECS,
+	VideoBitDepth,
 	VideoCodec,
 } from './codec';
+import { type DoviConfig, validateDoviConfig } from './dovi';
+import { type HdrStaticMetadata } from './hdr-metadata';
 import {
 	AudioEncodingConfig,
 	getEncodableAudioCodecs,
@@ -22,34 +33,43 @@ import {
 	Quality,
 	resolveQuality,
 	VideoEncodingConfig,
+	type VideoEncoderControls,
+	type VideoSampleFlusher,
+	type VideoSampleProcessor,
 } from './encode';
 import { Input } from './input';
-import { InputAudioTrack, InputTrack, InputVideoTrack } from './input-track';
+import { InputAudioTrack, InputSubtitleTrack, InputTrack, InputVideoTrack } from './input-track';
 import { Logging } from './logging';
 import {
 	AudioSampleSink,
 	EncodedPacketSink,
+	SubtitleCueSink,
 	VideoSampleSink,
 } from './media-sink';
 import {
 	AudioSource,
 	EncodedVideoPacketSource,
 	EncodedAudioPacketSource,
+	SubtitleCueSource,
 	VideoSource,
 	VideoSampleSource,
 	AudioSampleSource,
+	DeclaredColorSpaceMismatchError,
 } from './media-source';
 import {
+	MaybePromise,
+	Rotation,
 	assert,
 	assertNever,
 	ceilToMultipleOfTwo,
 	clamp,
+	colorSpaceIsEmpty,
+	composeRotationAndFlip,
+	duplicateMediabunnyLoaded,
 	isIso639Dash2LanguageCode,
 	isNumber,
-	MaybePromise,
-	composeRotationAndFlip,
 	promiseWithResolvers,
-	Rotation,
+	type WideVideoColorSpaceInit,
 } from './misc';
 import { Output, OutputTrackGroup } from './output';
 import { NullOutputFormat } from './output-format';
@@ -60,10 +80,9 @@ import {
 	CropRectangle,
 	getBytesPerSample,
 	validateCropRectangle,
-	VideoSample,
-	VideoSampleResource,
 } from './sample';
 import { MetadataTags, validateMetadataTags } from './metadata';
+import { SubtitleCue, SubtitleMetadata } from './subtitles';
 import { NullTarget } from './target';
 import { PacketOrderValidator } from './muxer';
 
@@ -83,7 +102,9 @@ export type ConversionOptions = {
 	 * which case it defaults to `'primary'`.
 	 *
 	 * - `'all'`: All input tracks are eligible for conversion.
-	 * - `'primary'`: Only the primary video and audio track from the input are eligible for conversion.
+	 * - `'primary'`: Only the primary video and audio track from the input are eligible for conversion. There is no
+	 * primary subtitle track, so every subtitle track of the input is excluded and listed in
+	 * {@link Conversion.discardedTracks} with reason `'not_a_primary_track'`. Use `'all'` to convert subtitles.
 	 */
 	tracks?: 'all' | 'primary';
 
@@ -120,6 +141,23 @@ export type ConversionOptions = {
 		| ((track: InputAudioTrack, n: number) => MaybePromise<
 			ConversionAudioOptions | ConversionAudioOptions[] | undefined
 		>);
+
+	/**
+	 * Subtitle-specific options. When passing an object, the same options are applied to all subtitle tracks. When
+	 * passing a function, it will be invoked for each subtitle track and is expected to return or resolve to the
+	 * options for that specific track. The function is passed an instance of {@link InputSubtitleTrack} as well as a
+	 * number `n`, which is the 1-based index of the track in the list of all subtitle tracks.
+	 *
+	 * When passing an array or a function that returns an array, one output track per array element will be created,
+	 * allowing for "fan-out". Useful for emitting the same cues in multiple subtitle codecs.
+	 */
+	subtitle?: ConversionSubtitleOptions
+		| ConversionSubtitleOptions[]
+		| ((track: InputSubtitleTrack, n: number) => MaybePromise<
+			ConversionSubtitleOptions | ConversionSubtitleOptions[] | undefined
+		>)
+	| null
+	| undefined;
 
 	/** Options to trim the input file. */
 	trim?: {
@@ -257,6 +295,54 @@ export type ConversionVideoOptions = {
 	 */
 	keyFrameInterval?: number;
 	/**
+	 * Where the AVC or HEVC parameter sets (SPS/PPS, plus VPS) are carried. Ignored by all other codecs.
+	 *
+	 * - `'outOfBand'` (default): They are kept solely in the sample entry, signalled as `avc1`/`hvc1`.
+	 * - `'inBand'`: They are also repeated throughout the bitstream, signalled as `avc3`/`hev1`, which lets a
+	 * player join mid-stream without the sample entry.
+	 *
+	 * Setting this field forces a transcode.
+	 */
+	parameterSets?: 'inBand' | 'outOfBand' | null | undefined;
+	/**
+	 * The bit depth per color component to encode at, which selects the codec profile. Defaults to the bit depth of
+	 * the input track, falling back to the codec's 8-bit profile when no codec in the output format can encode the
+	 * input's depth.
+	 *
+	 * Setting this field forces a transcode.
+	 */
+	bitDepth?: VideoBitDepth | null | undefined;
+	/**
+	 * The color space to signal on the output track. Defaults to the color space of the input track, except when the
+	 * frames have to be re-rendered (resizing, cropping, rotating, processing, or an encoder that can't take the
+	 * input's frames), which converts them to 8-bit sRGB and therefore replaces the input's color space.
+	 *
+	 *
+	 * Setting this field forces a transcode.
+	 */
+	colorSpace?: WideVideoColorSpaceInit | null | undefined;
+	/**
+	 * The HDR10 static metadata (mastering display colour volume and content light level) to signal on the output
+	 * track. Defaults to the input track's, which describes how the content was graded and therefore still holds
+	 * after a re-encode of that same grade.
+	 *
+	 * Inherited or not, it is dropped from the output wherever the HDR transfer function it describes is dropped:
+	 * when the output is encoded at a bit depth too shallow to carry it, or when the frames are re-rendered into a
+	 * color space that no longer has it.
+	 *
+	 * Setting this field forces a transcode, and requires a `colorSpace` whose transfer function is PQ or HLG.
+	 */
+	hdrStaticMetadata?: HdrStaticMetadata | null | undefined;
+	/**
+	 * Declares that the output track is Dolby Vision, stating the configuration record written into its
+	 * sample entry. It is never inherited from the input: a rung is a different picture at a different
+	 * resolution, so its level is the caller's to state, and a rung whose picture was altered is not Dolby
+	 * Vision at all. Without it the per-frame RPUs are dropped rather than written to a track that states
+	 * no record. Only a cross-compatible base layer can be declared — profile 5's IPT-PQ-c2 base is not
+	 * something an encoder can produce.
+	 */
+	dolbyVision?: DoviConfig | null | undefined;
+	/**
 	 * A hint that configures the hardware acceleration method used when transcoding, which applies to both decoding and
 	 * encoding. This is best left on `'no-preference'`, the default.
 	 */
@@ -268,18 +354,40 @@ export type ConversionVideoOptions = {
 	 * timestamp modifications. Will be called for each input video sample after transformations and frame rate
 	 * corrections.
 	 *
-	 * Must return a {@link VideoSample}, a {@link VideoSampleResource} or a `CanvasImageSource`, an array of them, or
-	 * `null` for dropping the frame. When non-timestamped data is returned, the timestamp and duration from the source
-	 * sample will be used. Rotation and flip metadata of the returned sample will be ignored.
+	 * Returns what {@link VideoSampleProcessor} describes. Rotation and flip metadata of the returned sample will be
+	 * ignored.
 	 *
 	 * This function can also be used to manually resize frames. When doing so, you should signal the post-process
 	 * dimensions using the `processedWidth` and `processedHeight` fields, which enables the encoder to better know what
 	 * to expect. If these fields aren't set, Mediabunny will assume you won't perform any resizing.
 	 */
-	process?: (sample: VideoSample) => MaybePromise<
-		CanvasImageSource | VideoSample | VideoSampleResource
-		| (CanvasImageSource | VideoSample | VideoSampleResource)[] | null
-	>;
+	process?: VideoSampleProcessor | undefined;
+	/**
+	 * Like `process`, but called on each decoded video sample before any resize, rotation, crop or frame rate
+	 * correction. Deinterlacing belongs here: run after a resize, it would interpolate across the two
+	 * interleaved fields. Setting it forces a transcode.
+	 */
+	preProcess?: VideoSampleProcessor | null | undefined;
+	/**
+	 * Encoder-level controls for the encoders in `@mediabunny/server`, as {@link VideoEncoderControls}
+	 * describes. Setting any of them forces a transcode.
+	 */
+	encoderControls?: VideoEncoderControls | null | undefined;
+	/**
+	 * Hands back the frames a stateful `preProcess` hook is still holding, once the track's last frame has gone
+	 * through it. Without it, a hook whose output lags its input loses those frames and never learns the track
+	 * ended. What it returns is transformed and frame rate corrected as `preProcess` output is. Setting it forces
+	 * a transcode.
+	 *
+	 * Returns what {@link VideoSampleFlusher} describes.
+	 */
+	preProcessFlush?: VideoSampleFlusher | null | undefined;
+	/**
+	 * Like `preProcessFlush`, but drains the `process` hook. What it returns goes straight to the encoder.
+	 *
+	 * Returns what {@link VideoSampleFlusher} describes.
+	 */
+	processFlush?: VideoSampleFlusher | null | undefined;
 	/**
 	 * An optional hint specifying the width of video samples returned by the `process` function, for better
 	 * encoder configuration.
@@ -377,6 +485,32 @@ export type ConversionAudioOptions = {
 };
 
 /**
+ * Subtitle-specific options.
+ * @group Conversion
+ * @public
+ */
+export type ConversionSubtitleOptions = {
+	/** If `true`, all subtitle tracks will be discarded and will not be present in the output. */
+	discard?: boolean;
+	/**
+	 * The desired output subtitle codec. Defaults to the input track's codec when the output format can hold it, and
+	 * otherwise to the first subtitle codec the output format supports.
+	 *
+	 * Subtitle codecs are converted between by rewriting the cues, so any requested codec the output format supports
+	 * can be reached from any input codec. A codec the output format cannot hold discards the track with reason
+	 * `'unsupported_subtitle_codec'`.
+	 */
+	codec?: SubtitleCodec | null | undefined;
+	/**
+	 * Defines the group(s) the output track is a part of. For more, see {@link BaseTrackMetadata.group}.
+	 *
+	 * If left blank, tracks will internally be assigned to groups such that the output track pairability graph exactly
+	 * matches the input track pairability graph.
+	 */
+	group?: OutputTrackGroup | OutputTrackGroup[];
+};
+
+/**
  * Options for copying encoded media during conversion.
  * @group Conversion
  * @public
@@ -423,7 +557,8 @@ export type ConversionCopyOptions = {
 	boundaryTolerance?: number;
 };
 
-const validateVideoOptions = (videoOptions: ConversionVideoOptions) => {
+/** @internal */
+export const validateVideoOptions = (videoOptions: ConversionVideoOptions) => {
 	if (!videoOptions || typeof videoOptions !== 'object') {
 		throw new TypeError('options.video, when provided, must be an object.');
 	}
@@ -508,8 +643,53 @@ const validateVideoOptions = (videoOptions: ConversionVideoOptions) => {
 	) {
 		throw new TypeError('options.video.keyFrameInterval, when provided, must be a non-negative number.');
 	}
+	if (
+		videoOptions?.parameterSets != null
+		&& !['inBand', 'outOfBand'].includes(videoOptions.parameterSets)
+	) {
+		throw new TypeError('options.video.parameterSets, when provided, must be \'inBand\' or \'outOfBand\'.');
+	}
+	if (
+		videoOptions?.bitDepth != null
+		&& !(VIDEO_BIT_DEPTHS as readonly number[]).includes(videoOptions.bitDepth)
+	) {
+		throw new TypeError(`options.video.bitDepth, when provided, must be one of ${VIDEO_BIT_DEPTHS.join(', ')}.`);
+	}
+	if (videoOptions?.colorSpace != null) {
+		validateVideoColorSpaceInit(videoOptions.colorSpace, 'options.video.colorSpace');
+	}
+	if (videoOptions?.dolbyVision != null) {
+		validateDoviConfig(videoOptions.dolbyVision, 'options.video.dolbyVision');
+
+		if (videoOptions.dolbyVision.blSignalCompatibilityId === 0) {
+			throw new Error(
+				'options.video.dolbyVision states a base layer that is not cross-compatible'
+				+ ' (blSignalCompatibilityId 0, profile 5), whose IPT-PQ-c2 base an encoder cannot produce.',
+			);
+		}
+	}
+	if (videoOptions?.hdrStaticMetadata != null) {
+		validateHdrStaticMetadata(videoOptions.hdrStaticMetadata, 'options.video.hdrStaticMetadata');
+	}
+	{
+		validateBitDepthCarriesTransfer(
+			videoOptions?.bitDepth ?? undefined, videoOptions?.colorSpace ?? undefined, 'options.video.',
+		);
+		validateTransferCarriesHdrStaticMetadata(
+			videoOptions?.hdrStaticMetadata ?? undefined, videoOptions?.colorSpace ?? undefined, 'options.video.',
+		);
+	}
 	if (videoOptions?.process !== undefined && typeof videoOptions.process !== 'function') {
 		throw new TypeError('options.video.process, when provided, must be a function.');
+	}
+	if (videoOptions?.preProcess != null && typeof videoOptions.preProcess !== 'function') {
+		throw new TypeError('options.video.preProcess, when provided, must be a function.');
+	}
+	if (videoOptions?.preProcessFlush != null && typeof videoOptions.preProcessFlush !== 'function') {
+		throw new TypeError('options.video.preProcessFlush, when provided, must be a function.');
+	}
+	if (videoOptions?.processFlush != null && typeof videoOptions.processFlush !== 'function') {
+		throw new TypeError('options.video.processFlush, when provided, must be a function.');
 	}
 	if (
 		videoOptions?.processedWidth !== undefined
@@ -629,6 +809,31 @@ const validateAudioOptions = (audioOptions: ConversionAudioOptions) => {
 	}
 };
 
+const validateSubtitleOptions = (subtitleOptions: ConversionSubtitleOptions) => {
+	if (!subtitleOptions || typeof subtitleOptions !== 'object') {
+		throw new TypeError('options.subtitle, when provided, must be an object.');
+	}
+	if (subtitleOptions?.discard !== undefined && typeof subtitleOptions.discard !== 'boolean') {
+		throw new TypeError('options.subtitle.discard, when provided, must be a boolean.');
+	}
+	if (subtitleOptions?.codec != null && !SUBTITLE_CODECS.includes(subtitleOptions.codec)) {
+		throw new TypeError(
+			`options.subtitle.codec, when provided, must be one of: ${SUBTITLE_CODECS.join(', ')}.`,
+		);
+	}
+	if (
+		subtitleOptions?.group !== undefined
+		&& !(
+			subtitleOptions.group instanceof OutputTrackGroup
+			|| (Array.isArray(subtitleOptions.group) && subtitleOptions.group.every(x => x instanceof OutputTrackGroup))
+		)
+	) {
+		throw new TypeError(
+			'options.subtitle.group, when provided, must be an OutputTrackGroup or an array of OutputTrackGroups.',
+		);
+	}
+};
+
 const FALLBACK_NUMBER_OF_CHANNELS = 2;
 const FALLBACK_SAMPLE_RATE = 48000;
 const PACKET_STATS_PACKET_COUNT = 256;
@@ -658,6 +863,10 @@ export type DiscardedTrack = {
 	 * with the given copy configuration because it would require a transcode instead.
 	 * - `'unknown_maximum_packet_count'`: The output format requires a maximum packet count, but it can't be estimated
 	 * because the track is live and no trim end is set. Set it manually using the `maximumPacketCount` track option.
+	 * - `'unsupported_subtitle_codec'`: The output format cannot hold this subtitle track, because it holds no
+	 * subtitle codec at all or none that matches the codec you requested.
+	 * - `'not_a_primary_track'`: {@link ConversionOptions.tracks} was `'primary'` and this track is not a primary
+	 * track of the input. Subtitle tracks are never primary tracks.
 	 */
 	reason:
 		| 'discarded_by_user'
@@ -667,9 +876,11 @@ export type DiscardedTrack = {
 		| 'undecodable_source_codec'
 		| 'no_encodable_target_codec'
 		| 'cannot_copy'
-		| 'unknown_maximum_packet_count';
+		| 'unknown_maximum_packet_count'
+		| 'unsupported_subtitle_codec'
+		| 'not_a_primary_track';
 	/** The options that were provided for this track, or `{}` if none were provided. */
-	trackOptions: ConversionVideoOptions | ConversionAudioOptions;
+	trackOptions: ConversionVideoOptions | ConversionAudioOptions | ConversionSubtitleOptions;
 };
 
 /**
@@ -755,6 +966,8 @@ export class Conversion {
 	/** @internal */
 	_executionUntil = Infinity;
 	/** @internal */
+	_finishRequested = false;
+	/** @internal */
 	_pauseRequested = false;
 
 	/** @internal */
@@ -781,6 +994,8 @@ export class Conversion {
 	_lastProgress = 0;
 	/** @internal */
 	_lastProcessedTime = 0;
+	/** @internal */
+	_undecodableSourceCodecs: MediaCodec[] = [];
 
 	/**
 	 * Whether this conversion, as it has been configured, is valid and can be executed. If this field is `false`, check
@@ -917,6 +1132,16 @@ export class Conversion {
 			// We'll validate the return value later
 		}
 
+		if (options.subtitle != null && typeof options.subtitle !== 'function') {
+			if (Array.isArray(options.subtitle)) {
+				for (const obj of options.subtitle) {
+					validateSubtitleOptions(obj);
+				}
+			} else {
+				validateSubtitleOptions(options.subtitle);
+			}
+		}
+
 		if (options.trim !== undefined && (!options.trim || typeof options.trim !== 'object')) {
 			throw new TypeError('options.trim, when provided, must be an object.');
 		}
@@ -979,6 +1204,14 @@ export class Conversion {
 			const primaryAudioTrack = await this.input.getPrimaryAudioTrack();
 
 			tracks = [primaryVideoTrack, primaryAudioTrack].filter(x => x !== null);
+
+			for (const subtitleTrack of await this.input.getSubtitleTracks()) {
+				this.discardedTracks.push({
+					track: subtitleTrack,
+					reason: 'not_a_primary_track',
+					trackOptions: {},
+				});
+			}
 		} else {
 			assertNever(trackMode);
 			assert(false);
@@ -986,12 +1219,15 @@ export class Conversion {
 
 		const outputTrackCounts = this.output.format.getSupportedTrackCounts();
 
+		let nSubtitle = 1;
+
 		// All tracks that aren't discarded by the user
 		const filteredTracks: InputTrack[] = [];
-		const filteredTrackOptions: (ConversionVideoOptions | ConversionAudioOptions)[][] = [];
+		const filteredTrackOptions: (ConversionVideoOptions | ConversionAudioOptions | ConversionSubtitleOptions)[][]
+			= [];
 
 		for (const track of tracks) {
-			let trackOptions: (ConversionVideoOptions | ConversionAudioOptions)[];
+			let trackOptions: (ConversionVideoOptions | ConversionAudioOptions | ConversionSubtitleOptions)[];
 
 			if (track.isVideoTrack()) {
 				if (this._options.video) {
@@ -1037,6 +1273,31 @@ export class Conversion {
 						trackOptions = Array.isArray(this._options.audio)
 							? this._options.audio
 							: [this._options.audio];
+					}
+				} else {
+					trackOptions = [{}];
+				}
+			} else if (track.isSubtitleTrack()) {
+				if (this._options.subtitle) {
+					if (typeof this._options.subtitle === 'function') {
+						const returnedTrackOptions = await this._options.subtitle(track, nSubtitle) ?? {};
+						if (Array.isArray(returnedTrackOptions)) {
+							for (const obj of returnedTrackOptions) {
+								validateSubtitleOptions(obj);
+							}
+						} else {
+							validateSubtitleOptions(returnedTrackOptions);
+						}
+
+						trackOptions = Array.isArray(returnedTrackOptions)
+							? returnedTrackOptions
+							: [returnedTrackOptions];
+
+						nSubtitle++;
+					} else {
+						trackOptions = Array.isArray(this._options.subtitle)
+							? this._options.subtitle
+							: [this._options.subtitle];
 					}
 				} else {
 					trackOptions = [{}];
@@ -1123,6 +1384,8 @@ export class Conversion {
 					await this._processVideoTrack(track, option as ConversionVideoOptions, outputTrackId);
 				} else if (track.isAudioTrack()) {
 					await this._processAudioTrack(track, option as ConversionAudioOptions, outputTrackId);
+				} else if (track.isSubtitleTrack()) {
+					await this._processSubtitleTrack(track, option as ConversionSubtitleOptions, outputTrackId);
 				} else {
 					assert(false);
 				}
@@ -1197,6 +1460,19 @@ export class Conversion {
 				warnElements.push(
 					'Some tracks had to be discarded from the conversion:', unintentionallyDiscardedTracks,
 				);
+
+				if (
+					duplicateMediabunnyLoaded()
+					&& unintentionallyDiscardedTracks.some(x => x.reason === 'undecodable_source_codec')
+				) {
+					warnElements.push(
+						'\n\nMore than one copy of Mediabunny is loaded, which is the usual cause of this:'
+						+ ' an extension package such as @ahmedrowaihi/mediabunny-server registers its codecs on'
+						+ ' the copy it imported, and this conversion is holding the other one, so those codecs'
+						+ ' look absent. Install the core under the name the extensions import it by:'
+						+ ' npm i "mediabunny@npm:@ahmedrowaihi/mediabunny@<version>".',
+					);
+				}
 			}
 
 			if (!this.isValid) {
@@ -1225,6 +1501,9 @@ export class Conversion {
 			const encodabilityIsTheProblem = this.discardedTracks.every(x =>
 				x.reason === 'discarded_by_user' || x.reason === 'no_encodable_target_codec',
 			) && this.discardedTracks.some(x => x.reason === 'no_encodable_target_codec');
+			const decodabilityIsTheProblem = this.discardedTracks.every(x =>
+				x.reason === 'discarded_by_user' || x.reason === 'undecodable_source_codec',
+			) && this.discardedTracks.some(x => x.reason === 'undecodable_source_codec');
 
 			elements.push(
 				'Due to discarded tracks, this conversion cannot be executed.',
@@ -1321,6 +1600,42 @@ export class Conversion {
 						+ ' encoding and decoding all common codecs.',
 					);
 				}
+			} else if (decodabilityIsTheProblem) {
+				const sourceCodecs = [...new Set(this._undecodableSourceCodecs)];
+
+				if (sourceCodecs.length === 1) {
+					elements.push(
+						'\nTracks were discarded because your environment is not able to decode the source codec'
+						+ ` '${sourceCodecs[0]}'.`,
+					);
+				} else if (sourceCodecs.length > 1) {
+					elements.push(
+						'\nTracks were discarded because your environment is not able to decode the source codecs'
+						+ ` ${sourceCodecs.map(x => `'${x}'`).join(', ')}.`,
+					);
+				} else {
+					elements.push(
+						'\nTracks were discarded because your environment is not able to decode their source codec.',
+					);
+				}
+
+				if (sourceCodecs.includes('ac3') || sourceCodecs.includes('eac3')) {
+					elements.push(
+						'\nThe @mediabunny/ac3 extension package provides support'
+						+ ' for encoding and decoding AC-3/E-AC-3.',
+					);
+				}
+
+				if (sourceCodecs.includes('dts')) {
+					elements.push(
+						'\nThe @mediabunny/dts extension package provides support for decoding DTS.',
+					);
+				}
+
+				elements.push(
+					'\nIn Node, decoding requires the native codecs: call registerMediabunnyServer() from'
+					+ ' @mediabunny/server before initializing the conversion.',
+				);
 			} else {
 				elements.push('\nCheck the discardedTracks field for more info.');
 			}
@@ -1487,6 +1802,30 @@ export class Conversion {
 	}
 
 	/**
+	 * Stops reading the input and finalizes the output, so an ongoing `execute` call completes normally
+	 * instead of throwing. Unlike {@link Conversion.cancel}, the media already read is kept: a segmented
+	 * output closes its open segment and writes a complete, well-formed file.
+	 *
+	 * This is how a live conversion is meant to be ended — the input never reaches an end of its own, so
+	 * without it the only way to stop is `cancel()`, which discards the segment in progress.
+	 *
+	 * Does nothing if the conversion is already complete or canceled.
+	 */
+	finish() {
+		if (this._state === 'done' || this._state === 'canceled') {
+			return;
+		}
+
+		this._finishRequested = true;
+
+		for (const pump of this._trackPumps) {
+			pump.wake?.();
+		}
+
+		this._synchronizer.resolveAll();
+	}
+
+	/**
 	 * Cancels the conversion process, causing any ongoing `execute` call to throw a `ConversionCanceledError`.
 	 * Does nothing if the conversion is already complete.
 	 */
@@ -1594,11 +1933,23 @@ export class Conversion {
 		let videoCodecs = this.output.format.getSupportedVideoCodecs();
 		const alpha = trackOptions.alpha ?? 'discard';
 
+		const sourceIsAnnexB = (sourceCodec === 'avc' || sourceCodec === 'hevc')
+			&& !(await track.getDecoderConfig())?.description;
+
 		let needsTranscode = !this._copyMode
 			|| !!trackOptions.forceTranscode
 			|| !!trackOptions.frameRate
 			|| trackOptions.keyFrameInterval !== undefined
+			|| (trackOptions.parameterSets != null && !sourceIsAnnexB)
+			// Same for the bit depth, which is fixed by the codec profile the samples were encoded with.
+			|| trackOptions.bitDepth != null
+			|| trackOptions.colorSpace != null
+			|| trackOptions.hdrStaticMetadata != null
 			|| trackOptions.process !== undefined
+			|| trackOptions.preProcess != null
+			|| trackOptions.preProcessFlush != null
+			|| trackOptions.processFlush != null
+			|| trackOptions.encoderControls != null
 			|| trackOptions.quality !== undefined
 			// eslint-disable-next-line @typescript-eslint/no-deprecated
 			|| trackOptions.bitrate !== undefined
@@ -1726,7 +2077,7 @@ export class Conversion {
 					undefined,
 					{ verifyKeyPackets: true },
 				)) {
-					if (this._state === 'canceled') {
+					if (this._state === 'canceled' || this._finishRequested) {
 						break;
 					}
 
@@ -1835,6 +2186,10 @@ export class Conversion {
 
 			const canDecode = await track.canDecode();
 			if (!canDecode) {
+				const undecodableCodec = await track.getCodec();
+				if (undecodableCodec !== null) {
+					this._undecodableSourceCodecs.push(undecodableCodec);
+				}
 				this.discardedTracks.push({
 					track,
 					reason: 'undecodable_source_codec',
@@ -1851,15 +2206,36 @@ export class Conversion {
 			const quality = resolveQuality(trackOptions.quality, trackOptions.bitrate)
 				?? new Quality('high');
 
-			const encodableCodec = await getFirstEncodableVideoCodec(videoCodecs, {
-				width: trackOptions.process && trackOptions.processedWidth
+			const sourceDecoderConfig = await track.getDecoderConfig();
+			const sourceColorSpace = await track.getColorSpace();
+			let bitDepth = trackOptions.bitDepth
+				?? (sourceDecoderConfig ? extractVideoBitDepth(sourceDecoderConfig) ?? undefined : undefined);
+			const colorSpace = trackOptions.colorSpace
+				?? (colorSpaceIsEmpty(sourceColorSpace) ? undefined : sourceColorSpace);
+			const hdrStaticMetadata = trackOptions.hdrStaticMetadata ?? sourceDecoderConfig?.hdrStaticMetadata;
+
+			const sampleHookIsSet = trackOptions.process !== undefined || trackOptions.preProcess != null
+				|| trackOptions.processFlush != null || trackOptions.preProcessFlush != null;
+			const encodableCodecOptions = {
+				width: sampleHookIsSet && trackOptions.processedWidth
 					? trackOptions.processedWidth
 					: width,
-				height: trackOptions.process && trackOptions.processedHeight
+				height: sampleHookIsSet && trackOptions.processedHeight
 					? trackOptions.processedHeight
 					: height,
 				quality,
+			};
+
+			let encodableCodec = await getFirstEncodableVideoCodec(videoCodecs, {
+				...encodableCodecOptions,
+				bitDepth,
 			});
+			if (!encodableCodec && trackOptions.bitDepth == null && bitDepth !== undefined) {
+				// The source's bit depth is inherited, not demanded, so a format that can't reach it falls back to the
+				// codec default rather than dropping the track.
+				bitDepth = undefined;
+				encodableCodec = await getFirstEncodableVideoCodec(videoCodecs, encodableCodecOptions);
+			}
 			if (!encodableCodec) {
 				this.discardedTracks.push({
 					track,
@@ -1873,6 +2249,13 @@ export class Conversion {
 				codec: encodableCodec,
 				quality,
 				keyFrameInterval: trackOptions.keyFrameInterval,
+				parameterSets: trackOptions.parameterSets ?? undefined,
+				bitDepth,
+				colorSpace,
+				hdrStaticMetadata,
+				_bitDepthIsInherited: trackOptions.bitDepth == null,
+				_colorSpaceIsInherited: trackOptions.colorSpace == null,
+				_hdrStaticMetadataIsInherited: trackOptions.hdrStaticMetadata == null,
 				sizeChangeBehavior: trackOptions.fit ?? 'passThrough',
 				alpha,
 				hardwareAcceleration: trackOptions.hardwareAcceleration,
@@ -1882,14 +2265,20 @@ export class Conversion {
 
 			let needsRerender = width !== originalWidth
 				|| height !== originalHeight
-				|| (totalRotation !== 0 && (!canUseRotationMetadata || trackOptions.process !== undefined))
-				|| (totalFlip && (!canUseRotationMetadata || trackOptions.process !== undefined))
+				|| (totalRotation !== 0 && (!canUseRotationMetadata || sampleHookIsSet))
+				|| (totalFlip && (!canUseRotationMetadata || sampleHookIsSet))
 				|| !!crop
 				// Don't expect encoders to reliably handle non-square pixels:
 				|| squarePixelWidth !== await track.getCodedWidth()
 				|| squarePixelHeight !== await track.getCodedHeight();
 
-			if (!needsRerender) {
+			const dropInheritedColor = () => {
+				encodingConfig.bitDepth = trackOptions.bitDepth ?? undefined;
+				encodingConfig.colorSpace = trackOptions.colorSpace ?? undefined;
+				encodingConfig.hdrStaticMetadata = trackOptions.hdrStaticMetadata ?? undefined;
+			};
+
+			if (!needsRerender && trackOptions.preProcess == null) {
 				// If we're directly passing decoded samples back to the encoder, sometimes the encoder may error due
 				// to lack of support of certain video frame formats, like when HDR is at play. To check for this, we
 				// first try to pass a single frame to the encoder to see how it behaves. If it throws, we then fall
@@ -1918,13 +2307,24 @@ export class Conversion {
 						firstSample.close();
 						await tempOutput.finalize();
 					} catch (error) {
+						if (error instanceof DeclaredColorSpaceMismatchError && trackOptions.colorSpace != null) {
+							void tempOutput.cancel();
+							throw error;
+						}
+
 						Logging._warn(
-							'An error occurred when probing encoder support. Falling back to rerender path.', error,
+							error instanceof DeclaredColorSpaceMismatchError
+								? 'The color space inherited from the input contradicts the samples reaching the'
+								+ ' encoder, so it is dropped and the frames are re-rendered. The output states no'
+								+ ' color rather than one its samples do not have.'
+								: 'An error occurred when probing encoder support. Falling back to rerender path.',
+							error,
 						);
 						void tempOutput.cancel();
 
 						needsRerender = true;
 						encodingConfig.transform.force = true;
+						dropInheritedColor();
 					}
 				} else {
 					await tempOutput.cancel();
@@ -1937,6 +2337,22 @@ export class Conversion {
 
 			if (trackOptions.process) {
 				encodingConfig.transform.process = trackOptions.process;
+			}
+
+			if (trackOptions.preProcess) {
+				encodingConfig.transform.preProcess = trackOptions.preProcess;
+			}
+
+			if (trackOptions.encoderControls) {
+				encodingConfig.encoderControls = trackOptions.encoderControls;
+			}
+
+			if (trackOptions.preProcessFlush) {
+				encodingConfig.transform.preProcessFlush = trackOptions.preProcessFlush;
+			}
+
+			if (trackOptions.processFlush) {
+				encodingConfig.transform.processFlush = trackOptions.processFlush;
 			}
 
 			if (needsRerender) {
@@ -1968,7 +2384,7 @@ export class Conversion {
 				const sink = new VideoSampleSink(track, { hardwareAcceleration: trackOptions.hardwareAcceleration });
 
 				for await (using sample of sink.samples(this._startTimestamp, this._endTimestamp)) {
-					if (this._state === 'canceled') {
+					if (this._state === 'canceled' || this._finishRequested) {
 						break;
 					}
 
@@ -2050,6 +2466,8 @@ export class Conversion {
 			bitrate: bitrate ?? undefined,
 			averageBitrate: averageBitrate ?? undefined,
 			maximumPacketCount,
+			dolbyVision: trackOptions.dolbyVision ?? undefined,
+			parameterSets: trackOptions.parameterSets ?? undefined,
 		});
 
 		this.utilizedTracks.push(track);
@@ -2229,7 +2647,7 @@ export class Conversion {
 
 				// eslint-disable-next-line curly
 				if (copyStartPacket) for await (const packet of sink.packets(copyStartPacket)) {
-					if (this._state === 'canceled') {
+					if (this._state === 'canceled' || this._finishRequested) {
 						break;
 					}
 
@@ -2293,6 +2711,10 @@ export class Conversion {
 
 			const canDecode = await track.canDecode();
 			if (!canDecode) {
+				const undecodableCodec = await track.getCodec();
+				if (undecodableCodec !== null) {
+					this._undecodableSourceCodecs.push(undecodableCodec);
+				}
 				this.discardedTracks.push({
 					track,
 					reason: 'undecodable_source_codec',
@@ -2387,7 +2809,7 @@ export class Conversion {
 
 				const sink = new AudioSampleSink(track);
 				for await (using sample of sink.samples(this._startTimestamp, this._endTimestamp)) {
-					if (this._state === 'canceled') {
+					if (this._state === 'canceled' || this._finishRequested) {
 						break;
 					}
 
@@ -2561,6 +2983,101 @@ export class Conversion {
 	}
 
 	/** @internal */
+	async _processSubtitleTrack(
+		track: InputSubtitleTrack,
+		trackOptions: ConversionSubtitleOptions,
+		outputTrackId: number,
+	) {
+		const sourceCodec = await track.getCodec();
+		if (!sourceCodec) {
+			this.discardedTracks.push({
+				track,
+				reason: 'unknown_source_codec',
+				trackOptions,
+			});
+			return;
+		}
+
+		const supportedCodecs = this.output.format.getSupportedSubtitleCodecs();
+
+		let targetCodec: SubtitleCodec | null;
+		if (trackOptions.codec) {
+			targetCodec = supportedCodecs.includes(trackOptions.codec) ? trackOptions.codec : null;
+		} else {
+			targetCodec = supportedCodecs.includes(sourceCodec) ? sourceCodec : supportedCodecs[0] ?? null;
+		}
+
+		if (!targetCodec) {
+			this.discardedTracks.push({
+				track,
+				reason: 'unsupported_subtitle_codec',
+				trackOptions,
+			});
+			return;
+		}
+
+		const config = targetCodec === sourceCodec ? await track.getConfig() : null;
+		const source = new SubtitleCueSource(targetCodec);
+
+		this._registerTrackPump(async (pump) => {
+			const sink = new SubtitleCueSink(track);
+
+			let meta: SubtitleMetadata | undefined = { config: config ?? { description: '' } };
+
+			for await (const cue of sink.cues(this._startTimestamp, this._endTimestamp)) {
+				if (this._state === 'canceled' || this._finishRequested) {
+					break;
+				}
+
+				const cueStart = Math.max(cue.timestamp, this._startTimestamp);
+				const cueEnd = Math.min(cue.timestamp + cue.duration, this._endTimestamp);
+
+				const shiftedCue: SubtitleCue = {
+					...cue,
+					timestamp: cueStart + this._timestampOffset,
+					duration: Math.max(cueEnd - cueStart, 0),
+				};
+
+				this._updateProgress(outputTrackId, shiftedCue.timestamp + shiftedCue.duration);
+				await source.add(shiftedCue, meta);
+				meta = undefined;
+
+				if (this._synchronizer.shouldWait(outputTrackId, shiftedCue.timestamp)) {
+					await this._synchronizer.wait(shiftedCue.timestamp);
+				}
+
+				await this._checkpoint(pump, shiftedCue.timestamp);
+			}
+
+			source.close();
+			this._synchronizer.closeTrack(outputTrackId);
+		});
+
+		let ownGroup: OutputTrackGroup | null = null;
+		if (!trackOptions.group && !this._composable) {
+			ownGroup = new OutputTrackGroup();
+		}
+
+		const subtitleTrackLanguageCode = await track.getLanguageCode();
+		const trackName = await track.getName();
+		const trackDisposition = await track.getDisposition();
+
+		this.output.addSubtitleTrack(source, {
+			// TODO: This condition can be removed when all demuxers properly homogenize to BCP47 in v2
+			languageCode: isIso639Dash2LanguageCode(subtitleTrackLanguageCode)
+				? subtitleTrackLanguageCode
+				: undefined,
+			name: trackName ?? undefined,
+			disposition: trackDisposition,
+			group: ownGroup ?? trackOptions.group,
+		});
+
+		this.utilizedTracks.push(track);
+		this._outputTrackIds.push(outputTrackId);
+		this._outputOwnTrackGroups.push(ownGroup);
+	}
+
+	/** @internal */
 	async _registerAudioSample(
 		pump: TrackPump,
 		sample: AudioSample,
@@ -2604,7 +3121,11 @@ export class Conversion {
 
 	/** @internal */
 	async _checkpoint(pump: TrackPump, timestamp: number) {
-		while (this._state !== 'canceled' && (timestamp >= this._executionUntil || this._pauseRequested)) {
+		while (
+			this._state !== 'canceled'
+			&& !this._finishRequested
+			&& (timestamp >= this._executionUntil || this._pauseRequested)
+		) {
 			// We've reached the target; signal it and suspend until the next execution wakes us up
 			pump.resolvers.resolve();
 
